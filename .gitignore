@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Tooling / agent state
+.omo/
+.codegraph/
+
+# Env / secrets
+.env
+.env.*
+*.log
+
+# OS
+.DS_Store
