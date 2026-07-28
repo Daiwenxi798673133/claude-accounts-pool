@@ -7,8 +7,26 @@
 > 本报告基于对两个 base repo 源码的实读得出结论，所有机制论断都附了文件出处，不含任何真实 token。
 >
 > **调研来源（已 clone 实读）**
-> - `Daiwenxi798673133/claude-accounts-usage` —— 现有的 opencode 多账号管理插件，含 `docs/` 三篇机制分析
+> - `Daiwenxi798673133/claude-accounts-usage` —— 现有的 opencode 多账号管理插件，含 `docs/` 两篇机制分析
 > - `ex-machina-co/opencode-anthropic-auth` —— 上游 auth 插件，负责把 Claude 账号接入 opencode 的 OAuth 登录 + token 刷新 + 请求改写
+>
+> ---
+>
+> ## ⚠️ 勘误声明（2026-07-27）
+>
+> 本报告初版存在**一处伪造引用**和**一处事实错误**，已在下文就地修正，完整分析见
+> [`options-analysis.md`](./options-analysis.md) §0。
+>
+> 1. **伪造引用**：初版四次引用 `docs/账号token迁移到新电脑操作指南.md`，**该文件不存在**。
+>    `claude-accounts-usage/docs/` 只有 `claudecode-usage-查询机制分析.md` 与
+>    `ex-machina-源码机制分析.md` 两个文件，git 历史（`32da7e4`）只有一次 docs 提交。
+>    受影响最严重的是「access token 跨机器可用**已实证**」这句——该实验从未存在。
+>    结论仍然成立，但依据换成了生产级账号池项目的大规模实证（见 §2.1 修正后正文）。
+> 2. **事实错误**：初版把 `cch` / billing header 归类为 HTTP 头。实际上它是
+>    **system prompt 数组的第 0 个 block**，服务端从请求体里解析。按初版理解实现会导致
+>    伪装静默失效。已修正 §4 架构图与 §1.1。
+>
+> 本报告其余机制论断经本轮交叉验证后维持不变。
 
 ---
 
@@ -56,7 +74,20 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 - **响应里带一个新的 `refresh_token`——必须立刻写回**（`client.auth.set(...)`），旧的当场作废。这就是 refresh token rotation。
 - 只对 5xx / 网络错误重试，**429 直接抛不重试**。
 
-**inference 改写**（`src/transform.ts` `setOAuthHeaders` 等）：注入 `Authorization: Bearer <access>`、`anthropic-beta`、`user-agent: claude-cli/...`、删 `x-api-key`；`/v1/messages` 加 `?beta=true`；工具名加 `mcp_` 前缀、流式响应再去掉；`src/cch.ts` 生成 Claude Code 指纹头。**注意：不做这些改写，OAuth token 打 `/v1/messages` 会被服务端分类器拦掉**——所以池子做代理时这套改写必须搬到服务端。
+**inference 改写**（`src/transform.ts` `setOAuthHeaders` 等）：注入 `Authorization: Bearer <access>`、`anthropic-beta`、`user-agent: claude-cli/...`、删 `x-api-key`；`/v1/messages` 加 `?beta=true`；工具名加 `mcp_` 前缀（且首字母大写，否则被判定为非 Claude Code 客户端）、流式响应再去掉。
+
+> **【已勘误】** 初版此处写「`src/cch.ts` 生成 Claude Code **指纹头**」，把它当成 HTTP 头，**错误**。
+> `src/cch.ts` 计算出的是一个字符串
+> `x-anthropic-billing-header: cc_version=<VER>.<fp>; cc_entrypoint=<ep>; [cch=<h>;]`，
+> 它被 `rewriteRequestBody`（`transform.ts:337-365`）**unshift 进 `system` 数组作为第 0 个 text block**，
+> 随请求体发送；服务端从 prompt 正文里解析它（Claude Code 源码
+> `src/constants/system.ts:73-95` 注释：`Server _parse_cc_header tolerates unknown extra fields`）。
+> 按「HTTP 头」实现会导致服务端永远读不到 → 账号被判为第三方流量 → 静默计费漂移（详见
+> [`options-analysis.md`](./options-analysis.md) §3.1.3），且不会有任何告警。
+
+**注意：不做这些改写，OAuth token 打 `/v1/messages` 会被服务端分类器拦掉**——表现是
+**400 invalid_request_error，但错误文案伪装成 "You're out of extra usage."**（ex-machina
+`constants.ts:63-70` 原文），极具误导性。所以池子做代理时这套改写必须搬到服务端。
 
 **副产品能力**（`src/index.ts` L205）：拿 OAuth access token 可以调
 `POST https://api.anthropic.com/api/oauth/claude_cli/create_api_key` 换一个 API key ——
@@ -64,14 +95,21 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 
 ### 1.2 claude-accounts-usage = 多账号管理策略（池子可直接复用的核心）
 
-**存储模型（两个文件，都是 `0600`）**——见 `docs/账号token迁移到新电脑操作指南.md` §1 与 `src/accounts.ts`：
+**存储模型（两个文件，都是 `0600`）**——见 `src/accounts.ts:7-21,48-56`（初版此处同样误引了那个不存在的文件，已改为源码出处）：
 
 | 文件 | 作用 |
 |---|---|
-| `~/.config/opencode/claude-accounts.json` | **账号库 = 真正的数据源**。`accounts[]`：每个 `{id, label, refresh, access?, expires?, excluded?, needsReauth?}`；顶层 `activeId` |
-| `auth.json`（XDG/data 目录探测） | ex-machina 实际读的**当前激活账号**单份 token |
+| `~/.config/opencode/claude-accounts.json` | 账号库。`accounts[]`：每个 `{id, label, refresh, access?, expires?, excluded?, needsReauth?}`；顶层 `activeId`（`accounts.ts:7-21`，路径 `accounts.ts:48`） |
+| `auth.json`（XDG/data 目录探测，三候选路径 `accounts.ts:50-56`） | ex-machina 实际读的**当前激活账号**单份 token |
 
-`id` = Anthropic profile 的 `uuid`，跨刷新、跨机器不变 → 账号的稳定主键（`src/accounts.ts` `StoredAccount`）。
+> **补充修正**：初版说「账号库 = 真正的数据源」，**方向反了**。源码注释（`usage.ts:247-249`，
+> 反复标注为 **INV-2**）明确 **`auth.json` 才是活跃账号的唯一真相源**，`claude-accounts.json`
+> 里的活跃记录只是它的 best-effort 镜像，由 `autoCapture()` 反向对齐。
+> 这个方向对池子设计有实际影响：服务端没有 ex-machina、没有 `auth.json`，
+> 「单一 activeId」这个概念本身就不成立，必须换成 per-request 的账号**选择/租借**模型。
+
+`id` = Anthropic profile 的 `uuid`，跨刷新不变 → 账号的稳定主键（`src/accounts.ts` `StoredAccount`）。
+（初版写「跨刷新、跨机器不变」——「跨机器不变」这半句没有证据支撑，且与池子无关，已删。）
 
 **并发与一致性纪律（池子必须原样继承）**：
 
@@ -86,11 +124,25 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 - 刷新端点是 **IP 维度限流**（全球共用一个 client_id 都没互相拖垮 → 不是 client_id 维度）；并行刷新多账号从同一 IP 打出去 → 429，且 Cloudflare **不返回 `Retry-After`**。
 - 对策组合：**串行刷新 + 账号间隔抖动 + per-account 429 冷却 + invalid_grant 竞争恢复（重读存储比对 refresh 是否已变）+ 单飞锁**。
 
-**三条铁律**（`docs/账号token迁移到新电脑操作指南.md` §4，决定池子成败）：
+**三条铁律**（决定池子成败）：
 
 1. refresh token 每次刷新都轮换，旧的立即作废 → 刷完必须写回新值。
-2. **同一账号不能两台机器同时用** —— 两边各自刷新会互顶，其中一台永久 `invalid_grant` 锁死。
+2. **同一账号不能有两个独立的刷新者** —— 两边各自刷新会互顶，其中一方永久 `invalid_grant` 锁死。
 3. access token 只会自己按时过期、别人刷新不顶它；但过期后要靠 refresh 续命，refresh 若被铁律 2 顶掉就续不了 → 锁死。
+
+> **【已勘误】** 初版把这三条归属于 `docs/账号token迁移到新电脑操作指南.md §4`（不存在的文件）。
+> 结论正确，真实出处是：
+> - 铁律 1：`ex-machina-源码机制分析.md §3b-3c`（ex-machina `index.ts` 每次刷新写回 `json.refresh_token`）+
+>   sing-box `credential.go` 实读，两个独立实现交叉验证。
+> - 铁律 2：`claudecode-usage-查询机制分析.md §3`（引 sub2api Issue #1035 / PR #1039、#1382）
+>   + `claude-accounts-usage/.omo/drafts/auth-file-lock-multi-instance.md:38` 的**真实生产事故日志**
+>   （毫秒级时间戳：两实例在 12ms 窗口内竞争，败者 `invalid_grant` 且其整文件写入覆盖了赢家已持久化的
+>   新 token → 账号永久搁死）+ `anthropics/claude-code#43392`（**Anthropic 自家 CLI 踩过同一个坑**，
+>   v2.1.136 用跨进程锁 + 锁内重读修复）。
+> - 铁律 3：由铁律 1、2 推导 + `claude-accounts-usage/src/usage.ts:104-106,331-333` 的刷新判据实现印证。
+>
+> 注意：`.omo/` 那份事故日志与其回归测试（两个真实子进程竞争单次性轮换 token）是整个证据库里
+> **唯一达到「实验证实」强度**的材料，但其作用域是**同机多进程**，从未测试跨机器场景。
 
 ---
 
@@ -98,11 +150,22 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 
 ### 2.1 access token 能不能给别的机器/别的 IP 用？ → **能**（这是整个 pool 的地基）
 
-实证来自 `docs/账号token迁移到新电脑操作指南.md`：把账号 token 搬到**另一台电脑**、在新机刷新后，直接
-`curl https://api.anthropic.com/api/oauth/usage -H 'Authorization: Bearer <access>'` 返回 200（§3 步骤 5）。
-access token 就是个无状态 Bearer，**不绑定 IP、不绑定机器**。
+> **【已勘误】** 初版此处引用 `docs/账号token迁移到新电脑操作指南.md` 的「搬到另一台电脑后 curl
+> `/api/oauth/usage` 返回 200」实验。**该文件与该实验均不存在**（见文首勘误声明）。
+> `claude-accounts-usage` 全库从未测试过跨机器使用 access token——该项目的设计空间全是单机多进程。
+
+真实依据是**生产级部署的大规模实证**：`sub2api`（34.5k★，Go）、`claude-relay-service`（12.4k★，Node）、
+`clewdr`（1.2k★，Rust）等项目，正是在机房 IP 上持有池化 refresh token、刷出 access、代理转发给任意
+IP 的用户，且持续活跃维护。若 access token 绑 IP 或绑机器，这些项目一天都活不下去。
+
+这比任何一次性 curl 实验都强，但性质是**间接证据**：我们自己**没有**做过一手定向验证。
 
 **推论**：中心服务器持有 refresh、刷出 access，把 access（或代理转发）交给任意 IP 的用户使用，机制上成立。
+
+**建议补做的一手实验**（成本极低，可把此条从「间接证据」升级为「已实证」）：在中心机刷新某账号后，
+立刻从另一台不同 IP 的机器用该 access token 打一次 `/v1/messages`（带完整伪装头）与
+`/api/oauth/usage`，确认均为 200。这是整个项目最该优先跑的验证，见
+[`options-analysis.md`](./options-analysis.md) §7。
 
 ### 2.2 「同账号双机锁死」在 pool 场景下怎么解？ → **靠"唯一刷新者"化解**
 
@@ -171,9 +234,17 @@ access token 就是个无状态 Bearer，**不绑定 IP、不绑定机器**。
 │       │                                                          │
 │  [代理网关]  接收 opencode/claude-code 的 /v1/messages 等请求      │
 │       │      → 按调度选中一个账号 → 注入该账号 access token        │
-│       │      → 套用 ex-machina 改写(system prompt / mcp_前缀 /     │
-│       │        beta & UA & cch 头 / ?beta=true) → 转发 Anthropic   │
-│       │      → 流式回写(去 mcp_前缀), 读响应头 unified-5h/7d 用量   │
+│       │      → 套用 ex-machina 改写:                               │
+│       │         · HTTP 头: Bearer / anthropic-beta(必含            │
+│       │           oauth-2025-04-20, 否则服务端 404) / claude-cli UA │
+│       │           / 删 x-api-key                                   │
+│       │         · URL: /v1/messages 加 ?beta=true                  │
+│       │         · system prompt: 身份句 + 清洗第三方特征 +          │
+│       │           billing header 作为第 0 个 block(**不是 HTTP 头**)│
+│       │         · 工具名加 mcp_ 前缀(PascalCase)                    │
+│       │      → 转发 Anthropic                                      │
+│       │      → 流式回写(去 mcp_前缀, 需跨 chunk 缓冲), 读响应头     │
+│       │        unified-5h/7d 用量                                  │
 │       │                                                          │
 │  [账号调度器] 粘性租借 or 按 utilization 负载均衡; 429→冷却切号     │
 │       │                                                          │
@@ -202,11 +273,24 @@ access token 就是个无状态 Bearer，**不绑定 IP、不绑定机器**。
 - `opencode-anthropic-auth/src/{auth,pkce,constants,transform,cch}.ts` → 纳管登录 + 请求改写（服务端化）。
 - `claude-accounts-usage/src/{accounts,keeper,usage,constants}.ts` → 账号库 schema、原子写/锁、token-keeper、串行刷新+冷却、用量读取。
 
-**待定技术点（需一次实测/确认）**
+**待定技术点**
 
-- opencode 的 anthropic provider 是否能干净地覆盖 `baseURL` 并带自定义 key（大概率可以，需确认后是否还需保留客户端插件）。
-- Team 计划的细节：这些是 Team 席位还是个人 Max？Team 是否有 admin/seat API 可用于更规范的席位管理（比伪装 Claude Code 更合规）。
-- 实测：中心刷新 refresh 的同时，另一 IP 用其 access 打 inference 是否完全无冲突（预期无冲突——只有 refresh 轮换、access 使用不轮换）。
+- ~~opencode 的 anthropic provider 是否能干净地覆盖 `baseURL` 并带自定义 key~~ → **已确认可以，且不需要客户端插件。**
+  `opencode.json` → `provider.anthropic.options.{baseURL,apiKey}`；源码 `packages/llm/src/providers/anthropic.ts:13-18`
+  读 `options.apiKey` 并以 `x-api-key` 发送；`provider.ts:1582-1590` 的 merge 顺序保证 **config 恒胜**于
+  已存储凭据。Claude Code 侧用 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`（官方文档化支持）。
+  详见 [`options-analysis.md`](./options-analysis.md) §4，含三个必须注意的坑
+  （只设 baseURL 会导致池子被绕过 / 必须真流式 / `anthropic-beta` 必须原样透传）。
+- Team 计划的细节：这些是 Team 席位还是个人 Max？Team 是否有 admin/seat API 可用于更规范的席位管理（比伪装 Claude Code 更合规）。**仍待 owner 确认**——这直接决定是否可以走
+  [`options-analysis.md`](./options-analysis.md) §2 的方案 E（合规干净路线）。
+- **【最高优先级实验】** 中心刷新 refresh 的同时，另一 IP 用其 access 打 inference 是否完全无冲突。
+  预期无冲突（只有 refresh 轮换，access 使用不轮换），且已有 34.5k★ 生产项目的间接实证，
+  但我们自己**没有一手验证**，而整个项目的地基就压在这一条上。应在写任何产品代码之前跑掉。
+- **【新增风险，需持续关注】** `NATIVE_CLIENT_ATTESTATION`：Claude Code 源码
+  `src/constants/system.ts:73-88` 有 `cch=00000` 占位符，由 Bun 的**原生** HTTP 栈
+  （`Attestation.zig`，不在可读源码内）在发包前覆写为真实 attestation hash。
+  **任何 JS/Go/Rust 代理都无法复现。** 目前藏在 build flag 后，服务端是否已强制校验无法从外部判断。
+  一旦启用，纯软件代理路线整体失效。详见 [`options-analysis.md`](./options-analysis.md) §3.1.4。
 
 ---
 
@@ -215,6 +299,28 @@ access token 就是个无状态 Bearer，**不绑定 IP、不绑定机器**。
 **裁决：✅ FEASIBLE-WITH-CAVEATS。** 机制地基成立（access 跨机可用 + 唯一刷新者化解双机锁死），且几乎所有难点（轮换、串行刷新、429、请求改写、账号库一致性）在两个 base repo 里已有可移植的成熟实现。真正的门槛不在技术，而在**运营纪律（池外零副本刷新）**与**合规/安全**。
 
 **Top 3 风险**：① 池外出现第二个刷新者 → 账号锁死；② 多用户共享 per-account 5h/7d 限额 → 必须做账号租借/调度；③ 中心 token 库单点泄露 + 账号共享 ToS 封号风险。
+
+> **【本轮补充】初版风险清单不完整**，深化分析新增四条同等或更高量级的风险，完整登记册见
+> [`options-analysis.md`](./options-analysis.md) §8：
+> - **伪装漂移**：ex-machina 一年 ~145 PR / ~10 次纠正性发布追这套伪装，v1.4.0 整套架构在 v1.6.1 被完全回滚。
+>   自建代理 = 把这份对活体反滥用分类器的持续逆向工程搬进自己的 on-call，且一个常量过期会**同时** 400 掉全体用户。
+> - **静默计费漂移**：伪装不完美但未触发硬错时，流量被重分类为第三方 →
+>   `"Third-party apps now draw from your extra usage, not your plan limits"`，
+>   账单从订阅额度漂到按 token 计费的 overage，**无任何告警**。这是财务风险，不是可用性风险。
+> - **`NATIVE_CLIENT_ATTESTATION`**：见上文「待定技术点」。一旦服务端启用，纯软件代理整体失效。
+> - **单一出口 IP 的 IP 维度 429**：部分 429 按出口 IP 计（`teamclaude` 为此加了住宅代理故障转移），
+>   切账号无效。而本项目是单台中心服务器 = 单一出口 IP。
+>
+> 另：初版把封号写成「可能违反 ToS」的假设。实际已有实锤——`claude-relay-service#587` 有多人第一手
+> 报告 $200/月 Max 20x 账号入池后**数天内被封**；`#1108` 是一批稳定半年的账号在 CLI 版本更新后集中被封。
+> 且 **opencode 已在 v1.3.0 主动下架捆绑的 Anthropic OAuth 插件，理由是「Anthropic explicitly prohibits this」**
+> ——本项目的 base repo `ex-machina` 正是被点名的那一类。
+>
+> 但需与之拆开的一点：Anthropic **官方文档化并支持 LLM Gateway 机制本身**
+> （`llm-gateway-protocol` / `llm-gateway-connect`），只声明不背书具体网关产品。
+> **机制是合法的，违规点在于往里灌池化的订阅 OAuth token。** 由此浮现出初版没有的**方案 E**
+> （池子持 Console 按量计费 API key）——唯一合规干净的路线，代价是放弃共享订阅额度。见
+> [`options-analysis.md`](./options-analysis.md) §2。
 
 **建议下一步（给 owner）**
 
@@ -225,4 +331,7 @@ access token 就是个无状态 Bearer，**不绑定 IP、不绑定机器**。
 
 ---
 
-*本报告为 Issue #1 的 research 交付物。base 源码机制细节另见 claude-accounts-usage 的 `docs/` 三篇分析。*
+*本报告为 Issue #1 的第一版 research 交付物。base 源码机制细节另见 claude-accounts-usage 的 `docs/` 两篇分析。*
+
+*逐方案（A/B/C/D/E）的详细可行性分析、证据强度分级、客户端接入实测、封号证据与完整风险登记册，
+见 [`options-analysis.md`](./options-analysis.md)。若两份报告有冲突，以 `options-analysis.md` 为准。*
