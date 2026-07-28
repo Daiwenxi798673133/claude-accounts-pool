@@ -7,26 +7,45 @@
 > 本报告基于对两个 base repo 源码的实读得出结论，所有机制论断都附了文件出处，不含任何真实 token。
 >
 > **调研来源（已 clone 实读）**
-> - `Daiwenxi798673133/claude-accounts-usage` —— 现有的 opencode 多账号管理插件，含 `docs/` 两篇机制分析
+> - `Daiwenxi798673133/claude-accounts-usage` —— 现有的 opencode 多账号管理插件，含 `docs/` 三篇机制分析
 > - `ex-machina-co/opencode-anthropic-auth` —— 上游 auth 插件，负责把 Claude 账号接入 opencode 的 OAuth 登录 + token 刷新 + 请求改写
 >
 > ---
 >
-> ## ⚠️ 勘误声明（2026-07-27）
+> ## ⚠️ 勘误声明（2026-07-28 修订）
 >
-> 本报告初版存在**一处伪造引用**和**一处事实错误**，已在下文就地修正，完整分析见
-> [`options-analysis.md`](./options-analysis.md) §0。
+> 本节此前（2026-07-27）曾指控初版存在「伪造引用」。**该指控不成立，现予撤回**；同一轮提出的
+> 另外两处技术修正**属实且重要，予以保留**。
 >
-> 1. **伪造引用**：初版四次引用 `docs/账号token迁移到新电脑操作指南.md`，**该文件不存在**。
->    `claude-accounts-usage/docs/` 只有 `claudecode-usage-查询机制分析.md` 与
->    `ex-machina-源码机制分析.md` 两个文件，git 历史（`32da7e4`）只有一次 docs 提交。
->    受影响最严重的是「access token 跨机器可用**已实证**」这句——该实验从未存在。
->    结论仍然成立，但依据换成了生产级账号池项目的大规模实证（见 §2.1 修正后正文）。
-> 2. **事实错误**：初版把 `cch` / billing header 归类为 HTTP 头。实际上它是
->    **system prompt 数组的第 0 个 block**，服务端从请求体里解析。按初版理解实现会导致
->    伪装静默失效。已修正 §4 架构图与 §1.1。
+> ### 撤回：所谓「伪造引用」实为审计方使用了旧检出
 >
-> 本报告其余机制论断经本轮交叉验证后维持不变。
+> 上一轮审计称初版引用的 `claude-accounts-usage/docs/账号token迁移到新电脑操作指南.md`
+> 「不存在」。对上游仓库重新 clone 核验的结果是——**该文件存在**：
+>
+> ```
+> docs/ 实有 3 个文件（该文件 180 行）
+> git log --diff-filter=A -- 'docs/*'   →  2 次提交，非 1 次
+>   4d50c07  2026-07-24  docs: 新增账号 token 迁移到新电脑操作指南   ← 被判为"不存在"的那个
+>   32da7e4  2026-06-13  docs: 新增 ex-machina 与 Claude Code 源码机制分析
+> ```
+>
+> **根因**：该轮审计的证据源是本地旧检出 `../claude-accounts-usage`，其工作副本停留在
+> 2026-07-24 之前，`docs/` 里确实只有 2 个文件；同样的 `git log` 命令在新 clone 上返回 2 次提交。
+> 初版引用有效，**未发生伪造**。
+>
+> 连带撤回：初版「access token 跨机器可用**已实证**」这句**成立**，且属**一手证据**——该文件
+> 「踩坑 B」记录的正是这个实验：旧机签发的 access token 拿到新机（不同机器 / 不同 IP）调
+> `/api/oauth/usage`，返回 `200` 与真实用量。上一轮把它降级为「仅有间接证据、待补一手验证」是错的。
+>
+> ### 保留：两处技术修正属实
+>
+> 1. **billing header 不是 HTTP 头**：它是 **system prompt 数组的第 0 个 block**
+>    （`transform.ts:358` `parsed.system.unshift(...)`），服务端从请求体解析。初版写成「指纹头」
+>    不准确，按初版理解实现会导致伪装静默失效。已修正 §1.1 与 §4。
+> 2. **`auth.json` 才是活跃链的真相源（INV-2）**：见 `usage.ts:247`。初版写成
+>    「账号库是数据源」方向反了。已修正 §1.2。
+>
+> 本报告其余机制论断经交叉验证后维持不变。
 
 ---
 
@@ -95,7 +114,8 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 
 ### 1.2 claude-accounts-usage = 多账号管理策略（池子可直接复用的核心）
 
-**存储模型（两个文件，都是 `0600`）**——见 `src/accounts.ts:7-21,48-56`（初版此处同样误引了那个不存在的文件，已改为源码出处）：
+**存储模型（两个文件，都是 `0600`）**——见 `src/accounts.ts:7-21,48-56`（源码出处；
+迁移指南 §1 亦有同一份说明）：
 
 | 文件 | 作用 |
 |---|---|
@@ -130,8 +150,8 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 2. **同一账号不能有两个独立的刷新者** —— 两边各自刷新会互顶，其中一方永久 `invalid_grant` 锁死。
 3. access token 只会自己按时过期、别人刷新不顶它；但过期后要靠 refresh 续命，refresh 若被铁律 2 顶掉就续不了 → 锁死。
 
-> **【已勘误】** 初版把这三条归属于 `docs/账号token迁移到新电脑操作指南.md §4`（不存在的文件）。
-> 结论正确，真实出处是：
+> **出处**：这三条原文见 `claude-accounts-usage/docs/账号token迁移到新电脑操作指南.md §4`
+> （该文件存在，见文首勘误声明——此前一轮审计误判其不存在，已撤回）。此外还有多个独立来源交叉印证：
 > - 铁律 1：`ex-machina-源码机制分析.md §3b-3c`（ex-machina `index.ts` 每次刷新写回 `json.refresh_token`）+
 >   sing-box `credential.go` 实读，两个独立实现交叉验证。
 > - 铁律 2：`claudecode-usage-查询机制分析.md §3`（引 sub2api Issue #1035 / PR #1039、#1382）
@@ -141,8 +161,8 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 >   v2.1.136 用跨进程锁 + 锁内重读修复）。
 > - 铁律 3：由铁律 1、2 推导 + `claude-accounts-usage/src/usage.ts:104-106,331-333` 的刷新判据实现印证。
 >
-> 注意：`.omo/` 那份事故日志与其回归测试（两个真实子进程竞争单次性轮换 token）是整个证据库里
-> **唯一达到「实验证实」强度**的材料，但其作用域是**同机多进程**，从未测试跨机器场景。
+> 注意 `.omo/` 那份事故日志与其回归测试（两个真实子进程竞争单次性轮换 token）作用域是**同机多进程**；
+> 跨机器场景由迁移指南的实操记录覆盖（见 §2.1）。
 
 ---
 
@@ -150,22 +170,26 @@ USER_AGENT   = 'claude-cli/2.1.87 (external, cli)'
 
 ### 2.1 access token 能不能给别的机器/别的 IP 用？ → **能**（这是整个 pool 的地基）
 
-> **【已勘误】** 初版此处引用 `docs/账号token迁移到新电脑操作指南.md` 的「搬到另一台电脑后 curl
-> `/api/oauth/usage` 返回 200」实验。**该文件与该实验均不存在**（见文首勘误声明）。
-> `claude-accounts-usage` 全库从未测试过跨机器使用 access token——该项目的设计空间全是单机多进程。
+**一手证据**（来自 `claude-accounts-usage/docs/账号token迁移到新电脑操作指南.md`，该文件确实存在，
+见文首勘误声明）：
 
-真实依据是**生产级部署的大规模实证**：`sub2api`（34.5k★，Go）、`claude-relay-service`（12.4k★，Node）、
+- 「踩坑 B」记录，**旧机签发的 access token 被带到新机（不同机器、不同 IP）后仍然有效**：
+  用 usage 接口实测，两个账号的 access「都还有约 6 小时有效（接口 `200` 返回真实用量）」。
+  这正是「access token 跨机器可用」的定向验证。
+- §3 步骤 5 的验证流程同样在新机上用 `curl .../api/oauth/usage -H 'Authorization: Bearer <access>'`
+  逐个账号确认 `200`。
+
+**旁证：生产级部署的大规模实证**。`sub2api`（34.5k★，Go）、`claude-relay-service`（12.4k★，Node）、
 `clewdr`（1.2k★，Rust）等项目，正是在机房 IP 上持有池化 refresh token、刷出 access、代理转发给任意
 IP 的用户，且持续活跃维护。若 access token 绑 IP 或绑机器，这些项目一天都活不下去。
 
-这比任何一次性 curl 实验都强，但性质是**间接证据**：我们自己**没有**做过一手定向验证。
+两类证据（一手实操记录 + 生产规模旁证）互相印证：**access token 是无状态 Bearer，不绑 IP、不绑机器**。
 
 **推论**：中心服务器持有 refresh、刷出 access，把 access（或代理转发）交给任意 IP 的用户使用，机制上成立。
 
-**建议补做的一手实验**（成本极低，可把此条从「间接证据」升级为「已实证」）：在中心机刷新某账号后，
-立刻从另一台不同 IP 的机器用该 access token 打一次 `/v1/messages`（带完整伪装头）与
-`/api/oauth/usage`，确认均为 200。这是整个项目最该优先跑的验证，见
-[`options-analysis.md`](./options-analysis.md) §7。
+> 仍建议在自己的部署环境跑一次冒烟验证（成本极低）：中心机刷新某账号后，立刻从另一台不同 IP 的机器
+> 用该 access token 打一次 `/v1/messages`（带完整伪装头）与 `/api/oauth/usage`，确认均为 200。
+> 这不是因为结论存疑，而是把「别人的环境成立」坐实为「我们的环境成立」。
 
 ### 2.2 「同账号双机锁死」在 pool 场景下怎么解？ → **靠"唯一刷新者"化解**
 
@@ -283,9 +307,11 @@ IP 的用户，且持续活跃维护。若 access token 绑 IP 或绑机器，�
   （只设 baseURL 会导致池子被绕过 / 必须真流式 / `anthropic-beta` 必须原样透传）。
 - Team 计划的细节：这些是 Team 席位还是个人 Max？Team 是否有 admin/seat API 可用于更规范的席位管理（比伪装 Claude Code 更合规）。**仍待 owner 确认**——这直接决定是否可以走
   [`options-analysis.md`](./options-analysis.md) §2 的方案 E（合规干净路线）。
-- **【最高优先级实验】** 中心刷新 refresh 的同时，另一 IP 用其 access 打 inference 是否完全无冲突。
-  预期无冲突（只有 refresh 轮换，access 使用不轮换），且已有 34.5k★ 生产项目的间接实证，
-  但我们自己**没有一手验证**，而整个项目的地基就压在这一条上。应在写任何产品代码之前跑掉。
+- **【最高优先级实验】** 中心刷新 refresh 的**同时**，另一 IP 用其 access 打 **inference** 是否完全无冲突。
+  注意这比「access token 跨机可用」更窄：后者已有一手实证（迁移指南「踩坑 B」，见 §2.1）+ 34.5k★
+  生产项目旁证；**尚未被直接覆盖的是** `/v1/messages` 这个端点本身，以及「刷新与使用并发」这一时序。
+  预期无冲突（只有 refresh 轮换，access 使用不轮换），但整个项目的地基压在这条上，
+  应在写任何产品代码之前用一次低成本冒烟跑掉。
 - **【新增风险，需持续关注】** `NATIVE_CLIENT_ATTESTATION`：Claude Code 源码
   `src/constants/system.ts:73-88` 有 `cch=00000` 占位符，由 Bun 的**原生** HTTP 栈
   （`Attestation.zig`，不在可读源码内）在发包前覆写为真实 attestation hash。
