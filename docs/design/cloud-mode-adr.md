@@ -122,7 +122,34 @@ worker 的 auth.json = 「过期 access + 无/无效 refresh」时，用**真实
 
 ---
 
-## 7. 决策修订：决策 6 的「逐响应回传」被证伪（2026-07-30，实施阶段发现）
+## 7. 决策修订（2026-07-30，实施阶段实测发现）
+
+### 7.0 决策 1 的编码方式必须改：opencode 要求 `refresh` 字段存在，否则**静默丢弃整个凭据**
+
+原决策 1 写的是「worker 的 auth.json 只写 access + expires，**永不写 refresh**」。**实测证明这样 worker 根本跑不起来。**
+
+**实验**（隔离 `XDG_DATA_HOME`，未触碰真实 auth.json，opencode 1.18.9）：
+
+| # | anthropic 条目内容 | `opencode auth list --pure` 结果 |
+|---|---|---|
+| A（对照） | `type + access + expires + refresh`，**refresh 是假字符串** | `● Anthropic oauth` → **1 credentials** ✅ |
+| B | `type + access + expires`，**无 refresh** | **0 credentials** ❌ |
+
+**结论**：opencode 的运行时校验**要求 oauth 条目带 `refresh`**（与官方 SDK 类型 `OAuth = { type, refresh: string, access, expires }` 的必填声明一致）。缺失时条目被**静默丢弃**——exit 0、零报错、零日志。`anthropic` provider 因此没有任何凭据，ex-machina 的 loader 拿不到可用 auth，worker 完全不可用。**这是本 ADR 未预见、research 也未覆盖的失败模式，且失败形状最坏（静默）。**
+
+**修订后的决策 1**：
+
+> worker 的 auth.json 写 `access + expires + 哨兵 refresh`——一个**明确的、可识别的非真实 token 常量**（例如 `"cloud-worker-no-refresh-sentinel"`）。
+
+**为什么这仍然完整保住原始意图**：
+1. 哨兵**不是** refresh token，worker 手里依然**没有任何可用于刷新的凭据**；master 仍是唯一刷新者。铁律 2 的双机互顶前提依然被消除。
+2. 实验 A 已证明 refresh 的**值不被校验**，只校验字段存在性 → 哨兵满足 schema。
+3. **双重保护**：正常路径下 keeper 把 `expires` 续在未来 → ex-machina 的刷新分支永不触发（`index.ts:49` 无 buffer，已源码确证）；万一 gate 失守真的触发了，ex-machina 拿哨兵 POST → Anthropic 400 → **只重试 5xx 故立即 throw → 绝不写 auth.json、绝不 rotate 任何东西**（`index.ts:84-92`、`auth.set` 仅在 `response.ok` 后）。**没有合法 refresh 被发出，master 的链路零风险。**
+
+**新增实现约束（否则哨兵会变成新的 bug 源）**：
+- 哨兵必须是**可识别的常量**，且 cloud-worker 模式下 `autoCapture` / `onAuthJsonChanged` 的捕获路径**必须拒绝把它当成真实 refresh 收录进账号库**，更不能回传 master。这是 INV-2（auth.json 为活跃链真相源）在 worker 侧被废弃后必须补上的护栏。
+
+### 7.1 决策 6 的「逐响应回传」被证伪
 
 **结论：决策 6 原文「worker 逐响应回传 ratelimit 头」在 opencode 插件层不可实现。**
 
