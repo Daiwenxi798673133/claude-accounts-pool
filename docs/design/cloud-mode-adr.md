@@ -106,6 +106,38 @@ research 对该变体的定性必须原样带入本 ADR：**「唯一能干净�
 
 ---
 
+## 4.5 Gate-0 实测结果（2026-07-31 凌晨，真实账号实跑）
+
+### ✅ 实验 1（lease 形态功能验证）—— PASS
+隔离 `XDG_DATA_HOME` 沙箱，`auth.json` = `{真 access, 哨兵 refresh, 真 expires}` → `opencode run` 走**真实 ex-machina** → **推理成功**。事后沙箱 `auth.json` 的 `refresh` **仍是哨兵**，证明 ex-machina 全程未触发刷新。前置的 containment 门禁（假 token → `Invalid bearer token`）证明请求真的到达 Anthropic、哨兵不阻断链路、且沙箱未回落到真实凭据。
+
+⇒ **决策 1 + 修订 A1 在真实 API 上被验证**：worker 只持 `access + 哨兵` 即可跑真实推理，且不会成为第二个刷新者。
+
+### ⚠️ 计费桶归属 —— 本机无法测定（诚实记账）
+今晚无干净受试账号：一个 vince 号 7d 额度 100% 耗尽（请求撞 429），另一个正是执行本工作的 agent 会话所用账号（自身流量持续移动计数器，单次小请求的 delta 被噪声淹没），第三个账号所有者明令禁止使用。
+
+**但更重要的是一个分析修正**：research §9 实验 1 的原协议测的是「原生客户端 + `ANTHROPIC_AUTH_TOKEN`」= **通道 1（绕过伪装）**，而本架构走**通道 2（写凭据文件 + 未经修改的真实 ex-machina）**。§3.1.3 的静默重分类风险源于**方案 A 自行重写伪装**；cloud-worker 的请求与今日常规流量同源。⇒ 真正剩余的未证问题窄化为「**Anthropic 是否按源 IP 区别计费**」——本机永不可测，需第二台机器；research 已有反面证据（access token 不绑 IP）。
+
+### 🚨 实验 2（refresh 归属权）—— 推翻先验，暴露真实设计缺陷
+| 步骤 | 观测 |
+|---|---|
+| 刷新前 `access1` | HTTP **200** |
+| `POST /v1/oauth/token`（`grant_type=refresh_token`） | 成功，`refresh2 ≠ refresh1`（轮换确认），`expires_in=28800s`（8h） |
+| **刷新后 `access1`** | HTTP **401** |
+| 新 `access2` | HTTP **200** |
+
+⇒ **Anthropic 在刷新时立即作废上一枚 access token。** 这违反常规 OAuth 2.0 语义（access token 本应独立按期失效），也推翻了「从 OAuth 语义 + 生产池存活推断不会作废」的先验论证。
+
+**由此暴露的缺陷：缓冲区方向是反的。** master 在 `expires - MASTER_MIN_REMAINING_MS`（10min）刷新 → 所有在外租约当场死亡；而 worker 直到 `expiresAt - LEASE_RENEW_BUFFER_MS`（5min）才续租 ⇒ **中间 5 分钟 worker 手持死 token**。
+
+**修法（两层，均已实施）**：
+1. **INV-CLOUD-4**：master 下发 `expiresAt = accountExpires - MASTER_MIN_REMAINING_MS`（即 master 自己可刷新的时刻）。worker 的 5min 缓冲随即落在其之前 ⇒ 恒早于 master 轮换至少 5 分钟续租。租约视界若已过期则返回 503，绝不下发「到手即死」的 token。
+2. **INV-CLOUD-5**：worker 把 **401 当作「租约被轮换」**而非额度问题——立刻以 `reason:"prelease"` 重新领租并续接，**不冷却该账号、不通知 master 排除它**。把 401 误route进限流路径会白白冷却一个健康账号、削减池子容量。
+
+**连带影响**：这条也解释了为什么「master 必须是唯一刷新者」比原先理解的更严格——任何一次池外刷新不仅会轮换 refresh 链，还会**当场击毙所有在外的 access 租约**。
+
+---
+
 ## 5. 开工前硬门槛：Gate-0（决策做完也不能跳）
 
 两个实验来自 research §9，本 B 变体对它们比代理更敏感。**在写任何产品代码之前必须跑完。**
