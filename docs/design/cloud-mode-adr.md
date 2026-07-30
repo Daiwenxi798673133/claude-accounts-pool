@@ -31,7 +31,7 @@ research 对该变体的定性必须原样带入本 ADR：**「唯一能干净�
 | 3 | 撞限自动切号 | **worker 检测+续接，master 决策换号** | 429 和 session 事件物理上只在 worker 看得到（检测 + 原 session 发 continue 必须留 worker）；选号归 master（符合决策 2），冷却状态机集中在 master 一处（避免 R7 在每台机器复刻 429 分类逻辑）。 |
 | 4 | worker↔master 鉴权/传输 | **内网/VPN + 每 worker 一个 pool-key（Bearer）** | 决策 1 是拉取续租 → 普通请求/响应，无需长连接。master 只在内网面暴露，pool-key 可单独撤销/审计/限流，把 research §2.6 风险②（中心 token 库泄露）暴露面压到最低。 |
 | 5 | 续租失败 fail-safe | **提前续租 + 过期即硬阻报错（宁停勿污）** | keeper 剩 N 分钟就续租+指数退避；万一真过期且 master 不可达，worker gate 直接拦请求报错，**绝不让 ex-machina 用 `refresh: undefined` 去 POST、绝不弹 /login**。宁可任务暂停，也不污染凭据、不铸新链（R2）。 |
-| 6 | 用量可观测 | **worker 逐响应回传 ratelimit 头** | 决策 2 要按用量轮转，实时用量只在 worker 的 `anthropic-ratelimit-unified-*` 响应头里。**残留缺口**：纯静默的「200 + 扣错桶」计费漂移（R1）在响应头里看不到，需查用量页——这只眼睛暂时闭着，待 Gate-0 实验 1 结果决定是否补 master 轮询。 |
+| 6 | 用量可观测 | **worker 逐响应回传 ratelimit 头** ⚠️**已修订，见 §7**| 决策 2 要按用量轮转，实时用量只在 worker 的 `anthropic-ratelimit-unified-*` 响应头里。**残留缺口**：纯静默的「200 + 扣错桶」计费漂移（R1）在响应头里看不到，需查用量页——这只眼睛暂时闭着，待 Gate-0 实验 1 结果决定是否补 master 轮询。 |
 | 7 | 纳管入口 | **master 上跑 ex-machina PKCE 登录，keeper 自动收录** | 复用现有全套 autoCapture 逻辑，零新代码。定死了 master 上必须装 ex-machina（纳管要用）。硬规矩：纳管进池的账号，池外一切副本必须清除（否则铁律 2 锁死）。 |
 | 8 | master 角色 | **纯 token 维护 + lease server，不跑 inference** | auth.json 的「单一 activeId」语义在 master 上废弃，账号库成为真相源（正是 research §1.2 预言的转变）。keeper 从「依赖 ex-machina 惰性刷活跃号 + 只主动刷非活跃号」改造成「主动刷全部账号」。opencode server 只承载插件运行时 + 管理面。 |
 | 9 | provider 范围 | **MVP 只 cloud 化 Claude；OpenAI 走本地不纳池** | OpenAI 侧机制不同且更危：codex 是刷新者、refresh 重放吐销整个 token 族、插件 keepalive/autoswitch 默认关且只单账号验证过。收窄到 anthropic 单 provider 避雷。 |
@@ -119,6 +119,37 @@ research 对该变体的定性必须原样带入本 ADR：**「唯一能干净�
 worker 的 auth.json = 「过期 access + 无/无效 refresh」时，用**真实 ex-machina** 观察其实际行为（是否 POST `refresh: undefined`、是否弹重登、是否污染凭据）。
 - 直接验证决策 1 + 决策 5 的地基是否成立。
 - 若规避这个问题必须 fork ex-machina，则「把伪装维护外包给上游」的论据塌掉一半。
+
+---
+
+## 7. 决策修订：决策 6 的「逐响应回传」被证伪（2026-07-30，实施阶段发现）
+
+**结论：决策 6 原文「worker 逐响应回传 ratelimit 头」在 opencode 插件层不可实现。**
+
+### 证据（一手源码，非推断）
+
+1. `session.status` 的事件形状在本仓代码里写死，**只有三个字段**：
+   ```typescript
+   properties: { sessionID: string; status?: { type: string; message?: string; next?: number } }
+   const error: RetryErrorLike = { message: status.message }   // ← 只有 message
+   ```
+2. `RetryErrorLike`（`statusCode` / `responseHeaders` / `responseBody`）**不是插件 API 提供的类型，是本仓自己手写的期望形状**（`src/providers.ts:8-13`）。其注释原文：
+   > `session.status(retry)` fills in `message` ONLY; `session.error` can carry the full HTTP triple.
+3. 在 `node_modules/@opencode-ai/plugin@1.18.9` 的**全部 `.d.ts` 中 grep `responseHeaders|responseBody|statusCode` → 零命中**。插件 API 没有响应头这一类型化表面。
+4. 头部唯一可能的来源是 `session.error` → `toErrorData()`，而它**只认 `name === "APIError"` 的 `.data`**（`src/autoswitch.ts:37-42`）——**仅存在于错误路径**。
+
+→ **成功响应的 ratelimit 头在插件层不存在。** master 无法从 worker 流量获得稳态的 per-account 剩余额度。
+
+### 修订后的决策 6（不删需求，换成唯一能达成同一目的的机制）
+
+| 用途 | 机制 |
+|---|---|
+| **稳态轮转数据**（服务决策 2 的按用量选号） | **master 轮询 `/api/oauth/usage`** —— master 本就持全部 refresh，仓内已有 `fetchUsage` / `collectAllUsage` 打 `USAGE_ENDPOINT` 的成熟实现可直接复用。这正是决策 6 当时的选项 2。 |
+| **撞限即时信号**（服务决策 3 的换号） | **worker 回传它唯一能看到的限流头** —— 即 `session.error` 的 `APIError.data` 里的 `anthropic-ratelimit-unified-*`。这本就是决策 3 要求的「worker 上报撞限」，两者合并为同一条上报。 |
+
+**连带影响**：master 轮询会顺带拿到 plan-limit 与 overage 两个桶，因此 ADR §4 里「R1 静默计费漂移这只眼睛暂时闭着」的缺口**被动补上了一半**——但仍需 Gate-0 实验 1 确认扣费桶归属，轮询只能观测、不能证明归因。
+
+**代价**：`/api/oauth/usage` 有已知的持续 429 问题（upstream #31021），且粒度粗、有延迟。轮询节奏必须复用 keeper 既有的「串行 + 账号间隔 + per-account 429 冷却」纪律，不能并行打。
 
 ---
 
