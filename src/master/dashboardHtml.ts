@@ -1,18 +1,12 @@
-// The read-only dashboard's HTML shell: ONE string, zero dependencies, zero build step, and — the
-// property everything else here rests on — ZERO DATA. No account, no utilization number, no key.
-//
-// WHY THE SHELL IS UNAUTHENTICATED. A browser navigating to a URL cannot send an Authorization
-// header, so gating this document behind the pool key would make it unreachable from a browser at
-// all; the only way to serve it under Bearer auth would be a key in the query string, which lands in
-// shell history, proxy logs and the browser's own history — strictly worse than an inert document.
-// Because it discloses nothing beyond "a master lives here" (which /v1/health already answers to an
-// unauthenticated caller by design), serving it keyless costs nothing. The KEY is typed into the
-// page, kept in sessionStorage — scoped to this origin and gone when the tab closes, unlike
-// localStorage — and travels ONLY in the Authorization header of the fetch below.
+// The read-only dashboard's HTML page: ONE string, zero dependencies, zero build step. It holds no
+// data of its own — it fetches the JSON route below and renders it — so the document is identical
+// for every viewer and can be built once at startup.
 //
 // DATA REACHES THE DOM THROUGH textContent AND style.width ONLY, NEVER innerHTML. `label` is an
 // account email that originated in a profile response, and rendering pool-derived text as markup is
-// how a dashboard becomes an XSS vector against the one person on the network holding a pool key.
+// how a monitoring page becomes an XSS vector. This matters MORE now that the page is unauthenticated
+// (see the decision recorded on CLOUD_ROUTES.usage): there is no key gate in front of it to slow an
+// attacker who found a way to influence a label.
 //
 // The script is written in ES5-ish `var` / string-concatenation style on purpose: it is embedded in a
 // TS template literal, so every backtick and every `${` inside it would need escaping and would be
@@ -40,16 +34,6 @@ export function dashboardHtml(usageRoute: string): string {
   h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
   #meta { color: var(--dim); font-size: 12px; }
   #meta.stale { color: var(--full); font-weight: 600; }
-  #gate { margin: 24px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  /* An author-level display declaration beats the UA stylesheet's hidden-attribute rule, so without
-     this line setting gate.hidden would hide nothing and the key form would stay on screen even after
-     a successful load. */
-  #gate[hidden] { display: none; }
-  #gate input { flex: 0 1 380px; padding: 6px 8px; border-radius: 6px; border: 1px solid #30363d;
-                background: #010409; color: inherit; font-family: ui-monospace, monospace; }
-  #gate button { padding: 6px 14px; border-radius: 6px; border: 1px solid #30363d; background: #21262d;
-                 color: inherit; cursor: pointer; }
-  #gate-error { flex: 1 0 100%; margin: 0; color: var(--full); font-size: 12px; }
   #rows { display: grid; gap: 12px; margin: 20px 0 0; }
   .card { border: 1px solid #30363d; border-radius: 8px; padding: 12px 14px; background: #161b22; }
   .card.cooling { border-color: var(--full); }
@@ -77,25 +61,16 @@ export function dashboardHtml(usageRoute: string): string {
 </head>
 <body>
 <h1>账号池用量</h1>
-<div id="meta"></div>
-<form id="gate" hidden>
-  <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="pool key">
-  <button type="submit">查看</button>
-  <p id="gate-error" hidden></p>
-</form>
+<div id="meta">加载中…</div>
 <div id="rows"></div>
 <footer>只读视图：不含任何 token，也不提供任何改状态的操作。</footer>
 <script>
 (function () {
   "use strict";
   var USAGE_URL = "${usageRoute}";
-  var KEY_STORE = "claude-accounts-pool.dashboard.key";
   var RELOAD_MS = 60000;
   var TICK_MS = 1000;
 
-  var gate = document.getElementById("gate");
-  var gateError = document.getElementById("gate-error");
-  var keyInput = document.getElementById("key");
   var rows = document.getElementById("rows");
   var meta = document.getElementById("meta");
   var latest = null;
@@ -123,28 +98,10 @@ export function dashboardHtml(usageRoute: string): string {
     return "剩 " + fmtSpan(ms);
   }
 
-  function showGate(message) {
-    gate.hidden = false;
-    gateError.hidden = !message;
-    gateError.textContent = message || "";
-    rows.textContent = "";
-    meta.textContent = "";
-    meta.className = "";
-    keyInput.focus();
-  }
-
-  // Clearing the error text as well as hiding the form: a rejected key followed by a good one must
-  // not leave "pool key 无效" sitting above a page full of valid data.
-  function hideGate() {
-    gate.hidden = true;
-    gateError.hidden = true;
-    gateError.textContent = "";
-  }
-
   function renderMeta() {
     if (latest.at === 0) {
       meta.className = "stale";
-      meta.textContent = "尚未完成任何一轮轮询——下面没有可展示的用量数据。";
+      meta.textContent = "尚未完成任何一轮轮询——master 重启后首轮用量采集要等一个轮询周期(5 分钟)。";
       return;
     }
     var when = new Date(latest.at).toLocaleTimeString();
@@ -202,24 +159,13 @@ export function dashboardHtml(usageRoute: string): string {
   }
 
   function load() {
-    var presented = sessionStorage.getItem(KEY_STORE);
-    if (!presented) { showGate(""); return; }
-    fetch(USAGE_URL, { headers: { Authorization: "Bearer " + presented }, cache: "no-store" })
+    fetch(USAGE_URL, { cache: "no-store" })
       .then(function (res) {
-        if (res.status === 401) {
-          // The stored key is wrong or has been revoked. Dropping it here is what keeps the page
-          // from re-sending a dead credential once a minute forever.
-          sessionStorage.removeItem(KEY_STORE);
-          showGate("pool key 无效或已吊销，请重新输入。");
-          return null;
-        }
         if (!res.ok) throw new Error("HTTP " + res.status);
         return res.json();
       })
       .then(function (payload) {
-        if (!payload) return;
         latest = payload;
-        hideGate();
         render();
       })
       .catch(function (error) {
@@ -227,17 +173,6 @@ export function dashboardHtml(usageRoute: string): string {
         meta.textContent = "拉取失败：" + error.message;
       });
   }
-
-  gate.addEventListener("submit", function (event) {
-    event.preventDefault();
-    var value = keyInput.value.trim();
-    if (!value) return;
-    sessionStorage.setItem(KEY_STORE, value);
-    // Cleared immediately so the live credential does not sit in a DOM node for the rest of the session.
-    keyInput.value = "";
-    hideGate();
-    load();
-  });
 
   load();
   // Two clocks: the countdowns tick locally every second, while the snapshot itself is refetched

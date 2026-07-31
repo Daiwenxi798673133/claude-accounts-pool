@@ -205,13 +205,16 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     return new Response(null, { status: 204 })
   }
 
-  // READ-ONLY, and deliberately behind the SAME pool key as the two POSTs. The payload names every
-  // account in the pool and how much of each subscription is left — precisely the reconnaissance a
-  // stolen key wants — so it may not be public. It carries no token of any kind (enforced by the
-  // view's type, see usageView.ts), so what the key gates here is the ROSTER, not a credential.
-  // Serving it costs the upstream API nothing: this reads the usage poller's existing snapshot and
-  // never issues a request of its own, so refreshing the page cannot provoke `/api/oauth/usage`.
-  async function handleUsage(_req: Request, workerId: string): Promise<Response> {
+  // READ-ONLY AND UNAUTHENTICATED — see the decision recorded on CLOUD_ROUTES.usage. Two properties
+  // are what make that safe enough to be a choice rather than a bug, and BOTH must survive any edit
+  // here:
+  //   1. NO CREDENTIAL IS REACHABLE FROM THIS PAYLOAD. Enforced by the view's type (usageView.ts),
+  //      not by care taken in this function. Never build a row by spreading a StoredAccount.
+  //   2. IT CANNOT BE USED TO DRIVE THE POOL. It reads the usage poller's existing snapshot and
+  //      issues no request of its own, so an anonymous caller hammering this route cannot provoke
+  //      `/api/oauth/usage` (whose 429 lasts minutes and is charged to this master's egress IP),
+  //      cannot mint a token, and cannot move an account.
+  async function handleUsage(): Promise<Response> {
     const view = buildUsageView({
       accounts: await deps.loadAccounts(),
       snapshot: deps.scheduler.getUsageSnapshot(),
@@ -219,7 +222,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       // detached method would break on any implementation that is not closure-based.
       isCoolingDown: (accountId) => deps.scheduler.isCoolingDown(accountId),
     })
-    log.debug("master:usage-served", { workerId, accounts: view.accounts.length, stale: view.stale })
+    log.debug("master:usage-served", { accounts: view.accounts.length, stale: view.stale })
     return json(200, view)
   }
 
@@ -239,10 +242,10 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // "public" by forgetting to opt in.
     [CLOUD_ROUTES.lease]: (req) => authed(req, handleLease),
     [CLOUD_ROUTES.ratelimit]: (req) => authed(req, handleRateLimit),
-    [CLOUD_ROUTES.usage]: (req) => authed(req, handleUsage),
-    // The SECOND unauthenticated route, and the reason it is allowed to be one is the same as
-    // health's: it discloses nothing. The document is inert — no account, no number, no key — and
-    // the data it goes on to fetch is gated above. See the header on dashboardHtml.ts.
+    // The dashboard pair, both keyless. Note what is NOT relaxed by that: `lease` and `ratelimit`
+    // above still go through `authed`, because those two mint credentials and move pool state. This
+    // table is the one place that contrast is visible, so keep it that way.
+    [CLOUD_ROUTES.usage]: () => handleUsage(),
     [CLOUD_ROUTES.dashboard]: async () => html(dashboardShell),
   }
 
