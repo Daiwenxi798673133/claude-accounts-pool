@@ -312,20 +312,33 @@ function dashboardHarness(stale: boolean): Harness {
   })
 }
 
-test("usage requires the same pool key as the lease routes", async () => {
+test("usage is public, and that did not open the credential routes", async () => {
   const harness = dashboardHarness(false)
   try {
-    // Given: the dashboard's JSON names every account in the pool and how much of each subscription
-    // is left. When: it is asked for with no key, and then with a wrong one.
+    // Given: an anonymous caller with no Authorization header whatsoever. When: it asks for the
+    // dashboard's JSON.
     const anonymous = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)
-    const wrongKey = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`, { headers: { Authorization: "Bearer not-the-pool-key" } })
 
-    // Then: 401 both times, identically — that roster is reconnaissance a stolen or guessed key
-    // wants, so this route may not be the one place the pool answers an anonymous caller.
-    expect(anonymous.status).toBe(401)
-    expect(wrongKey.status).toBe(401)
-    expect(await anonymous.json()).toEqual({ error: expect.any(String) })
-    expect(await wrongKey.json()).toEqual({ error: expect.any(String) })
+    // Then: it is SERVED — a deliberate owner decision recorded on CLOUD_ROUTES.usage, resting on
+    // the payload being read-only and credential-free.
+    expect(anonymous.status).toBe(200)
+    expect(await anonymous.text()).not.toContain("sk-ant-")
+
+    // AND THE WHOLE POINT OF THIS CASE: the very same anonymous caller is still refused by the two
+    // routes that mint credentials and move pool state. A keyless dashboard must never become the
+    // reason a keyless lease works — that would turn a monitoring convenience into an open
+    // credential dispenser.
+    const lease = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
+    const ratelimit = await post(harness.base, CLOUD_ROUTES.ratelimit, {
+      workerId: WORKER_ID,
+      accountId: "acct-live",
+      headers: {},
+    } satisfies RateLimitReport)
+    expect(lease.status).toBe(401)
+    expect(ratelimit.status).toBe(401)
+    // Nothing was minted and no pool state moved, which is the consequence the statuses stand for.
+    expect(harness.refreshed).toEqual([])
+    expect(harness.reports).toEqual([])
   } finally {
     harness.stop()
   }
@@ -334,8 +347,8 @@ test("usage requires the same pool key as the lease routes", async () => {
 test("usage returns the whole pool with no token in it", async () => {
   const harness = dashboardHarness(false)
   try {
-    // When
-    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`, { headers: { Authorization: `Bearer ${POOL_KEY}` } })
+    // When: fetched the way the page itself fetches it — no credential of any kind.
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)
 
     // Then
     expect(res.status).toBe(200)
@@ -391,7 +404,7 @@ test("usage returns the whole pool with no token in it", async () => {
 test("usage marks a stale snapshot instead of presenting it as current", async () => {
   const harness = dashboardHarness(true)
   try {
-    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`, { headers: { Authorization: `Bearer ${POOL_KEY}` } })
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)
 
     // The scheduler's own staleness verdict is forwarded verbatim. Without it the page would draw a
     // confident green bar from numbers selection has already stopped trusting — a monitoring surface
@@ -406,15 +419,15 @@ test("usage marks a stale snapshot instead of presenting it as current", async (
   }
 })
 
-test("dashboard serves an inert HTML shell without a key, repeatedly", async () => {
+test("dashboard serves a data-free HTML page, repeatedly", async () => {
   const harness = dashboardHarness(false)
   try {
-    // Given: a browser navigating to a URL cannot send an Authorization header. When: it asks for the
-    // dashboard with no credential at all.
+    // When: a browser navigates to the dashboard.
     const res = await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)
 
-    // Then: it is served — and what it is served contains NO pool data whatsoever, which is the only
-    // reason a keyless route is acceptable on the port that also hands out live credentials.
+    // Then: the document itself embeds NO pool data and NO key — it fetches the JSON route at
+    // runtime. That is what lets one string be built at startup and shared by every viewer, and it
+    // keeps the page out of the "leaks on disclosure" class entirely.
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("text/html")
     const body = await res.text()

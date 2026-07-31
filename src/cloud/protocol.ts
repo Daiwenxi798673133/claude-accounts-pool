@@ -12,14 +12,18 @@ export const CLOUD_ROUTES = Object.freeze({
   ratelimit: "/v1/ratelimit",
   // GET — liveness/readiness probe.
   health: "/v1/health",
-  // GET — the read-only usage dashboard's JSON. The two routes below are master↔OPERATOR, not
-  // master↔worker: no leaseClient calls them. They live in this table anyway because the server's
-  // route map is a `Record<Route, RouteHandler>` derived from it, which is what makes "every route
-  // this master answers, and whether it needs a key" readable in one place.
+  // GET — the read-only usage dashboard's JSON, and GET / its HTML page. Both are master↔OPERATOR,
+  // not master↔worker: no leaseClient calls either. They live in this table anyway because the
+  // server's route map is a `Record<Route, RouteHandler>` derived from it, which is what makes
+  // "every route this master answers, and whether it needs a key" readable in one place.
+  //
+  // BOTH ARE UNAUTHENTICATED BY DELIBERATE DESIGN, unlike the two POSTs above. They are read-only
+  // and carry NO credential, so the most a reader gains is the pool's roster and how much of each
+  // subscription is left — a disclosure the pool owner accepted knowingly. The cost is real and
+  // must not be forgotten: the bind address is the operator's choice and is NOT necessarily
+  // loopback, so every peer that can reach the lease port can enumerate the pool, account emails
+  // included. What narrows that is the BIND ADDRESS, not a key on these two routes.
   usage: "/v1/usage",
-  // GET — the dashboard's HTML shell. Answered WITHOUT a key because the document carries no data
-  // at all (see dashboardHtml.ts); the key is typed into the page and only ever travels in the
-  // Authorization header of its fetch to `usage`.
   dashboard: "/",
 } as const)
 

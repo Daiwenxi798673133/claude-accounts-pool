@@ -104,7 +104,7 @@ cd claude-accounts-pool && bun install && bun run build
 1. **在 master 主机上逐个登录 Claude 账号**:照常 `opencode auth login`(经 ex-machina),master 的 keeper 会自动收录进账号库。
 2. **在 master 上跑 `reg` 命令给每台 worker 签发 pool key**。**明文 key 只显示这一次**(库里只存 SHA-256 摘要),请立刻粘进那台 worker 的 `tui.json`。
 3. **每台 worker 一把独立的 key**,可以单独吊销某一把。
-4. **想看全池用量**:在 master 主机上用浏览器打开 `http://<master 的 hostname>:<port>/`,输入任意一把 pool key 即可看到只读看板(JSON 接口是 `GET /v1/usage`)。详见 [docs/cloud-mode.md](docs/cloud-mode.md#只读用量看板)。
+4. **想看全池用量**:浏览器直接打开 `http://<master 的 hostname>:<port>/` 就是只读看板(JSON 接口是 `GET /v1/usage`),**免鉴权**。也就是说凡能连到这个端口的人都能看到池内账号与余量——[取舍与理由见此](docs/cloud-mode.md#为什么这两条路由是裸的)。
 5. **一条硬规矩:纳入池子的账号,在池外不能再有任何刷新者。** 旧机器上残留的登录、第二个 master,都算。Anthropic 的 refresh token 是一次性并且轮换的,而且(**实测**)一次刷新还会**立刻作废上一枚已签发的 access token**——池外的第二个刷新者不仅会打断 refresh 链,还会当场击毙所有在外的租约。
 
 ## 日志与排查
