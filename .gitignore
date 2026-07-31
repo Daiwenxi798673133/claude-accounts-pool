@@ -5,13 +5,23 @@ node_modules/
 dist/
 build/
 
+# Lockfile is not published with this package
+bun.lockb
+bun.lock
+
+# Atomic-write temp files (accounts.ts writes `<path>.tmp-<pid>-<ts>`)
+*.tmp-*
+
 # Tooling / agent state
+.opencode/
+.sisyphus/
 .omo/
 .codegraph/
 
-# Env / secrets
+# Env / secrets — vars.txt holds the npm publish token
 .env
 .env.*
+vars.txt
 *.log
 
 # OS
