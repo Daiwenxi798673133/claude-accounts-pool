@@ -4,6 +4,7 @@ import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { StoredAccount } from "./accounts.ts"
 import { NEEDS_REAUTH_ERROR, type AccountUsage, type UsageResponse, type UsageWindow } from "./usage.ts"
+import type { UsageAccountView, UsageSnapshotView, UsageWindowView } from "./cloud/protocol.ts"
 import type { OpenaiUsage, OpenaiWindow } from "./openai-usage.ts"
 import { planLabel } from "./profile.ts"
 import { currentConversation } from "./current-conversation.ts"
@@ -526,4 +527,84 @@ export function openUsageDialog(api: TuiPluginApi, options: UsageDialogOptions):
       onToggleExclude={(id, next) => void options.onToggleExclude(id, next)}
     />
   ))
+}
+
+// ── cloud-worker read-only usage view ────────────────────────────────────────────────────────
+// Renders the master's UsageSnapshotView verbatim (a worker never collects usage itself). Strictly
+// READ-ONLY — no switch/delete/exclude keys — because a worker does not own these accounts
+// (INV-CLOUD-2), and the wire type carries no credential to leak.
+
+function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
+  const theme = () => props.api.theme.current
+  return (
+    <box flexDirection="row" gap={1}>
+      <text fg={theme().textMuted}>{props.win.label.padEnd(6)}</text>
+      <text fg={tone(props.api, props.win.utilization)}>
+        {bar(props.win.utilization)} {percent(props.win.utilization)}
+      </text>
+      <Show when={props.win.resetsAt}>
+        <text fg={theme().textMuted}>重置 {resetIn(props.win.resetsAt!)}</text>
+      </Show>
+    </box>
+  )
+}
+
+function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView }) {
+  const theme = () => props.api.theme.current
+  const account = () => props.account
+  return (
+    <box flexDirection="column">
+      <box flexDirection="row" justifyContent="space-between" gap={1}>
+        <box flexDirection="row" gap={1}>
+          <text fg={theme().text}>{account().label}</text>
+          <Show when={account().coolingDown}>
+            <text fg={theme().warning}>冷却中</text>
+          </Show>
+          <Show when={account().needsReauth}>
+            <text fg={theme().error}>需重新登录</text>
+          </Show>
+        </box>
+        <Show when={account().excluded}>
+          <text fg="#22D3EE">不自动切</text>
+        </Show>
+      </box>
+      <box flexDirection="column" paddingLeft={4}>
+        <Show when={account().hasUsage} fallback={<text fg={theme().textMuted}>额度未知(不在本次快照)</text>}>
+          <For each={account().windows}>{(win) => <WorkerWindowRow api={props.api} win={win} />}</For>
+        </Show>
+      </box>
+    </box>
+  )
+}
+
+function WorkerUsagePanel(props: { api: TuiPluginApi; view: UsageSnapshotView }) {
+  const api = props.api
+  const theme = () => api.theme.current
+  return (
+    <box paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1} flexDirection="column">
+      <box flexDirection="row" justifyContent="center" width="100%">
+        <text fg={theme().text}>
+          <b>账号池用量(只读)</b>
+        </text>
+      </box>
+      <Show when={props.view.stale}>
+        <text fg={theme().warning}>⚠ 快照已陈旧,master 可能已停止轮询,以下数字仅供参考</text>
+      </Show>
+      <Show
+        when={props.view.accounts.length > 0}
+        fallback={<text fg={theme().textMuted}>账号池暂无用量数据</text>}
+      >
+        <For each={props.view.accounts}>{(account) => <WorkerAccountRow api={api} account={account} />}</For>
+      </Show>
+      <box flexDirection="row" justifyContent="space-between" gap={2}>
+        <text fg={theme().textMuted}>esc 关闭</text>
+        <text fg={theme().textMuted}>快照于 {clockTime(props.view.at)}</text>
+      </box>
+    </box>
+  )
+}
+
+export function openWorkerUsageDialog(api: TuiPluginApi, view: UsageSnapshotView): void {
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() => <WorkerUsagePanel api={api} view={view} />)
 }
