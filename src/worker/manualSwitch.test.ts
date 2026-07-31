@@ -7,7 +7,7 @@ const NOW = 1_900_000_000_000
 const LEASE = { accountId: "eaaa1a79-4c1d-4f6e-9a52-6b7c8d9e0f11", access: "sk-ant-oat01-leased", expiresAt: NOW + 3_600_000 }
 
 type LeaseCall = { reason: string; preferredAccountIdPrefix: string; attempts: number }
-type Written = { access: string; expires: number }
+type Written = { access: string; expires: number; accountId: string }
 type Toasted = { variant: string; message: string }
 
 // The collaborators are recorders, not mocks with canned assertions: what matters here is WHETHER a
@@ -45,10 +45,11 @@ test("a manual switch names the account, writes the lease and reports the accoun
   // for every other worker because one person changed their mind.
   // ONE attempt, because a human is watching a dialog for the verdict.
   expect(leases).toEqual([{ reason: "prelease", preferredAccountIdPrefix: "eaaa1a79", attempts: 1 }])
-  // ACCESS + EXPIRY ONLY — INV-CLOUD-1. There is no refresh field on this seam to leak, and the write
-  // shape is identical to the renewal loop's, so a manual switch cannot produce a credential a
-  // scheduled one could not.
-  expect(written).toEqual([{ access: LEASE.access, expires: LEASE.expiresAt }])
+  // ACCESS + EXPIRY ONLY as the credential — INV-CLOUD-1. There is no refresh field on this seam to
+  // leak, and the write shape is identical to the renewal loop's, so a manual switch cannot produce
+  // a credential a scheduled one could not. `accountId` is the operator's chosen account travelling
+  // to the seam's bookkeeping half, which is what lets /usage mark this row on the NEXT process too.
+  expect(written).toEqual([{ access: LEASE.access, expires: LEASE.expiresAt, accountId: LEASE.accountId }])
   expect(toasts).toHaveLength(1)
   expect(toasts[0].variant).toBe("success")
   expect(toasts[0].message).toContain("vince.dai3@potentia.ai")

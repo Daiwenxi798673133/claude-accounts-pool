@@ -353,6 +353,32 @@ export async function upsertAccount(
   return file
 }
 
+// WHICH ACCOUNT A CLOUD-WORKER'S CURRENT LEASE BELONGS TO. A worker's auth.json entry carries
+// access + expiry and the sentinel refresh — nothing that names an account — so without this record
+// the only place that knows is leaseKeeper's in-memory field, which is empty for the whole first
+// stretch of a process that booted onto a still-fresh on-disk lease. That gap is what left /usage's
+// "In Use" marker blank on the first call and left autoswitch reporting `""` as the spent account.
+//
+// DELIBERATELY NOT setActiveId: that one refuses an id absent from `accounts[]`, which is correct
+// for local mode (the pointer must name a record whose token this machine will actually load) and
+// wrong here — a worker's library is empty BY DESIGN (upsertAccount's sentinel-skip), so on a worker
+// this pointer legitimately names an account only the master holds.
+//
+// An id string only. There is no credential in this write, so it costs INV-CLOUD-1 nothing.
+export async function recordLeasedActiveId(id: string): Promise<void> {
+  await withAuthLock(async () => {
+    const file = await loadAccounts()
+    // Renewals re-lease the SAME account far more often than they move, and the read-modify-write
+    // below is a real disk write under a cross-process lock; skipping the no-op keeps a long-lived
+    // worker from rewriting this file every renewal for nothing.
+    if (file.activeId === id) return
+    const from = file.activeId
+    file.activeId = id
+    await saveAccounts(file)
+    log.info("accounts:record-leased-active", { from, to: id })
+  })
+}
+
 export async function setActiveId(id: string): Promise<void> {
   const file = await loadAccounts()
   const account = file.accounts.find((item) => item.id === id)

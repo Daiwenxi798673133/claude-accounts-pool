@@ -64,6 +64,27 @@ function clockTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
 
+// DISPLAY FORM ONLY. Anthropic's fixed windows travel the wire under their RAW field names
+// (normalizeAnthropic emits `five_hour` / `seven_day` / …, and scoring, logs and the protocol key
+// off exactly those), so the short form has to be applied here rather than by renaming the label
+// upstream. It is also what makes the column line up: a 9-character `five_hour` overruns the
+// 6-column pad and shoves its bar out of line with the `Fable` row below it. A label that is
+// absent — a dynamic per-model weekly window — passes through UNCHANGED rather than being
+// dropped. The browser dashboard inlines its own copy of this table into generated JS
+// (master/dashboardHtml.ts's SHORT_LABELS); keep the two in step.
+const SHORT_WINDOW_LABELS: Record<string, string> = {
+  five_hour: "5h",
+  seven_day: "7d",
+  seven_day_sonnet: "7d sonnet",
+  seven_day_opus: "7d opus",
+}
+
+// Own-property lookup, not a bare index: a pool-derived label of "constructor" must not resolve
+// to something off Object.prototype.
+function shortWindowLabel(label: string): string {
+  return Object.hasOwn(SHORT_WINDOW_LABELS, label) ? SHORT_WINDOW_LABELS[label] : label
+}
+
 
 
 function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow | null }) {
@@ -542,7 +563,7 @@ function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
   const theme = () => props.api.theme.current
   return (
     <box flexDirection="row" gap={1}>
-      <text fg={theme().textMuted}>{props.win.label.padEnd(6)}</text>
+      <text fg={theme().textMuted}>{shortWindowLabel(props.win.label).padEnd(6)}</text>
       <text fg={tone(props.api, props.win.utilization)}>
         {bar(props.win.utilization)} {percent(props.win.utilization)}
       </text>
@@ -553,11 +574,12 @@ function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
   )
 }
 
-// UNKNOWN IS NOT "NO". `held` is undefined when this worker has not leased in THIS process — its
-// on-disk lease was still fresh at startup, so the renewal loop never ran and nothing on this machine
-// can say which account that lease belongs to (a lease is an opaque access token, and a worker keeps
-// no account library to match it against). Drawing `○` on every row then would read as "I hold none
-// of these", so the marker column goes BLANK instead: absence of knowledge, rendered as absence.
+// UNKNOWN IS NOT "NO". `held` is undefined only when this machine has NEVER recorded a leased
+// account — a worker that has not yet completed its first lease. (It used to also cover the far more
+// common case of booting onto a still-fresh on-disk lease, which left the whole column blank on the
+// first /usage; worker/install.ts now records the id with every lease and reads it back at panel
+// open.) Drawing `○` on every row while unknown would read as "I hold none of these", so the marker
+// column goes BLANK instead: absence of knowledge, rendered as absence. Keep the three states.
 function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView; selected: boolean; held?: boolean }) {
   const theme = () => props.api.theme.current
   const account = () => props.account

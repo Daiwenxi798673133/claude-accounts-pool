@@ -28,9 +28,12 @@ export type LeaseKeeperDeps = {
   // dependency to it is what lets every test drive the loop without a transport at all.
   client: { lease(input: { reason: "prelease" | "ratelimit"; currentAccountId?: string }): Promise<LeaseOutcome> }
   readAuth: () => Promise<{ access?: string; expires?: number } | undefined>
-  // The `{kind:"lease"}` write seam — access + expiry and NOTHING else. A worker has no real
-  // refresh token to pass, and that is precisely why it cannot leak, replay or revoke one.
-  writeLease: (input: { access: string; expires: number }) => Promise<void>
+  // The `{kind:"lease"}` write seam — access + expiry and NOTHING else of the CREDENTIAL. A worker
+  // has no real refresh token to pass, and that is precisely why it cannot leak, replay or revoke
+  // one. `accountId` rides along because it is the only moment this machine is told whose token
+  // this is; the seam records it so a later process can answer "which account do I hold?" without
+  // spending a lease to find out.
+  writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
   toast: (input: { variant: "warning" | "error"; message: string }) => void
   sleep: (ms: number) => Promise<void>
   // Injected clock so every expiry comparison below is testable at a frozen instant.
@@ -145,7 +148,7 @@ export function installLeaseKeeper(deps: LeaseKeeperDeps): {
     // dispose() may have landed while the request was in flight. Past this line we would be
     // writing a credential file on behalf of a keeper the host has already torn down.
     if (disposed) return undefined
-    await deps.writeLease({ access: lease.access, expires: lease.expiresAt })
+    await deps.writeLease({ access: lease.access, expires: lease.expiresAt, accountId: lease.accountId })
     heldAccountId = lease.accountId
     failures = 0
     // accountId and expiry only. `lease.access` is a live credential and is never logged.

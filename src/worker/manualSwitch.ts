@@ -22,9 +22,10 @@ export type ManualSwitchDeps = {
   client: {
     lease(input: { reason: "prelease"; preferredAccountIdPrefix: string; attempts: number }): Promise<LeaseOutcome>
   }
-  // The `{kind:"lease"}` write seam — access + expiry and NOTHING else, so this path cannot express a
-  // real refresh token even by accident (INV-CLOUD-1). Same seam the renewal loop uses.
-  writeLease: (input: { access: string; expires: number }) => Promise<void>
+  // The `{kind:"lease"}` write seam — access + expiry and NOTHING else of the credential, so this
+  // path cannot express a real refresh token even by accident (INV-CLOUD-1). Same seam the renewal
+  // loop uses, `accountId` included: it is the id the seam records so /usage knows what it holds.
+  writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
   toast: (input: { variant: "success" | "warning" | "error"; message: string }) => void
   now?: () => number
 }
@@ -101,7 +102,7 @@ export function createManualSwitch(deps: ManualSwitchDeps): ManualSwitch {
         return { ok: false }
       }
 
-      await deps.writeLease({ access: lease.access, expires: lease.expiresAt })
+      await deps.writeLease({ access: lease.access, expires: lease.expiresAt, accountId: lease.accountId })
       // Never `lease.access` — it is a live credential.
       log.info("manual-switch:leased", { accountId: lease.accountId, expiresAt: lease.expiresAt })
       // The second clause is not hedging, it is the truth about this pool: there is NO worker→account

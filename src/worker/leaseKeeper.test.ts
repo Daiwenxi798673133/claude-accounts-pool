@@ -172,14 +172,19 @@ test("pre-leases before expiry and lease-writes sentinel entry", async () => {
 
   // Then: one routine pre-lease (no account id yet — this worker holds nothing it was told about)
   expect(requests).toEqual([{ reason: "prelease" }])
-  // …written through the LEASE seam, with an expiry that is genuinely in the future.
-  expect(h.writes).toEqual([{ access: granted.access, expires: granted.expiresAt }])
+  // …written through the LEASE seam, with an expiry that is genuinely in the future, and carrying
+  // the id of the account the master says it just handed over.
+  expect(h.writes).toEqual([{ access: granted.access, expires: granted.expiresAt, accountId: granted.accountId }])
   expect(h.writes[0].expires).toBeGreaterThan(NOW)
-  // The payload is EXACTLY the two lease fields and nothing else — no `token`, no `refresh`. That
-  // is what makes it a `{kind:"lease"}` write, which accounts.ts serializes with SENTINEL_REFRESH
-  // (pinned byte-for-byte in src/cloud/lease-write.test.ts). A worker can therefore never persist
-  // a real refresh token: it never has one to pass.
-  const write: TokenWrite = { kind: "lease", ...h.writes[0] }
+  // The CREDENTIAL half is EXACTLY the two lease fields and nothing else — no `token`, no `refresh`.
+  // That is what makes it a `{kind:"lease"}` write, which accounts.ts serializes with
+  // SENTINEL_REFRESH (pinned byte-for-byte in src/cloud/lease-write.test.ts). A worker can therefore
+  // never persist a real refresh token: it never has one to pass. `accountId` is split off first
+  // because it is BOOKKEEPING, not credential — worker/install.ts routes it to recordLeasedActiveId
+  // and never to writeAuthAnthropic — and this destructure is what proves it cannot slip into one.
+  const { accountId, ...credential } = h.writes[0]
+  expect(accountId).toBe(granted.accountId)
+  const write: TokenWrite = { kind: "lease", ...credential }
   expect(Object.keys(write).sort()).toEqual(["access", "expires", "kind"])
   // A successful renewal neither backs off nor bothers the user.
   expect(h.delays).toEqual([])

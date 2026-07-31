@@ -39,7 +39,10 @@ type Effect =
   // writeAuthAnthropic({ kind: "lease", access, expires }). A worker may never produce
   // {kind:"full"}: that would file a refresh token it must not hold, and the writeLease dep's
   // shape (access + expires, no refresh) makes it unrepresentable.
-  | { kind: "lease"; access: string; expires: number }
+  // `accountId` is NOT part of that credential — the seam routes it to the account-id record, not
+  // to writeAuthAnthropic — but it is recorded here because a switch that does not carry it leaves
+  // /usage marking the account this worker just LEFT.
+  | { kind: "lease"; access: string; expires: number; accountId: string }
   | { kind: "resume"; text?: string }
 
 type Toast = { variant?: string; message: string }
@@ -97,7 +100,7 @@ function setup(outcome: LeaseOutcome) {
       },
     },
     writeLease: async (input) => {
-      effects.push({ kind: "lease", access: input.access, expires: input.expires })
+      effects.push({ kind: "lease", access: input.access, expires: input.expires, accountId: input.accountId })
     },
     toast: (input) => toasts.push(input),
   })
@@ -156,7 +159,9 @@ test("rate limit triggers report then lease then sentinel write then continue re
   expect(effects[0]).toEqual({ kind: "report", accountId: SPENT_ID, headers: QUOTA_HEADERS, resetsAt: RESET_SECONDS * 1000 })
   // reason:"ratelimit" (not "prelease") + the spent id, which is what lets the master exclude it.
   expect(effects[1]).toEqual({ kind: "lease-request", reason: "ratelimit", currentAccountId: SPENT_ID })
-  expect(effects[2]).toEqual({ kind: "lease", access: LEASE_ACCESS, expires: expiresAt })
+  // The write names the account the master MOVED US TO, not the spent one — this is what keeps
+  // /usage's "In Use" marker from staying on the account we just left.
+  expect(effects[2]).toEqual({ kind: "lease", access: LEASE_ACCESS, expires: expiresAt, accountId: "acct-fresh" })
   expect(effects[3]).toEqual({ kind: "resume", text: "continue" })
   expect(toasts.some((toast) => toast.variant === "error")).toBe(false)
   controller.dispose()
@@ -211,7 +216,8 @@ test("stale lease 401 triggers immediate re-lease and resume", async () => {
   // headline: a 401 must never be reported as a rate limit.
   expect(effects.map((effect) => effect.kind)).toEqual(["lease-request", "lease", "resume"])
   expect(effects[0]).toEqual({ kind: "lease-request", reason: "prelease", currentAccountId: HELD_ID })
-  expect(effects[1]).toEqual({ kind: "lease", access: LEASE_ACCESS, expires: expiresAt })
+  // Re-issued for the SAME account, so the recorded id does not move either.
+  expect(effects[1]).toEqual({ kind: "lease", access: LEASE_ACCESS, expires: expiresAt, accountId: HELD_ID })
   expect(effects[2]).toEqual({ kind: "resume", text: "continue" })
   expect(toasts.some((toast) => toast.variant === "error")).toBe(false)
   controller.dispose()
