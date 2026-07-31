@@ -9,10 +9,19 @@
 // exact invalid_grant strand the whole architecture exists to prevent.
 
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { applyToken, loadAccounts, readAuthAnthropic, saveAccounts, withAuthLock, type StoredAccount } from "../accounts.ts"
+// DEEP IMPORT, and knowingly so. ex-machina's package entry exports only its opencode Plugin object,
+// while `authorize` / `exchange` — the PKCE half this repo has always delegated rather than owned —
+// live in this submodule. There is no `exports` map in that package, so the path resolves and ships
+// its own .d.ts; the version is pinned EXACTLY in package.json because a private path carries no
+// compatibility promise. It is also bundled at build time (scripts/build.ts inlines everything not
+// listed as external), so a published consumer never resolves this path at runtime.
+import { authorize, exchange } from "@ex-machina/opencode-anthropic-auth/dist/auth.js"
+import { applyToken, loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, type AuthToken, type StoredAccount } from "../accounts.ts"
 import { log } from "../logger.ts"
 import type { ModeConfig } from "../mode.ts"
+import { fetchProfile } from "../profile.ts"
 import { autoCapture, fetchUsage } from "../usage.ts"
+import { createAccountOnboard, type OnboardProfile } from "./accountOnboard.ts"
 import { installMasterKeeper, makeOnboardingCapture } from "./keeper.ts"
 import { startLeaseServer } from "./leaseServer.ts"
 import { createRefresher, type MasterToken } from "./refresher.ts"
@@ -56,6 +65,31 @@ async function roster(): Promise<StoredAccount[]> {
   return (await loadAccounts()).accounts
 }
 
+// The web onboarding flow's write step. Goes STRAIGHT into the account library rather than via
+// auth.json, and that is the correct half of a real fork:
+//
+//   • Writing auth.json instead would mean waiting for the master keeper's next capture tick to
+//     absorb it — up to KEEPALIVE_TICK_MS — so the dialog would have to either lie ("已加入池中")
+//     or make the operator watch a spinner for five minutes. It would also put this process in the
+//     business of writing the file ex-machina owns, for a chain ex-machina never asked for.
+//   • The rotation hazard that makes auth.json untouchable elsewhere (INV-2) does not apply to this
+//     chain: it was just minted by OUR authorization_code exchange, nobody else has ever held it, so
+//     there is no other refresher to race. Contrast makeOnboardingCapture, which absorbs a chain
+//     ex-machina minted and must therefore never refresh it.
+//
+// `existing` is read INSIDE the lock and before the write, because upsertAccount's own return value
+// cannot answer it — it reports the file after the insert, by which point every id is present.
+async function absorbOnboarded(input: { profile: OnboardProfile; token: AuthToken }): Promise<{ existing: boolean }> {
+  return withAuthLock(async () => {
+    const before = await loadAccounts()
+    const existing = before.accounts.some((account) => account.id === input.profile.uuid)
+    // Not nested in a second withAuthLock: upsertAccount deliberately takes no lock of its own (its
+    // callers own the critical section), and the lock here is NOT reentrant.
+    await upsertAccount(input.profile.uuid, input.profile.email, input.token, input.profile.subscription)
+    return { existing }
+  })
+}
+
 export function installCloudMaster(
   api: TuiPluginApi,
   cfg: Extract<ModeConfig, { mode: "cloud-master" }>,
@@ -95,6 +129,17 @@ export function installCloudMaster(
     sleep,
   })
 
+  const accountOnboard = createAccountOnboard({
+    // 'max' — the Claude Pro/Max subscription flow. NEVER 'console': that mode's chain authorizes an
+    // API-key workspace, not the subscription whose 5h/7d windows this pool schedules against.
+    authorize: () => authorize("max"),
+    exchange,
+    fetchProfile,
+    absorb: absorbOnboarded,
+    newId: () => crypto.randomUUID(),
+    now: Date.now,
+  })
+
   // Started LAST of the four, so the port only opens once everything a lease answer depends on is
   // live: a worker that reached a half-composed master would be handed a 500 it retries forever.
   const server = startLeaseServer({
@@ -102,6 +147,7 @@ export function installCloudMaster(
     refresher,
     registry,
     loadAccounts: roster,
+    accountOnboard,
     // The dashboard's refresh button reuses the poller's OWN sweep rather than fetching usage itself,
     // so a forced refresh inherits every protection the scheduled path already has: the re-entrancy
     // guard, the 500ms spacing between accounts, and the per-account 429 cooldown.

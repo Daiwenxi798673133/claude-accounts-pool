@@ -9,6 +9,9 @@
 
 import type { StoredAccount } from "../accounts.ts"
 import type {
+  AccountAddRequest,
+  AccountAddResponse,
+  AuthorizeStartResponse,
   ErrorBody,
   LeaseReason,
   LeaseRefusal,
@@ -22,6 +25,7 @@ import type {
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
+import type { AccountOnboard } from "./accountOnboard.ts"
 import { dashboardHtml } from "./dashboardHtml.ts"
 import type { PreferredInput, PreferredPick, UsageSnapshot } from "./scheduler.ts"
 import { buildUsageView } from "./usageView.ts"
@@ -46,6 +50,9 @@ export type LeaseServerDeps = {
   // poller's own tickOnce. Injected as a bare thunk so this server never learns what a poller is, and
   // so a test can prove the route triggers a sweep without any network at all.
   refreshUsage: () => Promise<void>
+  // The dashboard's "添加账号" flow. Owns the PKCE sessions, the exchange and the write into the
+  // account library; this server owns only the mapping from its outcomes onto HTTP statuses.
+  accountOnboard: AccountOnboard
   // Injected so a test can drive the refresh throttle deterministically. EVERY time read in this
   // module goes through it; a stray Date.now() would silently escape the injected clock.
   now?: () => number
@@ -66,7 +73,15 @@ type AuthedHandler = (req: Request, workerId: string) => Promise<Response>
 
 function json(
   status: number,
-  body: ErrorBody | LeaseResponse | UsageSnapshotView | ThrottledBody | LeaseRefusedBody | { ok: true },
+  body:
+    | ErrorBody
+    | LeaseResponse
+    | UsageSnapshotView
+    | ThrottledBody
+    | LeaseRefusedBody
+    | AuthorizeStartResponse
+    | AccountAddResponse
+    | { ok: true },
 ): Response {
   return Response.json(body, { status })
 }
@@ -161,6 +176,19 @@ function parseRateLimitReport(raw: unknown): RateLimitReport | undefined {
     headers: parseHeaderMap(headers),
     ...(typeof resetsAt === "number" && Number.isFinite(resetsAt) ? { resetsAt } : {}),
   }
+}
+
+function parseAccountAddRequest(raw: unknown): AccountAddRequest | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined
+  const { pendingId, code } = raw as Record<string, unknown>
+  if (typeof pendingId !== "string" || pendingId.length === 0) return undefined
+  // Trimmed HERE rather than in the onboard module, because whitespace is an artefact of how the
+  // operator moved the value (a copied line often carries a trailing newline) and not something the
+  // PKCE contract has an opinion about. An all-whitespace paste is an empty paste.
+  if (typeof code !== "string") return undefined
+  const trimmed = code.trim()
+  if (trimmed.length === 0) return undefined
+  return { pendingId, code: trimmed }
 }
 
 // One forced sweep per this window, server-wide. NOT per caller: what it protects is the master's
@@ -340,6 +368,50 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     return json(200, view)
   }
 
+  // POST-only for the same reason handleUsageRefresh is, and it is NOT redundant here just because
+  // this one issues no upstream request: it mutates the pending-session store, so a speculative GET
+  // from a link unfurler could evict the session an operator is halfway through using.
+  async function handleAccountAuthorize(req: Request): Promise<Response> {
+    if (req.method !== "POST") return json(405, { error: "use POST" })
+    const started = await deps.accountOnboard.start()
+    // The URL is safe to log — it is the same public value the page displays, carrying a challenge
+    // rather than the verifier — but it is long and appears verbatim on screen anyway, so only the
+    // handle and the deadline are recorded.
+    log.info("master:account-authorize-served", { pendingId: started.pendingId, expiresAt: started.expiresAt })
+    return json(200, started)
+  }
+
+  // Maps AddOutcome onto statuses. The split that matters to the page is 400 vs 410: a 400 is
+  // RECOVERABLE (re-paste into the field that is still on screen), a 410 means the session is gone and
+  // the operator must fetch a new link. Collapsing them would either strand someone on a dead session
+  // or throw away a good one over a typo.
+  async function handleAccountAdd(req: Request): Promise<Response> {
+    if (req.method !== "POST") return json(405, { error: "use POST" })
+    const request = parseAccountAddRequest(await readJson(req))
+    if (!request) return badRequest("malformed account add request")
+    const outcome = await deps.accountOnboard.add(request.pendingId, request.code)
+    if (outcome.ok) {
+      // PRIVACY: `outcome` carries an id PREFIX and the account email, never the chain that was just
+      // minted — AccountAddResponse has no field either token could be assigned to.
+      log.info("master:account-added", { idPrefix: outcome.idPrefix, existing: outcome.existing })
+      return json(200, { idPrefix: outcome.idPrefix, label: outcome.label, existing: outcome.existing })
+    }
+    if (outcome.reason === "throttled") {
+      // Same two-channel shape as the refresh throttle: Retry-After in seconds for anything speaking
+      // plain HTTP, the exact millisecond figure in the body for the dialog's own countdown.
+      return new Response(JSON.stringify({ error: "add throttled", retryAfterMs: outcome.retryAfterMs } satisfies ThrottledBody), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(outcome.retryAfterMs / 1000)) },
+      })
+    }
+    if (outcome.reason === "rejected") return badRequest("authorization code rejected")
+    // 502, not 500: the failure is upstream's (the profile endpoint), and it lands AFTER a successful
+    // exchange — the one arm where a real credential was minted and could not be filed.
+    if (outcome.reason === "profile-failed") return json(502, { error: "profile lookup failed" })
+    // The three terminal session states. Distinct strings, one status: all three mean "start over".
+    return json(410, { error: outcome.reason })
+  }
+
   // The STRING is built once (the shell is a constant), but each request gets a FRESH Response: a
   // Response body is a single-use stream, so sharing one object would serve the first browser and
   // then fail every reload after it.
@@ -347,6 +419,8 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     usageRoute: CLOUD_ROUTES.usage,
     refreshRoute: CLOUD_ROUTES.usageRefresh,
     throttleMs: USAGE_REFRESH_MIN_INTERVAL_MS,
+    authorizeRoute: CLOUD_ROUTES.accountAuthorize,
+    addRoute: CLOUD_ROUTES.accountAdd,
   })
 
   const routes: Record<Route, RouteHandler> = {
@@ -366,6 +440,12 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     [CLOUD_ROUTES.usage]: () => handleUsage(),
     [CLOUD_ROUTES.dashboard]: async () => html(dashboardShell),
     [CLOUD_ROUTES.usageRefresh]: (req) => handleUsageRefresh(req),
+    // The onboarding pair, keyless like the rest of the dashboard. Unlike every other keyless route
+    // here these two WRITE — the second one adds a record to the account library — so what stands in
+    // for a key is the bounded session store and the throttle inside accountOnboard. That is the whole
+    // of the defence, and this table is where a reviewer should notice it.
+    [CLOUD_ROUTES.accountAuthorize]: (req) => handleAccountAuthorize(req),
+    [CLOUD_ROUTES.accountAdd]: (req) => handleAccountAdd(req),
   }
 
   // A table lookup, not an if/else chain over paths: the chain's fallthrough silently answers an

@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
-import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
+import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS, ONBOARD_ADD_MIN_INTERVAL_MS } from "../constants.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
+import { createAccountOnboard } from "./accountOnboard.ts"
 import { startLeaseServer, USAGE_REFRESH_MIN_INTERVAL_MS } from "./leaseServer.ts"
 import type { UsageSnapshot } from "./scheduler.ts"
 
@@ -45,6 +46,9 @@ type Harness = {
   sweeps: number[]
   snapshotAt: () => number
   advance: (ms: number) => void
+  // Every code string the onboarding exchange was handed. Empty means the route refused BEFORE
+  // reaching out, which is the distinction the throttle and the session-lifecycle cases turn on.
+  exchanged: string[]
 }
 
 function startHarness(options?: {
@@ -53,6 +57,11 @@ function startHarness(options?: {
   preAborted?: boolean
   accountExpiresAt?: number
   usage?: UsageSnapshot
+  // The one paste the fake exchange accepts. Anything else comes back `failed`, exactly as
+  // ex-machina's own exchange collapses every refusal.
+  goodCode?: string
+  onboardProfile?: { uuid: string; email: string }
+  profileThrows?: boolean
 }): Harness {
   const accounts = options?.accounts ?? [account("acct-a"), account("acct-b")]
   const accountExpiresAt = options?.accountExpiresAt ?? ACCOUNT_EXPIRES_AT
@@ -72,6 +81,33 @@ function startHarness(options?: {
   const preferred: Harness["preferred"] = []
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
+
+  const goodCode = options?.goodCode ?? "good-code#the-state"
+  const onboardProfile = options?.onboardProfile ?? { uuid: "11111111-2222-3333-4444-555555555555", email: "new@example.test" }
+  const exchanged: string[] = []
+  let pendingSeq = 0
+  // The REAL onboard state machine over fake collaborators, not a stub of the whole thing: the
+  // session lifecycle (TTL, attempt cap, single-use) is precisely what these HTTP cases exist to
+  // observe from the outside, and a stub returning canned outcomes would assert nothing about it.
+  const accountOnboard = createAccountOnboard({
+    authorize: async () => ({
+      url: "https://claude.ai/oauth/authorize?state=the-state",
+      redirectUri: "https://platform.claude.com/oauth/code/callback",
+      state: "the-state",
+      verifier: "verifier-under-test",
+    }),
+    exchange: async (input) => {
+      exchanged.push(input)
+      return input === goodCode ? { type: "success", refresh: "refresh-new", access: "access-new", expires: clock() + 3600_000 } : { type: "failed" }
+    },
+    fetchProfile: async () => {
+      if (options?.profileThrows) throw new Error("profile endpoint said no")
+      return onboardProfile
+    },
+    absorb: async () => ({ existing: false }),
+    newId: () => `pending-${++pendingSeq}`,
+    now: clock,
+  })
 
   const server = startLeaseServer({
     scheduler: {
@@ -119,6 +155,7 @@ function startHarness(options?: {
       sweeps.push(clock())
       usage = { at: clock(), stale: false, byId: usage.byId }
     },
+    accountOnboard,
     now: clock,
     // Loopback only — a test must never expose a lease endpoint on a real interface.
     hostname: "127.0.0.1",
@@ -139,6 +176,7 @@ function startHarness(options?: {
     advance: (ms: number) => {
       nowMs += ms
     },
+    exchanged,
   }
 }
 
@@ -766,6 +804,215 @@ test("lease is refused when the horizon would already be in the past", async () 
     // WAS minted. That is what separates this 503 from the spent-pool 503 above, where
     // `refreshed` stays empty.
     expect(harness.refreshed).toEqual(["acct-a"])
+  } finally {
+    harness.stop()
+  }
+})
+
+// ── 添加账号 (web onboarding) ──────────────────────────────────────────────────────────────────
+// These two routes are the first on this server that WRITE while being KEYLESS, so what the cases
+// below pin down is mostly the refusals: which requests are turned away before anything leaves the
+// machine, and what the browser is — and is not — told.
+
+test("both onboarding routes are keyless, and refuse a GET", async () => {
+  const harness = startHarness()
+  try {
+    // Given/When: no Authorization header at all — the same omission that earns a 401 on lease
+    const authorize = await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})
+
+    // Then: served. That contrast with the 401 above is the deliberate design of this port: the
+    // dashboard and everything reachable from it is open, while minting a credential FOR A WORKER
+    // is not.
+    expect(authorize.status).toBe(200)
+
+    // And: neither route answers a GET. `accountAdd` reaches platform.claude.com, so a speculatively
+    // fetched link must not provoke it; `accountAuthorize` evicts pending sessions, so a link
+    // unfurler must not be able to knock out an operator's half-finished login either.
+    for (const route of [CLOUD_ROUTES.accountAuthorize, CLOUD_ROUTES.accountAdd]) {
+      const got = await fetch(`${harness.base}${route}`)
+      expect(got.status).toBe(405)
+    }
+    // And the GETs changed nothing: no exchange was attempted by either.
+    expect(harness.exchanged).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("authorize hands back a link and a handle, and never the PKCE verifier", async () => {
+  const harness = startHarness()
+  try {
+    // When
+    const res = await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})
+
+    // Then
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { url: string; pendingId: string; expiresAt: number }
+    expect(body.url).toContain("claude.ai/oauth/authorize")
+    expect(body.pendingId).toBe("pending-1")
+    expect(body.expiresAt).toBeGreaterThan(0)
+
+    // And: the verifier stays on this machine. It is the preimage of the challenge in that URL, so a
+    // browser holding it could redeem the code itself — which would end the property the whole cloud
+    // design rests on, that the master is the only holder of a real refresh token.
+    expect(JSON.stringify(body)).not.toContain("verifier-under-test")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a good code adds the account and the answer carries no token", async () => {
+  const harness = startHarness()
+  try {
+    // Given: a session the operator has just been handed
+    const started = (await (await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})).json()) as { pendingId: string }
+
+    // When: the code from the authorize page comes back
+    const res = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "good-code#the-state" })
+
+    // Then
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ idPrefix: "11111111", label: "new@example.test", existing: false })
+
+    // And: PRIVACY. The exchange just minted a live access token and a one-time-use refresh token,
+    // and neither appears in what the page is told — AccountAddResponse has no field either could be
+    // assigned to, and this asserts the shape actually shipped matches that promise.
+    const raw = JSON.stringify(body)
+    expect(raw).not.toContain("access-new")
+    expect(raw).not.toContain("refresh-new")
+    // The id is a PREFIX, never the uuid a lease names.
+    expect(raw).not.toContain("11111111-2222-3333-4444-555555555555")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("whitespace around a pasted code is tolerated, an empty one is refused", async () => {
+  const harness = startHarness()
+  try {
+    const started = (await (await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})).json()) as { pendingId: string }
+
+    // Given/When: a paste carrying the newline a copied line usually brings with it
+    const res = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "  good-code#the-state\n" })
+
+    // Then: accepted — whitespace is an artefact of how the value was moved, not part of the code
+    expect(res.status).toBe(200)
+    expect(harness.exchanged).toEqual(["good-code#the-state"])
+
+    // And: an all-whitespace paste is an EMPTY paste, refused at the boundary without reaching out
+    const blank = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "   " })
+    expect(blank.status).toBe(400)
+    expect(harness.exchanged).toHaveLength(1)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a malformed body and an unknown handle are separated by status", async () => {
+  const harness = startHarness()
+  try {
+    // Given/When: a body that is not the contract at all
+    const malformed = await post(harness.base, CLOUD_ROUTES.accountAdd, { nope: true })
+    // Then: 400 — the caller's fault, and it cost the master nothing
+    expect(malformed.status).toBe(400)
+
+    // When: a well-formed request naming a session that does not exist
+    const unknown = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: "pending-nope", code: "whatever" })
+
+    // Then: 410 GONE, not 400. The page keys off exactly this split — a 400 keeps the pasted value on
+    // screen for another try, a 410 means only a new link can help — so collapsing them would either
+    // strand an operator on a dead session or throw away a live one over a typo.
+    expect(unknown.status).toBe(410)
+
+    // And neither reached Anthropic.
+    expect(harness.exchanged).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a rejected code answers 400 and leaves the session usable", async () => {
+  const harness = startHarness()
+  try {
+    const started = (await (await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})).json()) as { pendingId: string }
+
+    // When: the operator pastes something truncated
+    const bad = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "truncated" })
+
+    // Then: 400 — recoverable, so the dialog keeps the field
+    expect(bad.status).toBe(400)
+
+    // And: the very same session still accepts the right value once the rate floor has passed
+    harness.advance(ONBOARD_ADD_MIN_INTERVAL_MS)
+    const good = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "good-code#the-state" })
+    expect(good.status).toBe(200)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("the add route throttles, naming the wait in a header and in the body", async () => {
+  const harness = startHarness()
+  try {
+    const started = (await (await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})).json()) as { pendingId: string }
+    await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "truncated" })
+
+    // When: a second attempt lands immediately, with the clock frozen
+    const res = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "good-code#the-state" })
+
+    // Then: 429, with the wait on BOTH channels — Retry-After in whole seconds for anything speaking
+    // plain HTTP, the exact millisecond figure for the dialog's own countdown
+    expect(res.status).toBe(429)
+    expect(res.headers.get("retry-after")).toBe(String(Math.ceil(ONBOARD_ADD_MIN_INTERVAL_MS / 1000)))
+    const body = (await res.json()) as ThrottledBody
+    expect(body.retryAfterMs).toBeGreaterThan(0)
+    expect(body.retryAfterMs).toBeLessThanOrEqual(ONBOARD_ADD_MIN_INTERVAL_MS)
+
+    // And the point of the throttle: the refusal happened WITHOUT a second POST to Anthropic. On a
+    // keyless route this is what stops a drip of requests from becoming a 400-storm against the token
+    // endpoint, whose block would be charged to this master's IP and cost every account its refresh.
+    expect(harness.exchanged).toEqual(["truncated"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a profile failure after a successful exchange answers 502", async () => {
+  // Given: an upstream that will hand over tokens and then fail to say whose they are
+  const harness = startHarness({ profileThrows: true })
+  try {
+    const started = (await (await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})).json()) as { pendingId: string }
+
+    // When
+    const res = await post(harness.base, CLOUD_ROUTES.accountAdd, { pendingId: started.pendingId, code: "good-code#the-state" })
+
+    // Then: 502, not 500 and not 400. The failure is upstream's and it lands AFTER the code was
+    // spent, so the operator must be told to start over rather than invited to re-paste a code that
+    // can no longer work.
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({ error: expect.any(String) })
+  } finally {
+    harness.stop()
+  }
+})
+
+test("the dashboard page carries the onboarding routes and still leaks nothing", async () => {
+  const harness = startHarness()
+  try {
+    const body = await (await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)).text()
+
+    // Both onboarding routes are INJECTED into the page from the same frozen table the server
+    // dispatches on, so a renamed route cannot leave a silently dead button behind.
+    expect(body).toContain(CLOUD_ROUTES.accountAuthorize)
+    expect(body).toContain(CLOUD_ROUTES.accountAdd)
+    expect(body).toContain("添加账号")
+
+    // And the page is still a shell: adding a credential-handling flow to it must not have put a
+    // credential, an account or a key into the document.
+    expect(body).not.toContain("verifier-under-test")
+    expect(body).not.toContain(POOL_KEY)
+    expect(body).not.toContain("example.test")
   } finally {
     harness.stop()
   }

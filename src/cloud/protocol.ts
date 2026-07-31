@@ -37,6 +37,27 @@ export const CLOUD_ROUTES = Object.freeze({
   // endpoint answers a burst with a 429 that lasts minutes and is charged to this master's egress IP,
   // i.e. to EVERY account in the pool at once. The throttle, not a key, is what bounds that.
   usageRefresh: "/v1/usage/refresh",
+  // POST ×2 — the dashboard's "添加账号" flow, which ONBOARDS a new Claude account into the pool
+  // through the browser instead of requiring an `opencode auth login` on the master's own console.
+  //
+  // THESE TWO BREAK THE "PURELY READ-ONLY DASHBOARD" PROPERTY, and that is a deliberate, recorded
+  // reversal by the pool owner rather than an oversight — docs/cloud-mode.md used to promise
+  // "纯只读:不切号、不删号、不签 key" and that sentence has been amended along with this table. What
+  // they do NOT relax is anything about `lease`: minting a credential FOR A WORKER still needs a key.
+  //
+  // Both POST for the same reason usageRefresh is: `accountAdd` reaches platform.claude.com, so a GET
+  // would let a pasted link provoke upstream traffic. `accountAuthorize` makes no network call at all,
+  // but it MUTATES the pending-session store, and a route that a link scanner can drive into evicting
+  // the operator's half-finished login is a route that looks broken for reasons nobody can see.
+  //
+  // Keyless, matching the rest of the dashboard, which is what keeps "open the browser and click"
+  // true. Three bounds replace the key, all in src/constants.ts: ONBOARD_MAX_PENDING caps the memory
+  // an anonymous flood can occupy, ONBOARD_MAX_ATTEMPTS caps the outbound POSTs each session can
+  // provoke, and ONBOARD_ADD_MIN_INTERVAL_MS caps their rate. What is deliberately NOT claimed here is
+  // that an anonymous peer cannot ADD AN ACCOUNT — it can, if it owns a Claude login and can reach
+  // this port. The bind address is what narrows that, exactly as for `usage`.
+  accountAuthorize: "/v1/account/authorize",
+  accountAdd: "/v1/account/add",
 } as const)
 
 // Why the worker is asking. `prelease` is the routine path (startup or renewal before the
@@ -101,6 +122,48 @@ export type ErrorBody = {
 // rather than leaving a button that looks broken — the same rule that killed the "重置未知"
 // placeholder: never let the UI imply something is wrong when the truth is simply "not yet".
 export type ThrottledBody = ErrorBody & { retryAfterMs: number }
+
+// ── Onboarding payloads (the 添加账号 flow) ──────────────────────────────────────────────────────
+// SAME PRIVACY RULE AS THE DASHBOARD VIEW BELOW, and here it is sharper, because this flow HANDLES a
+// real credential: the exchange yields an access token and a one-time-use refresh token. Neither may
+// ever be named by a type in this file. The browser's whole job is to relay an authorization code it
+// already has; it is never told what that code turned into.
+
+export type AuthorizeStartResponse = {
+  // The claude.ai URL the operator must open. Public by construction — it carries the globally-shared
+  // Claude Code client_id, the PKCE challenge (a hash, not the verifier) and an opaque state — which
+  // is precisely why it can be shown on an unauthenticated page.
+  url: string
+  // An opaque handle for the server-side session, and DELIBERATELY not the verifier or the state:
+  // those two are what make the exchange the master's to perform, and a browser holding them could
+  // complete the exchange itself against Anthropic and keep the tokens. Sending only a lookup key is
+  // what keeps this master the sole holder of every refresh token in the pool.
+  pendingId: string
+  // Absolute epoch-ms. Sent so the dialog can say the link has gone stale rather than letting the
+  // operator finish a browser round trip only to be refused with no explanation.
+  expiresAt: number
+}
+
+export type AccountAddRequest = {
+  pendingId: string
+  // Whatever the operator pasted. NOT narrowed to a bare code on purpose: Anthropic's manual-callback
+  // page has shown this value as `code#state`, as a full redirect URL, and as a query string across
+  // versions, and the exchange helper accepts all three. Rejecting two of the shapes here would turn
+  // an upstream page change into "the button does nothing".
+  code: string
+}
+
+export type AccountAddResponse = {
+  // The SAME redacted identity shape the usage view uses — an id PREFIX, never the account uuid the
+  // leases name.
+  idPrefix: string
+  label: string
+  // true when this uuid was already in the pool, i.e. the operator re-authorised an existing account
+  // rather than adding a new one. Reported instead of being silently treated as success, because the
+  // two outcomes call for different words on screen and hiding the difference is how an operator ends
+  // up believing the pool grew when it did not.
+  existing: boolean
+}
 
 // ── Dashboard payload (master → the operator's browser) ────────────────────────────────────────
 // PRIVACY IS ENFORCED BY THIS TYPE, not by the care taken in the builder. There is no field below
