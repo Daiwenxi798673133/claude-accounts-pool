@@ -10,7 +10,9 @@ import { planLabel } from "./profile.ts"
 import { currentConversation } from "./current-conversation.ts"
 import {
   clampSelection,
+  heldStateFor,
   initialPageSelection,
+  initialWorkerSelection,
   moveSelection,
   openaiRows,
   panelPages,
@@ -642,7 +644,12 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
   // The view is STATE, not a prop read: `r` replaces it in place, so the operator watches the same
   // list update rather than losing their position to a reopened dialog.
   const [view, setView] = createSignal(props.options.view)
-  const [selection, setSelection] = createSignal(0)
+  // Seeded on the held row, not on 0: the operator opens this panel already standing on the account
+  // they are using, so confirming usage or switching away costs no ↑↓ first. Seeded ONCE, from the
+  // snapshot the dialog opened with — `r` must not yank the cursor out from under them.
+  const [selection, setSelection] = createSignal(
+    initialWorkerSelection(props.options.view.accounts, props.options.heldAccountId),
+  )
   const [refreshing, setRefreshing] = createSignal(false)
   const [notice, setNotice] = createSignal<string | undefined>(undefined)
   const accounts = () => view().accounts
@@ -650,13 +657,10 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
   // an index that outlived its row would otherwise switch to whatever slid into that position.
   const index = () => clampSelection(selection(), accounts().length)
   const selected = () => accounts()[index()]
-  // THREE-STATE, and it must stay that way: `undefined` means this worker does not know what it holds,
-  // which the row renders as a blank marker rather than as `○` ("not this one"). A `?.startsWith(…)
-  // === true` shorthand here would collapse unknown into false and put a confident `○` on every row.
-  const heldFor = (account: UsageAccountView): boolean | undefined => {
-    const held = props.options.heldAccountId
-    return held === undefined ? undefined : held.startsWith(account.idPrefix)
-  }
+  // Shared with the cursor seed above, deliberately: the row `▶` starts on must be the row `●` is
+  // drawn on, and one rule is the only way to keep that true.
+  const heldFor = (account: UsageAccountView): boolean | undefined =>
+    heldStateFor(account.idPrefix, props.options.heldAccountId)
 
   // Clamp, NOT wrap — moveSelection in panel-model.ts does the same, and the two panels must not feel
   // different under the same keys.
