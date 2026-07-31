@@ -33,9 +33,12 @@ export type SwitchStrategyDeps = {
   client: LeaseClient
   // Narrower than accounts.ts's TokenWrite on purpose: access + expires and NO refresh slot, so a
   // worker cannot express a {kind:"full"} write here even by accident — the master is the only
-  // holder of real refresh chains. MUST NOT REJECT: onLimit's contract is a boolean, and a
-  // rejection would leave the caller's session neither resumed nor marked stalled.
-  writeLease: (input: { access: string; expires: number }) => Promise<void>
+  // holder of real refresh chains. `accountId` is the master's answer to "who did you give me",
+  // recorded by the seam so /usage can mark the right row after an automatic switch. MUST NOT
+  // REJECT: onLimit's contract is a boolean, and a rejection would leave the caller's session
+  // neither resumed nor marked stalled — that applies to the accountId record too, which is
+  // bookkeeping and must never cost a session its recovery.
+  writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
   toast: (input: { variant: "warning" | "error"; message: string }) => void
   now?: () => number
 }
@@ -83,7 +86,7 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
         return false
       }
 
-      await deps.writeLease({ access: lease.access, expires: lease.expiresAt })
+      await deps.writeLease({ access: lease.access, expires: lease.expiresAt, accountId: lease.accountId })
       // Never the access token itself — it is a live credential.
       log.info("switch:leased", { from: ctx.accountId, to: lease.accountId, expiresAt: lease.expiresAt })
       deps.toast({ variant: "warning", message: `当前账号额度已满，已切到云端账号「${lease.accountId}」并自动重试` })
@@ -120,7 +123,7 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
         return false
       }
 
-      await deps.writeLease({ access: lease.access, expires: lease.expiresAt })
+      await deps.writeLease({ access: lease.access, expires: lease.expiresAt, accountId: lease.accountId })
       // Never the access token itself — it is a live credential.
       log.info("switch:stale-lease-renewed", { accountId: lease.accountId, expiresAt: lease.expiresAt })
       deps.toast({ variant: "warning", message: `云端凭据已失效，已重新租用账号「${lease.accountId}」并自动重试` })

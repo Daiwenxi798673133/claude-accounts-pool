@@ -145,6 +145,34 @@ results.capture = {
   directUpsertLogged: logged("accounts:upsert"),
 }
 
+// ---- 5: the leased account-id record (what /usage marks "In Use" on a worker) ----
+const LEASED_ID = "eaaa1a79-4c1d-4f6e-9a52-6b7c8d9e0f11"
+// A worker's library is EMPTY by design (scenario 3 above is why), which is exactly the state
+// setActiveId refuses to write a pointer in. recordLeasedActiveId must write it anyway.
+writeAccounts({ version: 1, openaiActiveId: "oa-keep", accounts: [] })
+await accounts.recordLeasedActiveId(LEASED_ID)
+const afterRecord = JSON.parse(accountsText())
+const recordReadBack = await accounts.readActiveId()
+// Re-leasing the SAME account must not rewrite the file. Seeded COMPACT while saveAccounts always
+// writes 2-space JSON, so surviving bytes prove no write happened rather than merely no change.
+writeAccounts({ version: 1, activeId: LEASED_ID, openaiActiveId: "oa-keep", accounts: [] })
+const compactBefore = accountsText()
+await accounts.recordLeasedActiveId(LEASED_ID)
+const repeatSkipped = accountsText() === compactBefore
+// AND setActiveId's membership check is UNTOUCHED: local mode still refuses a pointer at an
+// account whose token this machine would never find.
+logTags.length = 0
+await accounts.setActiveId("not-in-this-library")
+results.leasedActiveId = {
+  activeId: afterRecord.activeId,
+  openaiActiveId: afterRecord.openaiActiveId,
+  accountCount: afterRecord.accounts.length,
+  readBack: recordReadBack,
+  repeatSkipped,
+  afterSetActiveUnknown: (await accounts.loadAccounts()).activeId,
+  setActiveUnknownLogged: logged("accounts:set-active-unknown"),
+}
+
 // ---- 4: keeper anthropic-maintenance gate ----
 let openaiCaptures = 0
 let keepActiveCalls = 0
@@ -223,7 +251,22 @@ type CaptureRow = {
   directUpsertLogged: boolean
 }
 type TickCounts = { openaiCaptures: number; keepActiveCalls: number; acquireCalls: number; autoCaptureCalls: number }
-type Results = { lease: LeaseRow; full: FullRow; capture: CaptureRow; keeper: { gated: TickCounts; ungated: TickCounts } }
+type LeasedActiveIdRow = {
+  activeId?: string
+  openaiActiveId?: string
+  accountCount: number
+  readBack?: string
+  repeatSkipped: boolean
+  afterSetActiveUnknown?: string
+  setActiveUnknownLogged: boolean
+}
+type Results = {
+  lease: LeaseRow
+  full: FullRow
+  capture: CaptureRow
+  keeper: { gated: TickCounts; ungated: TickCounts }
+  leasedActiveId: LeasedActiveIdRow
+}
 
 const runnerDir = mkdtempSync(join(tmpdir(), "cau-lease-parent-"))
 const runnerPath = join(runnerDir, "runner.test.ts")
@@ -295,6 +338,25 @@ test("store capture refuses sentinel refresh", () => {
   expect(r.capture.directStoreUnchanged).toBe(true)
   expect(r.capture.directUpsertLogged).toBe(false)
   expect(r.capture.directSentinelSkipLogged).toBe(true)
+})
+
+test("recordLeasedActiveId names an account the library does not hold", () => {
+  const r = results()
+  // THE POINT OF THE WHOLE MECHANISM: a worker's library is empty, so the pointer necessarily names
+  // an account only the master holds. Without this write nothing on the machine could answer "which
+  // account is my lease for?" until this process performed a lease of its own — which is why the
+  // first /usage of a freshly-started worker used to draw a blank "In Use" column.
+  expect(r.leasedActiveId.accountCount).toBe(0)
+  expect(r.leasedActiveId.activeId).toBe("eaaa1a79-4c1d-4f6e-9a52-6b7c8d9e0f11")
+  expect(r.leasedActiveId.readBack).toBe("eaaa1a79-4c1d-4f6e-9a52-6b7c8d9e0f11")
+  // The anthropic pointer is the ONLY field it may touch; the ChatGPT one belongs to another store.
+  expect(r.leasedActiveId.openaiActiveId).toBe("oa-keep")
+  // A renewal that lands on the same account costs no disk write.
+  expect(r.leasedActiveId.repeatSkipped).toBe(true)
+  // REGRESSION GUARD on local mode: setActiveId keeps refusing an unknown id, so the two writers
+  // cannot be "simplified" into one without this failing.
+  expect(r.leasedActiveId.setActiveUnknownLogged).toBe(true)
+  expect(r.leasedActiveId.afterSetActiveUnknown).toBe("eaaa1a79-4c1d-4f6e-9a52-6b7c8d9e0f11")
 })
 
 test("keeper skips anthropic maintenance when gated", () => {

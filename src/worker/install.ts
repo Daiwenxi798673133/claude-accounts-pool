@@ -9,7 +9,7 @@
 // OpenAI is untouched by all of this: those chains genuinely belong to this machine.
 
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { writeAuthAnthropic, readAuthAnthropic } from "../accounts.ts"
+import { readActiveId, recordLeasedActiveId, writeAuthAnthropic, readAuthAnthropic } from "../accounts.ts"
 import { installAutoSwitch } from "../autoswitch.ts"
 import { installTokenKeeper } from "../keeper.ts"
 import { log } from "../logger.ts"
@@ -52,8 +52,23 @@ function usageFailureMessage(failure: UsageFetchFailure): string {
 // the panel's manual switch, so there is exactly one shape a worker can produce. `{kind:"lease"}`
 // carries access + expiry and fills the refresh slot with the sentinel; `{kind:"full"}` is
 // structurally unreachable from here because no caller's dep type has a refresh field to pass.
-function writeLease(input: { access: string; expires: number }): Promise<void> {
-  return writeAuthAnthropic({ kind: "lease", access: input.access, expires: input.expires })
+//
+// TWO WRITES, IN THIS ORDER, AND THE ORDER IS THE POINT. The credential goes down FIRST because it
+// is the safety-critical one — an `expires` that never lands is the state in which the local auth
+// provider starts refreshing the sentinel itself. The accountId record is bookkeeping that follows,
+// so a crash between the two leaves a correct lease with a stale id rather than the reverse, and any
+// later lease write self-heals it. Recording it HERE rather than in each caller is what makes all
+// three lease paths — renewal, rate-limit switch, manual switch — impossible to forget.
+async function writeLease(input: { access: string; expires: number; accountId: string }): Promise<void> {
+  await writeAuthAnthropic({ kind: "lease", access: input.access, expires: input.expires })
+  try {
+    await recordLeasedActiveId(input.accountId)
+  } catch (error) {
+    // SWALLOWED BY CONTRACT: switchStrategy's writeLease MUST NOT REJECT — a throw here would leave
+    // a rate-limited session neither resumed nor marked stalled, trading a blank marker for a stuck
+    // turn. The lease itself is already on disk and works; only the marker is degraded.
+    log.warn("worker:record-held-account-fail", { error: error instanceof Error ? error.message : String(error) })
+  }
 }
 
 export function installCloudWorker(
@@ -98,10 +113,19 @@ export function installCloudWorker(
   // freshly-started worker holds whatever auth.json happened to contain until the first check
   // interval elapses — and if that entry is expired, the local auth provider refreshes it on the
   // very next request, which is the second-refresher failure this mode exists to prevent.
-  // Fire-and-forget with a catch: writeLease touches a real file and can genuinely reject, and an
+  //
+  // ADOPT BEFORE TICKING. The recorded id is what the PREVIOUS process leased, and this process
+  // inherited that lease along with auth.json — so the very first renewal must name it as
+  // `currentAccountId` (the master's rotation anchor) instead of asking as if from nowhere. When
+  // the on-disk lease is still fresh no tick happens at all, and adopting is then the ONLY thing
+  // that makes the first /usage able to mark a row.
+  // Fire-and-forget with a catch: both steps touch real files and can genuinely reject, and an
   // unhandled rejection here would surface as a crash in the plugin host.
-  void leaseKeeper
-    .tickOnce()
+  void readActiveId()
+    .then((id) => {
+      if (id) leaseKeeper.adoptAccount(id)
+      return leaseKeeper.tickOnce()
+    })
     .catch((error: unknown) => log.warn("worker:startup-lease-fail", { error: error instanceof Error ? error.message : String(error) }))
 
   // NO autoCapture() here, unlike the local bootstrap. Capture archives auth.json's tip into the
@@ -139,7 +163,12 @@ export function installCloudWorker(
             }
             openWorkerUsageDialog(api, {
               view: outcome.view,
-              heldAccountId: leaseKeeper.heldAccountId(),
+              // DISK FIRST, memory second. Every lease path writes the id through the shared
+              // writeLease seam, so the record is at least as fresh as the keeper's field and is
+              // the only one that survives a restart — which is the whole reason the first /usage
+              // of a process used to have nothing to mark. The in-memory value is the fallback for
+              // the one case the record cannot cover: a lease whose bookkeeping write failed.
+              heldAccountId: (await readActiveId()) ?? leaseKeeper.heldAccountId(),
               onSwitch: ({ prefix, label }) => {
                 void (async () => {
                   const switched = await manualSwitch.switchTo({ prefix, label })

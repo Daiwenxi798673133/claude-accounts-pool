@@ -563,7 +563,8 @@ export function installAutoSwitch(api: TuiPluginApi, strategy?: SwitchStrategy):
       // here: the limit is only observable as this session's failed turn, and only this session can
       // re-issue it. `??` short-circuits, so `strategy === undefined` evaluates the original
       // expression untouched and doSwitch is never even entered in cloud mode. `activeId ?? ""` =
-      // the worker holds no local record for its lease yet, i.e. no account for the master to exclude.
+      // this worker has never recorded a leased account (worker/install.ts's writeLease seam writes
+      // one on every lease), so there is no account for the master to cool or exclude.
       const leased = strategy
         ? await strategy.onLimit({ accountId: activeId ?? "", headers: diagnosticHeaders(error.responseHeaders), resetsAt: PROVIDERS.anthropic.parseResetMs(error) })
         : undefined
