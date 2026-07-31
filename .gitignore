@@ -17,6 +17,7 @@ bun.lock
 .sisyphus/
 .omo/
 .codegraph/
+.playwright-mcp/
 
 # Env / secrets — vars.txt holds the npm publish token
 .env

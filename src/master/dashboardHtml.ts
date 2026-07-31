@@ -103,16 +103,22 @@ export function dashboardHtml(config: DashboardConfig): string {
   #refresh.busy .spin { animation: spin 800ms linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  #rows { display: flex; flex-direction: column; gap: 20px; }
-  .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px;
-          padding: 26px 30px 22px; box-shadow: 0 1px 2px rgba(31,30,29,0.04); }
+  /* auto-fill, NOT auto-fit: auto-fit collapses the empty tracks, so a single-account pool would get
+     one card stretched across the whole 1180px .wrap — the full-width row this layout exists to end.
+     Inside that .wrap the 320px minimum yields exactly 3 columns, degrading to 2 then 1 on its own,
+     which is why the narrower card needs no media query of its own. */
+  #rows { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px;
+          align-items: start; }
+  .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 18px;
+          padding: 22px 22px 20px; box-shadow: 0 1px 2px rgba(31,30,29,0.04);
+          display: flex; flex-direction: column; gap: 18px; }
   .card.cooling { border-color: var(--accent); }
-  .head { display: flex; align-items: baseline; justify-content: space-between; gap: 20px;
-          flex-wrap: wrap; margin-bottom: 22px; }
+  /* Column, not a baseline-aligned row: in a ~350px card the label and the expiry line have no room
+     to sit side by side. The card's own gap now owns the space this rule's margin-bottom used to. */
+  .head { display: flex; flex-direction: column; gap: 10px; }
   .who { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-  .label { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.005em; }
-  .id { font-family: var(--mono); font-size: 12px; color: var(--text-3);
-        background: var(--chip-bg); border-radius: 5px; padding: 3px 7px; }
+  .label { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.005em;
+           word-break: break-all; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
   .badge.cool { color: var(--accent); }
   .badge.reauth { color: var(--accent-soft); }
@@ -120,8 +126,10 @@ export function dashboardHtml(config: DashboardConfig): string {
   .token { font-size: 14px; color: var(--text-2); }
 
   .wins { display: flex; flex-direction: column; gap: 14px; }
-  .win { display: grid; grid-template-columns: 130px 1fr 56px 110px; align-items: center; gap: 18px; }
-  .wl { font-family: var(--mono); font-size: 13px; color: var(--text-2);
+  .win { display: flex; flex-direction: column; gap: 7px; }
+  .win-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .win-right { display: flex; align-items: baseline; gap: 10px; }
+  .wl { font-family: var(--mono); font-size: 13px; color: var(--text-2); min-width: 0;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar { height: 8px; border-radius: 999px; background: var(--bar-track); overflow: hidden; }
   /* Four tones, darkest = most severe: a maxed window must never read as calmer than a busy one. */
@@ -129,11 +137,13 @@ export function dashboardHtml(config: DashboardConfig): string {
   .fill.zero { background: var(--bar-zero); }
   .fill.high { background: var(--accent); }
   .fill.max { background: var(--accent-dark); }
-  .pct { font-family: var(--mono); font-size: 14px; font-variant-numeric: tabular-nums;
-         text-align: right; color: var(--text); }
-  /* LEFT-aligned, hugging the percentage, as the local-mode panel packs it. Pinned to the far right
-     it read as a detached fourth column — and on rows whose reset is omitted it left a hole. */
-  .reset { font-size: 13px; text-align: left; color: var(--text-2); white-space: nowrap; }
+  .pct { font-family: var(--mono); font-size: 15px; font-variant-numeric: tabular-nums;
+         font-weight: 700; color: var(--text); }
+  /* The reset now hugs the percentage on the window's OWN header line, above a full-width bar, as the
+     local-mode panel packs it. Neither needs a text-align any more: there is no fixed column left to
+     align inside. Pinned to the far right of one it read as a detached fourth column — and on rows
+     whose reset is omitted it left a hole. */
+  .reset { font-size: 13px; color: var(--text-2); white-space: nowrap; }
   /* A 0% window is deliberately de-emphasised — it is the row with nothing to look at. */
   .pct.dim, .reset.dim { color: var(--text-3); }
 
@@ -215,8 +225,6 @@ export function dashboardHtml(config: DashboardConfig): string {
   @media (max-width: 640px) {
     body { padding: 32px 20px 56px; }
     .card { padding: 20px 18px 18px; }
-    .win { grid-template-columns: 1fr 48px; }
-    .win .bar, .win .reset { grid-column: 1 / -1; }
     #veil { padding: 16px; }
     #dialog { padding: 22px 18px 20px; }
   }
@@ -242,7 +250,7 @@ export function dashboardHtml(config: DashboardConfig): string {
     </div>
   </header>
   <div id="rows"></div>
-  <footer>本页不展示任何 token。除「添加账号」外不提供任何改状态的操作，且该操作只会向池中新增账号，不会切号或删号。</footer>
+  <footer>本页不展示任何 token 明文。除「添加账号」外不提供任何改状态的操作，且该操作只会向池中新增账号，不会切号或删号。</footer>
 </div>
 <div id="veil" hidden>
   <div id="dialog" role="dialog" aria-modal="true" aria-labelledby="dtitle">
@@ -408,19 +416,25 @@ export function dashboardHtml(config: DashboardConfig): string {
     var quiet = used > 0 ? "" : " dim";
 
     var row = el("div", "win");
-    row.appendChild(el("div", "wl", shortLabel(win.label)));
-    var bar = el("div", "bar");
-    var fill = el("div", "fill" + tone);
-    fill.style.width = Math.max(0, Math.min(100, used)) + "%";
-    bar.appendChild(fill);
-    row.appendChild(bar);
-    row.appendChild(el("div", "pct" + quiet, Math.round(used) + "%"));
+    // The bar gets the card's full width, below the text rather than beside it: sharing one line with
+    // three text columns left it, in a ~350px card, too narrow to read as a bar at all.
+    var top = el("div", "win-top");
+    top.appendChild(el("div", "wl", shortLabel(win.label)));
+    var right = el("div", "win-right");
+    right.appendChild(el("div", "pct" + quiet, Math.round(used) + "%"));
     // A window with no resetsAt renders NOTHING here — the same conditional the local-mode panel
     // applies (it wraps the reset text in a Show gated on resets_at). A placeholder like "重置未知"
     // was worse than silence: an idle window at 0% legitimately has no reset instant because it never
     // started, so those words announced a data gap where there was none, making a healthy idle
     // account look like one the poller had failed to reach.
-    row.appendChild(el("div", "reset" + quiet, win.resetsAt ? "重置 " + resetIn(win.resetsAt) : ""));
+    right.appendChild(el("div", "reset" + quiet, win.resetsAt ? "重置 " + resetIn(win.resetsAt) : ""));
+    top.appendChild(right);
+    row.appendChild(top);
+    var bar = el("div", "bar");
+    var fill = el("div", "fill" + tone);
+    fill.style.width = Math.max(0, Math.min(100, used)) + "%";
+    bar.appendChild(fill);
+    row.appendChild(bar);
     return row;
   }
 
@@ -429,7 +443,6 @@ export function dashboardHtml(config: DashboardConfig): string {
     var head = el("div", "head");
     var who = el("div", "who");
     who.appendChild(el("h2", "label", account.label));
-    who.appendChild(el("span", "id", account.idPrefix));
     if (account.coolingDown) who.appendChild(el("span", "badge cool", "冷却中"));
     if (account.needsReauth) who.appendChild(el("span", "badge reauth", "需重新登录"));
     if (account.excluded) who.appendChild(el("span", "badge muted", "不自动切"));
@@ -437,7 +450,7 @@ export function dashboardHtml(config: DashboardConfig): string {
     // one sitting at 0%. That confusion is the whole reason this page exists.
     if (!account.hasUsage) who.appendChild(el("span", "badge muted", "本轮无数据"));
     head.appendChild(who);
-    head.appendChild(el("span", "token", account.expiresAt ? "token " + fmtLeft(account.expiresAt - Date.now()) : "token 到期时间未知"));
+    head.appendChild(el("span", "token", account.expiresAt ? "access token " + fmtLeft(account.expiresAt - Date.now()) : "access token 到期时间未知"));
     card.appendChild(head);
     if (account.windows.length === 0) {
       card.appendChild(el("div", "empty", account.hasUsage ? "该账号本轮未报告任何窗口。" : "本轮轮询未取到该账号的用量（未知，不是 0%）。"));
