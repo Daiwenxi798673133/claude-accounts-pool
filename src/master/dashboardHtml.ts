@@ -10,7 +10,14 @@
 //
 // The script is written in ES5-ish `var` / string-concatenation style on purpose: it is embedded in a
 // TS template literal, so every backtick and every `${` inside it would need escaping and would be
-// one typo away from a page that fails to parse — with no compiler watching.
+// one typo away from a page that fails to parse — with no compiler watching. The same rule binds the
+// CSS and the markup below: no backtick and no `${` anywhere in the document, not even inside a
+// comment, except the single `${usageRoute}` interpolation.
+//
+// The look is Claude's warm-cream light theme. Its palette lives in `:root` custom properties and is
+// applied through classes rather than inline styles, because inline styles cannot express the
+// `@media` collapse or the state classes (`.cooling`, `.stale`, the four bar tones) this page needs
+// in order to show the states a happy-path mock never has to.
 
 // `usageRoute` comes from the frozen CLOUD_ROUTES table (a compile-time literal, never user input),
 // which is why interpolating it into a JS string literal here needs no escaping. It is a parameter
@@ -27,49 +34,122 @@ export function dashboardHtml(usageRoute: string): string {
      console of the very page an operator opens to find out whether anything is wrong. -->
 <link rel="icon" href="data:,">
 <style>
-  :root { color-scheme: dark light; --ok: #3fb950; --warn: #d29922; --full: #f85149; --dim: #8b949e; }
+  /* NO WEBFONT LINK, ON PURPOSE — do not "restore" one. The design this page copies loads Noto
+     Serif SC / Noto Sans SC / IBM Plex Mono from fonts.googleapis.com. This page must not: an
+     operator opens it precisely when the network or the pool is broken, and the master may run on a
+     host with no internet route at all, so typography that depends on a remote fetch degrades
+     exactly when the page is needed. The stacks below ask for those faces locally, then fall back. */
+  :root {
+    --serif: ui-serif, "Songti SC", "Noto Serif SC", Georgia, serif;
+    --sans: ui-sans-serif, -apple-system, "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", "IBM Plex Mono", Menlo, monospace;
+    --page-bg: #F5F4EE;
+    --card-bg: #FAF9F5;
+    --card-border: #E9E6DC;
+    --divider: #E3E0D6;
+    --chip-bg: #F0EEE5;
+    --text: #1F1E1D;
+    --text-2: #6F6B60;
+    --text-3: #908B7D;
+    --accent: #C15F3C;
+    --accent-soft: #D9865E;
+    --accent-dark: #A34A2A;
+    --bar-track: #EBE8DE;
+    --bar-zero: #C8C3B4;
+    color-scheme: light;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 24px; font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
-         background: #0d1117; color: #e6edf3; }
-  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
-  #meta { color: var(--dim); font-size: 12px; }
-  #meta.stale { color: var(--full); font-weight: 600; }
-  #rows { display: grid; gap: 12px; margin: 20px 0 0; }
-  .card { border: 1px solid #30363d; border-radius: 8px; padding: 12px 14px; background: #161b22; }
-  .card.cooling { border-color: var(--full); }
-  .head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-  .label { font-weight: 600; }
-  .id { color: var(--dim); font-family: ui-monospace, monospace; font-size: 12px; }
-  .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; }
-  .badge.cool { color: var(--full); }
-  .badge.reauth { color: var(--warn); }
-  .badge.muted { color: var(--dim); }
-  .token { color: var(--dim); font-size: 12px; margin-top: 4px; }
-  .win { display: grid; grid-template-columns: 150px 1fr 56px 130px; gap: 10px; align-items: center;
-         margin-top: 8px; font-size: 12px; }
-  .win .wl { color: var(--dim); font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
-  .bar { height: 8px; border-radius: 999px; background: #21262d; overflow: hidden; }
-  .fill { height: 100%; background: var(--ok); }
-  .fill.warn { background: var(--warn); }
-  .fill.full { background: var(--full); }
-  .pct { text-align: right; font-family: ui-monospace, monospace; }
-  .reset { color: var(--dim); text-align: right; }
-  .empty { color: var(--dim); font-size: 12px; margin-top: 6px; }
-  footer { margin-top: 24px; color: var(--dim); font-size: 12px; }
-  @media (max-width: 640px) { .win { grid-template-columns: 1fr 48px; } .win .bar, .win .reset { grid-column: 1 / -1; } }
+  body { margin: 0; padding: 56px 48px 80px; background: var(--page-bg); color: var(--text);
+         font: 14px/1.5 var(--sans); }
+  .wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 32px; }
+
+  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 32px;
+           flex-wrap: wrap; padding-bottom: 24px; border-bottom: 1px solid var(--divider); }
+  .titles { display: flex; flex-direction: column; gap: 10px; }
+  h1 { margin: 0; font-family: var(--serif); font-size: 38px; font-weight: 600;
+       letter-spacing: -0.01em; }
+  #meta { margin: 0; font-size: 15px; color: var(--text-2); }
+  #meta.stale { color: var(--accent); font-weight: 600; }
+  .ro { display: flex; align-items: center; gap: 8px; padding: 7px 14px; font-size: 13px;
+        border: 1px solid var(--divider); border-radius: 999px; background: var(--card-bg);
+        color: var(--text-2); }
+  .ro .dot { flex: 0 0 auto; display: block; width: 7px; height: 7px; border-radius: 50%;
+             background: var(--accent); }
+
+  #rows { display: flex; flex-direction: column; gap: 20px; }
+  .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px;
+          padding: 26px 30px 22px; box-shadow: 0 1px 2px rgba(31,30,29,0.04); }
+  .card.cooling { border-color: var(--accent); }
+  .head { display: flex; align-items: baseline; justify-content: space-between; gap: 20px;
+          flex-wrap: wrap; margin-bottom: 22px; }
+  .who { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .label { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.005em; }
+  .id { font-family: var(--mono); font-size: 12px; color: var(--text-3);
+        background: var(--chip-bg); border-radius: 5px; padding: 3px 7px; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  .badge.cool { color: var(--accent); }
+  .badge.reauth { color: var(--accent-soft); }
+  .badge.muted { color: var(--text-3); }
+  .token { font-size: 14px; color: var(--text-2); }
+
+  .wins { display: flex; flex-direction: column; gap: 14px; }
+  .win { display: grid; grid-template-columns: 130px 1fr 56px 110px; align-items: center; gap: 18px; }
+  .wl { font-family: var(--mono); font-size: 13px; color: var(--text-2);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { height: 8px; border-radius: 999px; background: var(--bar-track); overflow: hidden; }
+  /* Four tones, darkest = most severe: a maxed window must never read as calmer than a busy one. */
+  .fill { height: 100%; border-radius: 999px; background: var(--accent-soft); }
+  .fill.zero { background: var(--bar-zero); }
+  .fill.high { background: var(--accent); }
+  .fill.max { background: var(--accent-dark); }
+  .pct { font-family: var(--mono); font-size: 14px; font-variant-numeric: tabular-nums;
+         text-align: right; color: var(--text); }
+  /* LEFT-aligned, hugging the percentage, as the local-mode panel packs it. Pinned to the far right
+     it read as a detached fourth column — and on rows whose reset is omitted it left a hole. */
+  .reset { font-size: 13px; text-align: left; color: var(--text-2); white-space: nowrap; }
+  /* A 0% window is deliberately de-emphasised — it is the row with nothing to look at. */
+  .pct.dim, .reset.dim { color: var(--text-3); }
+
+  .empty { font-size: 13px; color: var(--text-3); }
+  footer { margin: 4px 0 0; font-size: 13px; color: var(--text-3); line-height: 1.6; }
+
+  @media (max-width: 640px) {
+    body { padding: 32px 20px 56px; }
+    .card { padding: 20px 18px 18px; }
+    .win { grid-template-columns: 1fr 48px; }
+    .win .bar, .win .reset { grid-column: 1 / -1; }
+  }
 </style>
 </head>
 <body>
-<h1>账号池用量</h1>
-<div id="meta">加载中…</div>
-<div id="rows"></div>
-<footer>只读视图：不含任何 token，也不提供任何改状态的操作。</footer>
+<div class="wrap">
+  <header>
+    <div class="titles">
+      <h1>账号池用量</h1>
+      <p id="meta">加载中…</p>
+    </div>
+    <div class="ro"><span class="dot"></span><span>只读视图</span></div>
+  </header>
+  <div id="rows"></div>
+  <footer>只读视图：不含任何 token，也不提供任何改状态的操作。</footer>
+</div>
 <script>
 (function () {
   "use strict";
   var USAGE_URL = "${usageRoute}";
   var RELOAD_MS = 60000;
   var TICK_MS = 1000;
+
+  // The fixed windows get a short display form; anything else — a dynamic per-model weekly window
+  // such as "Fable" — passes through UNCHANGED. A lookup with a pass-through fallback, never a
+  // chain of ifs, so a window label we have never seen is shown rather than silently dropped.
+  var SHORT_LABELS = {
+    five_hour: "5h",
+    seven_day: "7d",
+    seven_day_sonnet: "7d sonnet",
+    seven_day_opus: "7d opus"
+  };
+  var owns = Object.prototype.hasOwnProperty;
 
   var rows = document.getElementById("rows");
   var meta = document.getElementById("meta");
@@ -82,13 +162,19 @@ export function dashboardHtml(usageRoute: string): string {
     return node;
   }
 
+  function shortLabel(label) {
+    // hasOwnProperty, not a bare lookup: a pool-derived label of "constructor" must not resolve to
+    // something off Object.prototype.
+    return owns.call(SHORT_LABELS, label) ? SHORT_LABELS[label] : label;
+  }
+
   function fmtSpan(ms) {
     var minutes = Math.floor(ms / 60000);
     var days = Math.floor(minutes / 1440);
     var hours = Math.floor((minutes % 1440) / 60);
-    if (days > 0) return days + "天" + hours + "小时";
-    if (hours > 0) return hours + "小时" + (minutes % 60) + "分";
-    if (minutes > 0) return minutes + "分";
+    if (days > 0) return days + " 天 " + hours + " 小时";
+    if (hours > 0) return hours + " 小时 " + (minutes % 60) + " 分";
+    if (minutes > 0) return minutes + " 分";
     return "不到 1 分";
   }
 
@@ -96,6 +182,19 @@ export function dashboardHtml(usageRoute: string): string {
     if (!isFinite(ms)) return "未知";
     if (ms <= 0) return "已到期";
     return "剩 " + fmtSpan(ms);
+  }
+
+  // The local-mode /usage panel's resetIn(), reproduced deliberately so a window's countdown reads
+  // the same in both surfaces: compact units, and "now" for a deadline that has already passed.
+  function resetIn(iso) {
+    var ms = Date.parse(iso) - Date.now();
+    if (!isFinite(ms)) return "";
+    if (ms <= 0) return "now";
+    var hours = Math.floor(ms / 3600000);
+    var minutes = Math.floor((ms % 3600000) / 60000);
+    if (hours >= 24) return Math.floor(hours / 24) + "d " + (hours % 24) + "h";
+    if (hours > 0) return hours + "h " + minutes + "m";
+    return minutes + "m";
   }
 
   function renderMeta() {
@@ -116,33 +215,48 @@ export function dashboardHtml(usageRoute: string): string {
   }
 
   function renderWindow(win) {
+    var used = win.utilization;
+    var tone = used >= 100 ? " max" : used >= 70 ? " high" : used > 0 ? "" : " zero";
+    var quiet = used > 0 ? "" : " dim";
+
     var row = el("div", "win");
-    row.appendChild(el("div", "wl", win.label));
+    row.appendChild(el("div", "wl", shortLabel(win.label)));
     var bar = el("div", "bar");
-    var fill = el("div", "fill" + (win.utilization >= 100 ? " full" : win.utilization >= 80 ? " warn" : ""));
-    fill.style.width = Math.max(0, Math.min(100, win.utilization)) + "%";
+    var fill = el("div", "fill" + tone);
+    fill.style.width = Math.max(0, Math.min(100, used)) + "%";
     bar.appendChild(fill);
     row.appendChild(bar);
-    row.appendChild(el("div", "pct", Math.round(win.utilization) + "%"));
-    row.appendChild(el("div", "reset", win.resetsAt ? fmtLeft(Date.parse(win.resetsAt) - Date.now()) : "重置未知"));
+    row.appendChild(el("div", "pct" + quiet, Math.round(used) + "%"));
+    // A window with no resetsAt renders NOTHING here — the same conditional the local-mode panel
+    // applies (it wraps the reset text in a Show gated on resets_at). A placeholder like "重置未知"
+    // was worse than silence: an idle window at 0% legitimately has no reset instant because it never
+    // started, so those words announced a data gap where there was none, making a healthy idle
+    // account look like one the poller had failed to reach.
+    row.appendChild(el("div", "reset" + quiet, win.resetsAt ? "重置 " + resetIn(win.resetsAt) : ""));
     return row;
   }
 
   function renderAccount(account) {
     var card = el("article", "card" + (account.coolingDown ? " cooling" : ""));
     var head = el("div", "head");
-    head.appendChild(el("span", "label", account.label));
-    head.appendChild(el("span", "id", account.idPrefix));
-    if (account.coolingDown) head.appendChild(el("span", "badge cool", "冷却中"));
-    if (account.needsReauth) head.appendChild(el("span", "badge reauth", "需重新登录"));
-    if (account.excluded) head.appendChild(el("span", "badge muted", "不自动切"));
-    if (!account.hasUsage) head.appendChild(el("span", "badge muted", "本轮无数据"));
+    var who = el("div", "who");
+    who.appendChild(el("h2", "label", account.label));
+    who.appendChild(el("span", "id", account.idPrefix));
+    if (account.coolingDown) who.appendChild(el("span", "badge cool", "冷却中"));
+    if (account.needsReauth) who.appendChild(el("span", "badge reauth", "需重新登录"));
+    if (account.excluded) who.appendChild(el("span", "badge muted", "不自动切"));
+    // Without this badge an account the poller could not reach would look exactly like a healthy
+    // one sitting at 0%. That confusion is the whole reason this page exists.
+    if (!account.hasUsage) who.appendChild(el("span", "badge muted", "本轮无数据"));
+    head.appendChild(who);
+    head.appendChild(el("span", "token", account.expiresAt ? "token " + fmtLeft(account.expiresAt - Date.now()) : "token 到期时间未知"));
     card.appendChild(head);
-    card.appendChild(el("div", "token", account.expiresAt ? "token " + fmtLeft(account.expiresAt - Date.now()) : "token 到期时间未知"));
     if (account.windows.length === 0) {
       card.appendChild(el("div", "empty", account.hasUsage ? "该账号本轮未报告任何窗口。" : "本轮轮询未取到该账号的用量（未知，不是 0%）。"));
     } else {
-      for (var i = 0; i < account.windows.length; i++) card.appendChild(renderWindow(account.windows[i]));
+      var wins = el("div", "wins");
+      for (var i = 0; i < account.windows.length; i++) wins.appendChild(renderWindow(account.windows[i]));
+      card.appendChild(wins);
     }
     return card;
   }
