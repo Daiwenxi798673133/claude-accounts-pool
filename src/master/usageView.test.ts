@@ -75,6 +75,28 @@ test("joins roster, snapshot and cooldown into one anthropic-only view", () => {
   ])
 })
 
+test("a null resets_at from the API is omitted, not forwarded as null", () => {
+  // The cast mirrors the ONE at the real boundary: fetchUsage does `(await res.json()) as
+  // UsageResponse` with no validation, so `resets_at?: string` is a claim about the payload, not a
+  // proof. MEASURED against the live endpoint: a window sitting at 0% really answers
+  // `"resets_at": null`, which is why this fixture is not a hypothetical.
+  const withNull = { five_hour: { utilization: 0, resets_at: null } } as unknown as UsageResponse
+
+  const view = buildUsageView({
+    accounts: [account("zero")],
+    snapshot: snapshot([["zero", withNull]]),
+    isCoolingDown: never,
+  })
+
+  // The KEY IS ABSENT, not present-and-null. UsageWindowView promises "absent or a string", so a
+  // forwarded null would break any consumer testing with `in` or `hasOwn` — while still rendering
+  // fine in our own page (null is falsy), which is exactly how this would survive unnoticed.
+  const [window] = view.accounts[0].windows
+  expect(window).toEqual({ label: "five_hour", utilization: 0 })
+  expect(Object.hasOwn(window, "resetsAt")).toBe(false)
+  expect(JSON.stringify(view)).not.toContain("null")
+})
+
 test("an account missing from the snapshot is unknown, never zero", () => {
   const accounts = [account("kept"), account("missing")]
   const view = buildUsageView({

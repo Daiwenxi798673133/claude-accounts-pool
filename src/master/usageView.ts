@@ -23,11 +23,16 @@ export type UsageViewInput = {
   isCoolingDown: (accountId: string) => boolean
 }
 
+// `typeof === "string"`, NOT `!== undefined`. MEASURED against the live endpoint: a window sitting at
+// 0% comes back as `resets_at: null`, and that value reaches us through fetchUsage's unvalidated
+// `as UsageResponse` cast — so the declared `string | undefined` is a claim, not a guarantee. An
+// undefined-check would put `"resetsAt": null` on the wire, contradicting a view type that promises
+// the field is either absent or a string, and misleading any consumer testing with `in`.
 function toWindowView(window: NormalizedWindow): UsageWindowView {
   return {
     label: window.label,
     utilization: window.utilization,
-    ...(window.resets_at === undefined ? {} : { resetsAt: window.resets_at }),
+    ...(typeof window.resets_at === "string" ? { resetsAt: window.resets_at } : {}),
   }
 }
 
