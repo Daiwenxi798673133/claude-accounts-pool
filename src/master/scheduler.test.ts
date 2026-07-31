@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
+import { MASTER_USAGE_POLL_INTERVAL_MS } from "../constants.ts"
 import type { UsageResponse } from "../usage.ts"
 import { createScheduler, type SchedulerDeps } from "./scheduler.ts"
 
@@ -203,6 +204,50 @@ test("reportRateLimit starts cooldown and recovery restores availability", async
   scheduler.reportRateLimit("d", undefined)
   scheduler.setUsageCache([{ id: "c", usage: usage(20) }])
   expect(scheduler.isCoolingDown("d")).toBe(true)
+})
+
+test("getUsageSnapshot reports the poller's data with the scheduler's own staleness verdict", () => {
+  const { kv } = makeKv()
+  let clock = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => clock })
+  const accounts = [account("a"), account("b")]
+
+  // Before any sweep completes: `at` is 0 and the snapshot already reads STALE. A dashboard has to
+  // distinguish "polling has produced nothing yet" from "the whole pool is at 0%", and the zero
+  // instant does that without a third flag someone can forget to check.
+  const initial = scheduler.getUsageSnapshot()
+  expect(initial.at).toBe(0)
+  expect(initial.stale).toBe(true)
+  expect(initial.byId.size).toBe(0)
+
+  const polledAt = clock
+  scheduler.setUsageCache([{ id: "a", usage: usage(42) }])
+  const fresh = scheduler.getUsageSnapshot()
+  expect(fresh.at).toBe(polledAt)
+  expect(fresh.stale).toBe(false)
+  expect(fresh.byId.get("a")).toEqual(usage(42))
+
+  // The Map handed out is a COPY. A caller mutating it — a "let me just drop the rows I don't want
+  // to render" — must not be able to reach into the cache selection is still ranking by.
+  fresh.byId.delete("a")
+  fresh.byId.set("z", usage(0))
+  expect(scheduler.getUsageSnapshot().byId.get("a")).toEqual(usage(42))
+  expect(scheduler.getUsageSnapshot().byId.has("z")).toBe(false)
+
+  // THE STALENESS LINE IS THE SAME ONE SELECTION USES — that identity is the whole reason `stale`
+  // is computed inside the scheduler. Exactly AT the window: still ranked (`a` is the only account
+  // with a snapshot, so it wins on utilization) and still reported fresh.
+  clock = polledAt + 2 * MASTER_USAGE_POLL_INTERVAL_MS
+  expect(scheduler.getUsageSnapshot().stale).toBe(false)
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("a")
+
+  // One millisecond past it, BOTH flip together: ranking falls back to round-robin (so the pick
+  // moves off `a` despite its 42% still being the only number available) and the dashboard is told
+  // the numbers are no longer current. A page applying its own threshold could show a green light
+  // for a snapshot selection had already abandoned.
+  clock += 1
+  expect(scheduler.getUsageSnapshot().stale).toBe(true)
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("b")
 })
 
 test("cooldown state round-trips through injected kv", () => {

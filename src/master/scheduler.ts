@@ -35,6 +35,20 @@ export type SchedulerDeps = {
 
 export type UsageSnapshotEntry = { id: string; usage: UsageResponse }
 
+// The READ-ONLY view of the poller's latest sweep, for the master's usage dashboard.
+//
+// `stale` is decided HERE, not by the caller, because USAGE_CACHE_TTL_MS is the very threshold past
+// which this scheduler stops ranking by these numbers. A dashboard drawing its own line — even from
+// an exported copy of the constant — could show a green light for a snapshot selection has already
+// abandoned, which is the one thing a monitoring surface may never do.
+export type UsageSnapshot = {
+  // Epoch ms of the last completed sweep, `0` when none has ever completed — which reads as stale
+  // by construction rather than needing a separate "no data yet" flag.
+  at: number
+  stale: boolean
+  byId: Map<string, UsageResponse>
+}
+
 export type PickInput = {
   accounts: StoredAccount[]
   // The account the caller is leaving (the worker's current lease), excluded from this pick and
@@ -47,6 +61,7 @@ export type Scheduler = {
   reportRateLimit: (accountId: string, resetsAt?: number) => void
   setUsageCache: (entries: UsageSnapshotEntry[]) => void
   isCoolingDown: (accountId: string) => boolean
+  getUsageSnapshot: () => UsageSnapshot
 }
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
@@ -200,6 +215,15 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     }
   }
 
+  // A FRESH Map every call: the next sweep replaces `usageCache` wholesale, so handing out the live
+  // map would let a caller iterate a collection that is swapped underneath it — and let it delete
+  // entries selection still ranks by. The UsageResponse values are shared by reference on purpose:
+  // every consumer of this snapshot is read-only (it is serialised to JSON and discarded), so
+  // deep-cloning each payload would cost a copy per poll to prevent a mutation nobody performs.
+  function getUsageSnapshot(): UsageSnapshot {
+    return { at: usageCache.at, stale: now() - usageCache.at > USAGE_CACHE_TTL_MS, byId: new Map(usageCache.byId) }
+  }
+
   // Restore on construction so a master restart does not re-lease accounts that are still spent.
   // The stored type is a claim, not a proof (it came back from an untyped JSON store), hence the
   // runtime shape check; already-expired entries are DROPPED rather than restored, since they are
@@ -217,5 +241,6 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     reportRateLimit: (accountId: string, resetsAt?: number) => markCooldown(accountId, resetsAt),
     setUsageCache,
     isCoolingDown,
+    getUsageSnapshot,
   }
 }

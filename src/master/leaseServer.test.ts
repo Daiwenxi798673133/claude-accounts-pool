@@ -2,8 +2,9 @@ import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
 import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
-import type { LeaseRequest, LeaseResponse, RateLimitReport } from "../cloud/protocol.ts"
+import type { LeaseRequest, LeaseResponse, RateLimitReport, UsageSnapshotView } from "../cloud/protocol.ts"
 import { startLeaseServer } from "./leaseServer.ts"
+import type { UsageSnapshot } from "./scheduler.ts"
 
 // A REAL Bun.serve on an EPHEMERAL port, driven by REAL fetch. The deliverable here is HTTP
 // behaviour (status codes, auth gating, empty-body 204), and a handler invoked directly as a
@@ -43,10 +44,15 @@ function startHarness(options?: {
   cooled?: string[]
   preAborted?: boolean
   accountExpiresAt?: number
+  usage?: UsageSnapshot
 }): Harness {
   const accounts = options?.accounts ?? [account("acct-a"), account("acct-b")]
   const accountExpiresAt = options?.accountExpiresAt ?? ACCOUNT_EXPIRES_AT
   const cooled = new Set(options?.cooled ?? [])
+  // Empty and STALE by default — the shape a master has before its first poll completes. Every
+  // lease case below therefore runs against a server whose dashboard data is absent, proving the two
+  // concerns share a port without sharing a failure mode.
+  const usage: UsageSnapshot = options?.usage ?? { at: 0, stale: true, byId: new Map() }
   const reports: Harness["reports"] = []
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
@@ -63,6 +69,10 @@ function startHarness(options?: {
         reports.push({ accountId, ...(resetsAt === undefined ? {} : { resetsAt }) })
         cooled.add(accountId)
       },
+      getUsageSnapshot: () => usage,
+      // The SAME `cooled` set the pick filter reads, so a dashboard row claiming "冷却中" and an
+      // account being skipped by selection can never disagree in this harness.
+      isCoolingDown: (accountId) => cooled.has(accountId),
     },
     refresher: {
       async getFreshAccess(accountId) {
@@ -273,6 +283,162 @@ test("server aborts on lifecycle signal", async () => {
   // a server outlives the process that owns it.
   const preAborted = startHarness({ preAborted: true })
   await expect(fetch(`${preAborted.base}${CLOUD_ROUTES.health}`)).rejects.toThrow()
+})
+
+// A pool-shaped roster for the dashboard cases: a live account, one that is cooling, and one the
+// snapshot does not cover. Tokens are populated with recognisable values so the "no credential
+// reaches this payload" assertion below is a measurement, not a fixture that had nothing to leak.
+const dashboardAccounts: StoredAccount[] = [
+  { id: "acct-live", label: "live@example.test", refresh: "sk-ant-ort01-live", access: "sk-ant-oat01-live", expires: EXPIRES_AT },
+  { id: "acct-cool", label: "cool@example.test", refresh: "sk-ant-ort01-cool", access: "sk-ant-oat01-cool", expires: EXPIRES_AT },
+  { id: "acct-dark", label: "dark@example.test", refresh: "sk-ant-ort01-dark" },
+]
+
+const POLLED_AT = 1_700_000_000_000
+
+function dashboardHarness(stale: boolean): Harness {
+  return startHarness({
+    accounts: dashboardAccounts,
+    cooled: ["acct-cool"],
+    usage: {
+      at: POLLED_AT,
+      stale,
+      // `acct-dark` is deliberately absent: the poller omits accounts whose usage fetch failed.
+      byId: new Map([
+        ["acct-live", { five_hour: { utilization: 21, resets_at: "2026-08-01T00:00:00Z" }, seven_day: { utilization: 44 } }],
+        ["acct-cool", { five_hour: { utilization: 100, resets_at: "2026-08-01T03:00:00Z" } }],
+      ]),
+    },
+  })
+}
+
+test("usage requires the same pool key as the lease routes", async () => {
+  const harness = dashboardHarness(false)
+  try {
+    // Given: the dashboard's JSON names every account in the pool and how much of each subscription
+    // is left. When: it is asked for with no key, and then with a wrong one.
+    const anonymous = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)
+    const wrongKey = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`, { headers: { Authorization: "Bearer not-the-pool-key" } })
+
+    // Then: 401 both times, identically — that roster is reconnaissance a stolen or guessed key
+    // wants, so this route may not be the one place the pool answers an anonymous caller.
+    expect(anonymous.status).toBe(401)
+    expect(wrongKey.status).toBe(401)
+    expect(await anonymous.json()).toEqual({ error: expect.any(String) })
+    expect(await wrongKey.json()).toEqual({ error: expect.any(String) })
+  } finally {
+    harness.stop()
+  }
+})
+
+test("usage returns the whole pool with no token in it", async () => {
+  const harness = dashboardHarness(false)
+  try {
+    // When
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`, { headers: { Authorization: `Bearer ${POOL_KEY}` } })
+
+    // Then
+    expect(res.status).toBe(200)
+    const raw = await res.text()
+    const view = JSON.parse(raw) as UsageSnapshotView
+    expect(view.at).toBe(POLLED_AT)
+    expect(view.stale).toBe(false)
+
+    // 🔴 THE RED LINE, asserted on the RAW BYTES that crossed the socket rather than on a parsed
+    // object: no access token, no refresh token, no full account id. The fixture's tokens all start
+    // `sk-ant-`, so this fails the day a row is built by spreading a StoredAccount.
+    expect(raw).not.toContain("sk-ant-")
+    expect(raw).not.toContain("acct-live")
+
+    // Every anthropic account gets a row, in ROSTER order, keyed by an id PREFIX.
+    expect(view.accounts.map((row) => row.idPrefix)).toEqual(["acct-liv", "acct-coo", "acct-dar"])
+    expect(view.accounts.map((row) => row.label)).toEqual(["live@example.test", "cool@example.test", "dark@example.test"])
+
+    // The cooling account is flagged from the SCHEDULER's verdict — not inferred from its 100%
+    // window, which is exactly the case where the two would agree and hide a wrong implementation.
+    // `acct-live` proves the flag is not simply always true.
+    expect(view.accounts.map((row) => row.coolingDown)).toEqual([false, true, false])
+
+    // The account the poller could not reach is UNKNOWN, not idle: no windows and hasUsage false.
+    // A synthetic 0% row here would render as the emptiest bar on the page.
+    expect(view.accounts[2]).toEqual({
+      idPrefix: "acct-dar",
+      label: "dark@example.test",
+      windows: [],
+      hasUsage: false,
+      coolingDown: false,
+      excluded: false,
+      needsReauth: false,
+    })
+
+    // And the served rows carry the real windows, including each one's reset instant.
+    expect(view.accounts[0].windows).toEqual([
+      { label: "five_hour", utilization: 21, resetsAt: "2026-08-01T00:00:00Z" },
+      { label: "seven_day", utilization: 44 },
+    ])
+    expect(view.accounts[0].expiresAt).toBe(EXPIRES_AT)
+
+    // Serving the dashboard consulted the roster but minted NOTHING: it reads the usage poller's
+    // existing snapshot, so an operator refreshing the page can never provoke Anthropic's usage
+    // endpoint (whose 429 lasts minutes for every account behind this master's egress IP).
+    expect(harness.refreshed).toEqual([])
+    expect(harness.picks).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("usage marks a stale snapshot instead of presenting it as current", async () => {
+  const harness = dashboardHarness(true)
+  try {
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usage}`, { headers: { Authorization: `Bearer ${POOL_KEY}` } })
+
+    // The scheduler's own staleness verdict is forwarded verbatim. Without it the page would draw a
+    // confident green bar from numbers selection has already stopped trusting — a monitoring surface
+    // that lies is worse than no monitoring surface.
+    expect(res.status).toBe(200)
+    const view = (await res.json()) as UsageSnapshotView
+    expect(view.stale).toBe(true)
+    // The data itself is still served: the operator needs to see WHAT went stale, not an empty page.
+    expect(view.accounts).toHaveLength(3)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("dashboard serves an inert HTML shell without a key, repeatedly", async () => {
+  const harness = dashboardHarness(false)
+  try {
+    // Given: a browser navigating to a URL cannot send an Authorization header. When: it asks for the
+    // dashboard with no credential at all.
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)
+
+    // Then: it is served — and what it is served contains NO pool data whatsoever, which is the only
+    // reason a keyless route is acceptable on the port that also hands out live credentials.
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toContain("text/html")
+    const body = await res.text()
+    expect(body).toContain("<!doctype html>")
+    expect(body).toContain(CLOUD_ROUTES.usage)
+    expect(body).not.toContain("example.test")
+    expect(body).not.toContain("sk-ant-")
+    expect(body).not.toContain("acct-")
+    expect(body).not.toContain(POOL_KEY)
+
+    // A SECOND request must work too. A Response body is a single-use stream, so a handler that
+    // hoisted one shared Response out of the closure would serve the first browser and then fail
+    // every reload — the kind of break no single-fetch test would ever see.
+    const reload = await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)
+    expect(reload.status).toBe(200)
+    expect(await reload.text()).toBe(body)
+
+    // An unknown path is still a 404: adding a route at "/" must not turn the server into a catch-all
+    // that answers every probe with a page.
+    const missing = await fetch(`${harness.base}/not-a-route`)
+    expect(missing.status).toBe(404)
+  } finally {
+    harness.stop()
+  }
 })
 
 test("lease horizon never outlives the master refresh point", async () => {
