@@ -59,6 +59,7 @@
     "prepublishOnly": "tsc --noEmit && bun run build"
   },
   "dependencies": {
+    "@ex-machina/opencode-anthropic-auth": "1.8.1",
     "@opencode-ai/plugin": "^1.17.4",
     "@opentui/solid": "^0.4.1",
     "solid-js": "^1.9.13"

@@ -24,7 +24,13 @@
 // into the script needs no escaping. They are parameters rather than literals so the route table and
 // the throttle each stay a SINGLE source of truth: a renamed route cannot leave a silently broken
 // page behind, and the countdown the page shows cannot drift from the window the server enforces.
-export type DashboardConfig = { usageRoute: string; refreshRoute: string; throttleMs: number }
+export type DashboardConfig = {
+  usageRoute: string
+  refreshRoute: string
+  throttleMs: number
+  authorizeRoute: string
+  addRoute: string
+}
 
 export function dashboardHtml(config: DashboardConfig): string {
   return `<!doctype html>
@@ -79,6 +85,12 @@ export function dashboardHtml(config: DashboardConfig): string {
   .ro .dot { flex: 0 0 auto; display: block; width: 7px; height: 7px; border-radius: 50%;
              background: var(--accent); }
   .actions { display: flex; align-items: center; gap: 12px; }
+  /* The quiet sibling of #refresh: onboarding is rare and destructive-adjacent, so it must not
+     compete with the button an operator presses every visit. */
+  #add { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
+         border: 1px solid var(--divider); border-radius: 999px; background: var(--card-bg);
+         color: #3D3929; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
+  #add:hover { background: #F0EEE6; border-color: #D3CFC3; }
   #refresh { display: flex; align-items: center; gap: 8px; padding: 7px 14px; font: 500 13px/normal var(--sans);
              border: 1px solid var(--accent); border-radius: 999px; background: var(--accent);
              color: var(--card-bg); cursor: pointer; transition: background 120ms ease; }
@@ -128,11 +140,85 @@ export function dashboardHtml(config: DashboardConfig): string {
   .empty { font-size: 13px; color: var(--text-3); }
   footer { margin: 4px 0 0; font-size: 13px; color: var(--text-3); line-height: 1.6; }
 
+  /* ── 添加账号 dialog ───────────────────────────────────────────────────────────────────────────
+     Kept in the document from the start and toggled with [hidden] rather than built on demand: the
+     markup is fixed, so creating it per open would be the one place this page needed to assemble
+     elements under time pressure — which is how a textContent-only rule gets broken. */
+  #veil[hidden] { display: none; }
+  #veil { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center;
+          justify-content: center; padding: 32px; background: rgba(31,30,29,0.28);
+          backdrop-filter: blur(2px); animation: fade 160ms ease both; }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes pop { from { opacity: 0; transform: translateY(10px) scale(0.97); } to { opacity: 1; transform: none; } }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  #dialog { width: 100%; max-width: 480px; max-height: 100%; overflow-y: auto; padding: 28px 30px 26px;
+            display: flex; flex-direction: column; gap: 18px; background: var(--card-bg);
+            border: 1px solid var(--divider); border-radius: 16px;
+            box-shadow: 0 18px 48px rgba(31,30,29,0.18);
+            animation: pop 200ms cubic-bezier(0.2,0.8,0.2,1) both; }
+  #dialog h2 { margin: 0; font-family: var(--serif); font-size: 22px; font-weight: 600; }
+  .dhead { display: flex; flex-direction: column; gap: 6px; }
+  #dsub { margin: 0; font-size: 14px; color: var(--text-2); line-height: 1.5; }
+  .stage[hidden] { display: none; }
+  .stage { display: flex; flex-direction: column; gap: 14px;
+           animation: rise 240ms cubic-bezier(0.2,0.8,0.2,1) both; }
+
+  #d-loading { flex-direction: row; align-items: center; gap: 12px; padding: 26px 20px;
+               border: 1px dashed #DEDACE; border-radius: 12px; background: var(--page-bg); }
+  .dot-spin { flex: 0 0 auto; display: block; width: 15px; height: 15px; border-radius: 50%;
+              border: 2px solid #E0DCCE; border-top-color: var(--accent);
+              animation: spin 700ms linear infinite; }
+  #d-loading span:last-child { font-size: 14px; color: var(--text-2); }
+
+  .urlbox { display: flex; flex-direction: column; gap: 8px; padding: 14px 16px;
+            border: 1px solid var(--card-border); border-radius: 12px; background: var(--chip-bg); }
+  .cap { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-3); }
+  /* An anchor, not the design's static span: the issue asks for a link the operator CLICKS. It
+     carries noopener noreferrer because the target is a real login page — a tab that can reach back
+     into this one via window.opener is not something to hand an authorization flow. */
+  #authurl { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; color: #3D3929;
+             word-break: break-all; }
+  .pill { align-self: flex-start; display: flex; align-items: center; gap: 7px; padding: 8px 16px;
+          font: 500 13px/normal var(--sans); border: 1px solid var(--divider); border-radius: 999px;
+          background: var(--card-bg); color: #3D3929; cursor: pointer; }
+  .pill:hover { background: #F0EEE6; border-color: #D3CFC3; }
+  .pill.primary { border-color: var(--accent); background: var(--accent); color: var(--card-bg);
+                  transition: background 120ms ease; }
+  .pill.primary:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+  .pill:disabled { opacity: 0.75; cursor: default; }
+  .pill.primary .spin { display: none; }
+  .pill.primary.busy .spin { display: block; width: 12px; height: 12px; border-radius: 50%;
+                             border: 2px solid rgba(250,249,245,0.35); border-top-color: var(--card-bg);
+                             animation: spin 700ms linear infinite; }
+  .rule { height: 1px; background: var(--card-border); }
+  .field { display: flex; flex-direction: column; gap: 8px; }
+  .field label { font-size: 13px; font-weight: 500; color: #3D3929; }
+  #code { width: 100%; padding: 10px 13px; font-family: var(--mono); font-size: 13px;
+          color: var(--text); background: #FFFFFF; border: 1px solid var(--divider);
+          border-radius: 10px; outline: none;
+          transition: border-color 120ms ease, box-shadow 120ms ease; }
+  #code:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(193,95,60,0.12); }
+  .hint { font-size: 12.5px; color: var(--text-3); line-height: 1.5; }
+  .row { display: flex; align-items: center; gap: 10px; }
+  /* Only ever filled from a status-code lookup, never from a response body, so a hostile upstream
+     string cannot reach the operator's screen through it. */
+  #derr { font-size: 13px; color: var(--accent); font-weight: 600; line-height: 1.5; }
+  #derr[hidden] { display: none; }
+
+  #d-done { flex-direction: row; align-items: center; gap: 12px; padding: 22px 20px;
+            border: 1px solid var(--card-border); border-radius: 12px; background: var(--chip-bg); }
+  .tick { flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+          width: 26px; height: 26px; border-radius: 50%; background: var(--accent);
+          color: var(--card-bg); }
+  #donetext { font-size: 14px; color: #3D3929; }
+
   @media (max-width: 640px) {
     body { padding: 32px 20px 56px; }
     .card { padding: 20px 18px 18px; }
     .win { grid-template-columns: 1fr 48px; }
     .win .bar, .win .reset { grid-column: 1 / -1; }
+    #veil { padding: 16px; }
+    #dialog { padding: 22px 18px 20px; }
   }
 </style>
 </head>
@@ -145,6 +231,10 @@ export function dashboardHtml(config: DashboardConfig): string {
     </div>
     <div class="actions">
       <div class="ro"><span class="dot"></span><span>只读视图</span></div>
+      <button id="add" type="button">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 3.2v9.6"></path><path d="M3.2 8h9.6"></path></svg>
+        <span>添加账号</span>
+      </button>
       <button id="refresh" type="button">
         <span class="spin" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.7 6.6A6 6 0 0 0 3.1 4.6"></path><path d="M2.3 9.4A6 6 0 0 0 12.9 11.4"></path><path d="M13.9 2.6v4h-4"></path><path d="M2.1 13.4v-4h4"></path></svg></span>
         <span id="refresh-label">刷新</span>
@@ -152,13 +242,59 @@ export function dashboardHtml(config: DashboardConfig): string {
     </div>
   </header>
   <div id="rows"></div>
-  <footer>只读视图：不含任何 token，也不提供任何改状态的操作。</footer>
+  <footer>本页不展示任何 token。除「添加账号」外不提供任何改状态的操作，且该操作只会向池中新增账号，不会切号或删号。</footer>
+</div>
+<div id="veil" hidden>
+  <div id="dialog" role="dialog" aria-modal="true" aria-labelledby="dtitle">
+    <div class="dhead">
+      <h2 id="dtitle">添加 anthropic 账号</h2>
+      <p id="dsub">正在准备 OAuth 授权，请稍候。</p>
+    </div>
+    <div id="d-loading" class="stage">
+      <span class="dot-spin" aria-hidden="true"></span>
+      <span>正在生成 Anthropic 授权链接…</span>
+    </div>
+    <div id="d-ready" class="stage" hidden>
+      <div class="urlbox">
+        <span class="cap">授权链接</span>
+        <a id="authurl" href="#" target="_blank" rel="noopener noreferrer"></a>
+      </div>
+      <button id="copy" class="pill" type="button"><span id="copylabel">复制链接</span></button>
+      <div class="rule"></div>
+      <div class="field">
+        <label for="code">粘贴授权页返回的 code</label>
+        <input id="code" type="text" spellcheck="false" autocomplete="off" placeholder="例如 ac_xxx#state 或整条回调地址">
+        <span class="hint">在上面的链接里登录并点「Authorize」后，页面会给出一串 code。整段复制粘贴即可，带不带 state、是不是完整回调网址都能识别。</span>
+      </div>
+      <p id="derr" hidden></p>
+      <div class="row">
+        <button id="submit" class="pill primary" type="button" disabled>
+          <span class="spin" aria-hidden="true"></span>
+          <span id="submitlabel">验证并添加</span>
+        </button>
+        <button id="cancel" class="pill" type="button">取消</button>
+      </div>
+    </div>
+    <div id="d-done" class="stage" hidden>
+      <span class="tick" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-6"></path></svg></span>
+      <span id="donetext"></span>
+    </div>
+    <div id="d-fatal" class="stage" hidden>
+      <p id="fatalmsg" class="hint"></p>
+      <div class="row">
+        <button id="retry" class="pill primary" type="button"><span>重新获取链接</span></button>
+        <button id="close2" class="pill" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
 </div>
 <script>
 (function () {
   "use strict";
   var USAGE_URL = "${config.usageRoute}";
   var REFRESH_URL = "${config.refreshRoute}";
+  var AUTHORIZE_URL = "${config.authorizeRoute}";
+  var ADD_URL = "${config.addRoute}";
   var THROTTLE_MS = ${String(config.throttleMs)};
   var RELOAD_MS = 60000;
   var TICK_MS = 1000;
@@ -379,6 +515,237 @@ export function dashboardHtml(config: DashboardConfig): string {
   }
 
   button.addEventListener("click", refresh);
+
+  // ── 添加账号 ──────────────────────────────────────────────────────────────────────────────────
+  // A four-stage dialog (loading / ready / done / fatal) over the two onboarding routes. The split
+  // that drives it is the server's: a 400 is recoverable and keeps the pasted value on screen, while
+  // 410 and 502 mean this PKCE session is spent and only a new link can help.
+  var veil = document.getElementById("veil");
+  var dsub = document.getElementById("dsub");
+  var stages = {
+    loading: document.getElementById("d-loading"),
+    ready: document.getElementById("d-ready"),
+    done: document.getElementById("d-done"),
+    fatal: document.getElementById("d-fatal")
+  };
+  var authAnchor = document.getElementById("authurl");
+  var codeInput = document.getElementById("code");
+  var submitButton = document.getElementById("submit");
+  var submitLabel = document.getElementById("submitlabel");
+  var copyButton = document.getElementById("copy");
+  var copyLabel = document.getElementById("copylabel");
+  var errorLine = document.getElementById("derr");
+  var doneText = document.getElementById("donetext");
+  var fatalMessage = document.getElementById("fatalmsg");
+
+  var SUBTITLES = {
+    loading: "正在准备 OAuth 授权，请稍候。",
+    ready: "打开链接完成登录授权，然后把返回的 code 粘贴回来。",
+    done: "添加成功。",
+    fatal: "本次授权没有完成。"
+  };
+  // Keyed by STATUS, never by the response body: the body's error field is a machine-readable reason
+  // for the log, and echoing a server string into the DOM is the habit this page exists without.
+  var ADD_ERRORS = {
+    400: "这段 code 没有被接受。常见原因是复制不完整、已经用过一次，或者跟本次链接不是同一份授权——回到授权页重新取一段再试。",
+    410: "本次授权会话已失效：可能超过了 10 分钟，或者尝试次数已用尽。请重新获取链接。",
+    429: "操作太频繁，请稍候再试。",
+    502: "授权本身成功了，但读取账号信息失败，账号没有入池。请重新获取链接再走一遍。"
+  };
+  // 410 and 502 are terminal for the session; everything else leaves the operator on the form.
+  var FATAL_STATUS = { 410: true, 502: true };
+
+  var addStage = "loading";
+  var pendingId = "";
+  var submitting = false;
+  var closeTimer = 0;
+  var copyTimer = 0;
+
+  function showStage(name) {
+    addStage = name;
+    for (var key in stages) {
+      if (owns.call(stages, key)) stages[key].hidden = key !== name;
+    }
+    dsub.textContent = owns.call(SUBTITLES, name) ? SUBTITLES[name] : "";
+  }
+
+  function setError(text) {
+    errorLine.textContent = text;
+    errorLine.hidden = !text;
+  }
+
+  function syncSubmit() {
+    submitButton.disabled = submitting || codeInput.value.trim().length === 0;
+    submitButton.className = submitting ? "pill primary busy" : "pill primary";
+    submitLabel.textContent = submitting ? "验证中…" : "验证并添加";
+  }
+
+  function closeDialog() {
+    clearTimeout(closeTimer);
+    veil.hidden = true;
+    pendingId = "";
+    submitting = false;
+  }
+
+  // Asks for a fresh PKCE session every time the dialog opens. Deliberately NOT cached across opens:
+  // a session the operator abandoned is one the server may already have evicted, and reusing a dead
+  // pendingId would fail at the worst moment — after they had gone and authorized in the browser.
+  function beginAdd() {
+    clearTimeout(closeTimer);
+    veil.hidden = false;
+    pendingId = "";
+    submitting = false;
+    codeInput.value = "";
+    setError("");
+    copyLabel.textContent = "复制链接";
+    showStage("loading");
+    syncSubmit();
+    fetch(AUTHORIZE_URL, { method: "POST", cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (payload) {
+        pendingId = payload.pendingId;
+        // href AND textContent from the same value: the anchor is what the issue asks the operator to
+        // click, and showing a different string than the one it navigates to is how a link becomes a
+        // thing nobody can verify.
+        authAnchor.href = payload.url;
+        authAnchor.textContent = payload.url;
+        showStage("ready");
+        syncSubmit();
+        codeInput.focus();
+      })
+      .catch(function (error) {
+        fatalMessage.textContent = "获取授权链接失败：" + error.message;
+        showStage("fatal");
+      });
+  }
+
+  // execCommand, not the Clipboard API, as the FALLBACK — and it is the path that actually runs here
+  // most of the time. navigator.clipboard is gated on a SECURE CONTEXT, and this master is routinely
+  // reached over plain HTTP on a tailnet address, where that object does not exist at all.
+  function legacyCopy(text) {
+    var scratch = document.createElement("textarea");
+    scratch.value = text;
+    scratch.setAttribute("readonly", "");
+    scratch.style.position = "fixed";
+    scratch.style.top = "-1000px";
+    document.body.appendChild(scratch);
+    scratch.select();
+    var ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch (error) {
+      ok = false;
+    }
+    document.body.removeChild(scratch);
+    return ok;
+  }
+
+  function flashCopied(ok) {
+    // On failure the anchor is selected instead, so the operator always has a way out: the link is
+    // right there and now highlighted for a manual copy.
+    copyLabel.textContent = ok ? "已复制" : "复制失败，请手动选择";
+    if (!ok) {
+      var range = document.createRange();
+      range.selectNodeContents(authAnchor);
+      var selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(function () { copyLabel.textContent = "复制链接"; }, 1800);
+  }
+
+  function copyUrl() {
+    var text = authAnchor.textContent;
+    if (!text) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { flashCopied(true); }, function () {
+        flashCopied(legacyCopy(text));
+      });
+      return;
+    }
+    flashCopied(legacyCopy(text));
+  }
+
+  function submitCode() {
+    if (submitting || !pendingId) return;
+    var code = codeInput.value.trim();
+    if (!code) return;
+    submitting = true;
+    setError("");
+    syncSubmit();
+    fetch(ADD_URL, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pendingId: pendingId, code: code })
+    })
+      .then(function (res) {
+        if (res.ok) return res.json();
+        // Read as a STATUS, not as text to display. The 429 body is the only one consulted, and only
+        // for its number, so the page can name the wait instead of showing a dead button.
+        if (res.status === 429) {
+          return res.json().catch(function () { return null; }).then(function (body) {
+            var wait = body && typeof body.retryAfterMs === "number" && body.retryAfterMs > 0 ? body.retryAfterMs : 3000;
+            throw { status: 429, waitMs: wait };
+          });
+        }
+        throw { status: res.status };
+      })
+      .then(function (payload) {
+        // The pool grew only when the uuid was new. Saying so plainly beats a uniform "成功", which
+        // would let an operator re-authorising an existing account believe they had added a second one.
+        doneText.textContent = payload.existing
+          ? "该账号已在池中（" + payload.label + "），凭据已更新。"
+          : "账号 " + payload.label + " 已加入池中，将在下一轮采集用量。";
+        showStage("done");
+        // The roster on the page behind the dialog is now out of date by exactly one account.
+        load();
+        closeTimer = setTimeout(closeDialog, 2600);
+      })
+      .catch(function (failure) {
+        var status = failure && failure.status;
+        if (status === 429) {
+          setError(ADD_ERRORS[429] + "（约 " + Math.ceil(failure.waitMs / 1000) + " 秒）");
+          return;
+        }
+        if (status && FATAL_STATUS[status]) {
+          fatalMessage.textContent = ADD_ERRORS[status];
+          showStage("fatal");
+          return;
+        }
+        setError(status && owns.call(ADD_ERRORS, status) ? ADD_ERRORS[status] : "提交失败：" + (failure && failure.message ? failure.message : "网络错误"));
+      })
+      .then(function () {
+        submitting = false;
+        syncSubmit();
+      });
+  }
+
+  document.getElementById("add").addEventListener("click", beginAdd);
+  document.getElementById("cancel").addEventListener("click", closeDialog);
+  document.getElementById("close2").addEventListener("click", closeDialog);
+  document.getElementById("retry").addEventListener("click", beginAdd);
+  copyButton.addEventListener("click", copyUrl);
+  submitButton.addEventListener("click", submitCode);
+  codeInput.addEventListener("input", function () {
+    setError("");
+    syncSubmit();
+  });
+  codeInput.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") submitCode();
+  });
+  // Backdrop click closes, but only when the backdrop ITSELF was hit: without the target check a drag
+  // that started inside the dialog and ended on the veil would discard a half-typed code.
+  veil.addEventListener("mousedown", function (event) {
+    if (event.target === veil) closeDialog();
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !veil.hidden) closeDialog();
+  });
 
   load();
   // Two clocks: the countdowns (and the throttle's own countdown) tick locally every second, while the

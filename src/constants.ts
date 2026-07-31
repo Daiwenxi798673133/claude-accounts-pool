@@ -162,3 +162,34 @@ export const MASTER_WARM_SPACING_MS = 500
 // angry well past the request that upset it), so polling stays deliberately coarse — the data
 // is only used to rank accounts, and a 5-minute-old ranking is still a good ranking.
 export const MASTER_USAGE_POLL_INTERVAL_MS = 5 * 60_000
+
+// ── Web onboarding (the dashboard's 添加账号 flow) ───────────────────────────────────────────────
+// Every bound below exists because these two routes are KEYLESS, like the rest of the dashboard.
+// That decision is the pool owner's (it is what keeps "open the browser and click" true), and it
+// means the guards here are the ONLY thing standing between an anonymous peer on the bind address
+// and (a) this master's memory and (b) its egress IP at platform.claude.com — the IP whose 429 is
+// charged to every account in the pool at once. They are not ceremony; they are the whole defence.
+
+// How long a minted authorize URL stays exchangeable. The operator has to leave the page, log in at
+// claude.ai, and copy a code back, so this cannot be tight — but every live session is a verifier
+// held in memory, so it cannot be open-ended either.
+export const ONBOARD_PENDING_TTL_MS = 10 * 60_000
+
+// Hard ceiling on live PKCE sessions, oldest evicted first. This — not a rate limit — is what makes
+// the memory cost of an anonymous /authorize flood a CONSTANT rather than a slow leak: the store can
+// never hold more than this many verifiers no matter how often the route is called. Small because
+// onboarding is a one-at-a-time human action; the headroom above 1 exists only so an operator who
+// re-opens the dialog a couple of times does not knock out the session they are mid-way through.
+export const ONBOARD_MAX_PENDING = 4
+
+// Exchange attempts allowed per session before it is burned. Greater than 1 because a human pasting
+// a code will fumble it and a single-shot session would make them restart the whole browser round
+// trip; small because each attempt is one POST to Anthropic's token endpoint, and this multiplier is
+// what turns the pending cap into a bound on OUTBOUND calls (MAX_PENDING × MAX_ATTEMPTS).
+export const ONBOARD_MAX_ATTEMPTS = 3
+
+// Server-wide floor between two exchange attempts. The companion to the two bounds above: they cap
+// the total, this caps the RATE, so a sustained anonymous drip cannot turn into a 400-storm against
+// the token endpoint that gets this master's IP blocked and takes every account's refresh with it.
+// Sized for a human pressing a button, not for a script.
+export const ONBOARD_ADD_MIN_INTERVAL_MS = 3_000
