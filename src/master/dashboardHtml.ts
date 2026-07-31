@@ -304,7 +304,7 @@ export function dashboardHtml(config: DashboardConfig): string {
   var AUTHORIZE_URL = "${config.authorizeRoute}";
   var ADD_URL = "${config.addRoute}";
   var THROTTLE_MS = ${String(config.throttleMs)};
-  var RELOAD_MS = 60000;
+  var RELOAD_MS = 5000;
   var TICK_MS = 1000;
 
   // The fixed windows get a short display form; anything else — a dynamic per-model weekly window
@@ -328,6 +328,10 @@ export function dashboardHtml(config: DashboardConfig): string {
   // left instead of the snapshot age, so a disabled-looking button always has a reason next to it.
   var throttledUntil = 0;
   var errorText = "";
+  // In-flight marker for load(). Four things now ask for a snapshot — the interval and the three
+  // wake-up listeners below — and a single switch back to this window can fire two listeners at once,
+  // so overlapping GETs are ordinary here rather than rare.
+  var loading = false;
 
   function el(tag, className, text) {
     var node = document.createElement(tag);
@@ -375,7 +379,18 @@ export function dashboardHtml(config: DashboardConfig): string {
     if (!latest) return "加载中…";
     if (latest.at === 0) return "尚未完成任何一轮轮询——按「刷新」立即采集一次，否则要等下一个轮询周期(5 分钟)。";
     var when = new Date(latest.at).toLocaleTimeString();
-    var age = fmtSpan(Date.now() - latest.at);
+    // CLAMPED, because the snapshot instant is stamped by the MASTER's clock while this age is
+    // measured against the BROWSER's: a few seconds of skew between two hosts is ordinary and must
+    // read as "0 秒", never as a negative age.
+    var ageMs = Math.max(0, Date.now() - latest.at);
+    // SECONDS below a minute, and that is the half of this fix an operator actually SEES. Every sweep
+    // that arrives from outside this tab — a worker pressing r, another operator's tab, the
+    // scheduled poll — lands inside that first minute, and fmtSpan's flat "不到 1 分" renders
+    // identically on both sides of it, so the one line being watched would sit still at the exact
+    // moment it had just updated. With seconds, the existing 1s tick makes the new snapshot land
+    // visibly. fmtSpan is deliberately NOT widened: fmtLeft's per-account token countdown shares it,
+    // and that is a different surface with no such requirement.
+    var age = ageMs < 60000 ? Math.floor(ageMs / 1000) + " 秒" : fmtSpan(ageMs);
     if (latest.stale) {
       return "数据陈旧：快照采集于 " + when + "（" + age + "前），调度器已停止按它排序，下面的数字不代表当前状态。";
     }
@@ -475,19 +490,35 @@ export function dashboardHtml(config: DashboardConfig): string {
   }
 
   function load() {
+    // Dropped rather than queued: every caller wants the SAME thing — the current snapshot — so a
+    // second concurrent GET could only answer with what the first one is already about to deliver.
+    // This is also what keeps a slow FAILED response from painting 拉取失败 over data that is fine,
+    // which the monotonic guard below cannot do because it only governs the snapshot.
+    if (loading) return;
+    loading = true;
     fetch(USAGE_URL, { cache: "no-store" })
       .then(function (res) {
         if (!res.ok) throw new Error("HTTP " + res.status);
         return res.json();
       })
       .then(function (payload) {
-        latest = payload;
+        // NEVER GO BACKWARDS. The 刷新 button's POST is a second in-flight channel single-flight cannot
+        // see, so a GET issued before that sweep can land after it, carrying the OLDER instant, and
+        // undo the very update this page exists to show. An instant of 0 is exempt because that is how a
+        // RESTARTED master reports "not swept yet" — refusing it would hide that honest notice behind
+        // whatever snapshot this tab happened to still be holding, forever.
+        if (payload.at === 0 || !latest || payload.at >= latest.at) latest = payload;
+        // Cleared OUTSIDE the guard: a 200 proves the master answered, so a previous fetch error is
+        // stale news even when this particular body lost the race described above.
         errorText = "";
         render();
       })
       .catch(function (error) {
         errorText = "拉取失败：" + error.message;
         render();
+      })
+      .then(function () {
+        loading = false;
       });
   }
 
@@ -760,10 +791,38 @@ export function dashboardHtml(config: DashboardConfig): string {
     if (event.key === "Escape" && !veil.hidden) closeDialog();
   });
 
+  // ── WAKING UP ─────────────────────────────────────────────────────────────────────────────────
+  // The interval below CANNOT carry this on its own, and that is the whole point of these three.
+  // Sweeps now arrive that this tab never sees coming — a worker pressing r and another operator's
+  // tab both drive POST /v1/usage/refresh — and the operator watching for the result is, by
+  // definition, somewhere else at the time. A browser throttles a HIDDEN page's timers hard (Chrome
+  // clamps them to roughly one a minute once it has been hidden a few minutes, and Page Lifecycle may
+  // freeze them outright), so the tab that most needs to catch up is exactly the one whose interval
+  // has stopped running. Each listener below covers a return path the other two cannot see; none is
+  // redundant, so do not "simplify" this to one.
+  document.addEventListener("visibilitychange", function () {
+    // Switching back to this tab in the same window. Also the only one of the three that fires when a
+    // window becomes un-occluded without being clicked, where the platform reports occlusion at all.
+    if (!document.hidden) load();
+  });
+  window.addEventListener("focus", function () {
+    // THE CASE THIS FIX IS ACTUALLY ABOUT. While the browser window sits behind the terminal the
+    // operator is typing in, visibilityState stays "visible" on macOS — so visibilitychange never
+    // fires, and Cmd-Tabbing back is reported ONLY here.
+    load();
+  });
+  window.addEventListener("pageshow", function (event) {
+    // Restored from the back/forward cache, where the page resumes with everything frozen mid-flight.
+    // Guarded on the persisted flag so a normal navigation does not double the load() below.
+    if (event.persisted) load();
+  });
+
   load();
-  // Two clocks: the countdowns (and the throttle's own countdown) tick locally every second, while the
-  // snapshot is refetched only once a minute — the master polls the upstream usage API on its own
-  // multi-minute schedule, so a faster refetch would just re-serve the same numbers.
+  // Two clocks. The countdowns (and the throttle's own countdown) tick locally every second, while the
+  // snapshot is refetched every few seconds — deliberately far below the 30s window the server
+  // enforces on forced sweeps, so a sweep triggered anywhere in the pool shows up here promptly
+  // instead of aging silently. This is NOT the page trying to outrun the master's own multi-minute
+  // poll: it is what covers the tab that stayed visible while somebody else pressed 刷新.
   setInterval(render, TICK_MS);
   setInterval(load, RELOAD_MS);
 })();

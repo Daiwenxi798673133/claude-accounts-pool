@@ -997,6 +997,81 @@ test("a profile failure after a successful exchange answers 502", async () => {
   }
 })
 
+// TRIPWIRES, NOT BEHAVIOUR PROOFS — and deliberately so. The page's logic lives in an embedded ES5
+// script with no DOM harness in this repo, so what these two cases can assert is that each REVIEWED
+// DECISION is still present in the served document. Behaviour is proved against real Chromium
+// out-of-band. Each marker below is here because removing it silently reintroduces a shipped bug, so
+// a later "simplification" has to delete an assertion — and read why it exists — to get past CI.
+test("the dashboard wakes up instead of waiting out its own poll interval", async () => {
+  const harness = dashboardHarness(false)
+  try {
+    const body = await (await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)).text()
+
+    // A sweep can now land that this page never sees coming: a worker pressing `r` and another
+    // operator's tab both drive POST /v1/usage/refresh, and the scheduled poll lands on its own. At
+    // 60s the snapshot instant could sit a whole minute behind the pool while the local tick counted
+    // its age UP — the page reporting staleness it had already been told about.
+    expect(body).toContain("var RELOAD_MS = 5000")
+    expect(body).not.toContain("var RELOAD_MS = 60000")
+
+    // THE INTERVAL ALONE CANNOT FIX IT, because the tab is HIDDEN for the whole workflow: the
+    // operator is in the terminal when they press `r`. Chrome clamps a hidden page's timers to about
+    // one minute (intensive throttling, after 5 minutes hidden) and Page Lifecycle may freeze them
+    // outright, so a hidden tab's 5s interval is worth no more than the 60s one it replaced. These
+    // three listeners are what actually repairs the reported case, and NONE of them is redundant:
+    //   • visibilitychange — same-window tab switch back; also the only one Chrome's native window
+    //     occlusion tracking fires, which arrives WITHOUT focus.
+    //   • focus — the macOS case, and the one the issue is really about: while the browser window
+    //     sits behind the terminal, visibilityState stays "visible", so visibilitychange NEVER
+    //     fires and only a Cmd-Tab focus event reports the operator coming back.
+    //   • pageshow/persisted — bfcache restore, where Chrome and Firefox re-emit visibilitychange
+    //     but Safari historically does not.
+    expect(body).toContain('addEventListener("visibilitychange"')
+    expect(body).toContain('window.addEventListener("focus"')
+    expect(body).toContain('window.addEventListener("pageshow"')
+    expect(body).toContain("event.persisted")
+
+    // Single-flight. Waking on THREE events means one switch can fire two of them at once, and a
+    // faster interval makes overlapping GETs ordinary rather than rare. It also guards `errorText`,
+    // which the monotonic check below cannot: a slow FAILED response landing after a fresh success
+    // would otherwise paint "拉取失败" over data that is fine.
+    expect(body).toContain("if (loading) return")
+
+    // Monotonic snapshot. The 刷新 button's POST is a SECOND in-flight channel single-flight cannot
+    // see, so a slow GET carrying an older instant can land after it and roll the timestamp
+    // backwards — the exact symptom this whole change exists to remove. `at === 0` is exempt because
+    // that is how a restarted master says it has not swept yet; without the exemption that honest
+    // notice would be suppressed forever.
+    expect(body).toContain("payload.at === 0 || !latest || payload.at >= latest.at")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("the dashboard reports a fresh snapshot in seconds, not as a flat sub-minute bucket", async () => {
+  const harness = dashboardHarness(false)
+  try {
+    const body = await (await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)).text()
+
+    // Without this, two sweeps less than a minute apart BOTH render "不到 1 分" and a correct fix
+    // still looks broken: the operator presses `r`, the page really does refetch, and the line they
+    // are watching does not move. Seconds plus the existing 1s tick is what makes the refresh
+    // visible at the moment it lands.
+    expect(body).toContain('Math.floor(ageMs / 1000) + " 秒"')
+
+    // Clamped, because the instant comes from the MASTER's clock and the age is computed against the
+    // BROWSER's. A few seconds of skew between two hosts is ordinary and must read as "0 秒", never
+    // as a negative age.
+    expect(body).toContain("Math.max(0, Date.now() - latest.at)")
+
+    // fmtSpan is deliberately NOT the place for this: fmtLeft's per-account token countdown shares
+    // it, so widening it would change a surface this issue never asked about.
+    expect(body).toContain("function fmtSpan(ms)")
+  } finally {
+    harness.stop()
+  }
+})
+
 test("the dashboard page carries the onboarding routes and still leaks nothing", async () => {
   const harness = startHarness()
   try {
