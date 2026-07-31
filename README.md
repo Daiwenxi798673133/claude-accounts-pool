@@ -8,14 +8,20 @@
 
 ## 功能
 
-| 命令 | 作用 |
-|------|------|
-| `/usage` | 弹框显示账号用量,按 provider 分 `Claude` / `ChatGPT` 两页(`tab` / `←→` / `h l` 切页),并常驻一行「当前对话」显示本轮真实的 provider / model。两页都可 `↑↓` 选择、`enter` 切换(立即生效)、`m` 标记/取消"不自动切"、`d` 删除账号(再按一次 `d` 确认,当前账号不可删)、`esc` 关闭 |
-| `/stats` | 弹框显示本地 OpenCode 的用量统计仪表盘:总览 / 模型 / 提供方三个分页,含活跃热力图与 token 折线图,可切 All / 7天 / 30天 范围 |
+命令是**按模式注册**的,三种模式装出来的东西并不一样:
+
+| 命令 | 哪些模式有 | 作用 |
+|------|------|------|
+| `/usage` | `local` | 弹框显示账号用量,按 provider 分 `Claude` / `ChatGPT` 两页(`tab` / `←→` / `h l` 切页),并常驻一行「当前对话」显示本轮真实的 provider / model。两页都可 `↑↓` 选择、`enter` 切换(立即生效)、`m` 标记/取消"不自动切"、`d` 删除账号(再按一次 `d` 确认,当前账号不可删)、`esc` 关闭 |
+| `/usage` | `cloud-worker` | **另一个精简面板**:单一 Claude 平铺列表,没有 provider 页签,也没有 `m` / `d`——这两个操作都要改账号库,而账号库在 master 上。键位是 `↑↓ 选择 · enter 切号 · r 刷新 · esc 关闭`:`enter` 是**向 master 申请租用**指定账号,可能被拒(账号不存在 / 前缀有歧义 / 冷却中 / 需重新登录);`r` 让 master 立刻跑一轮采集;master 停止轮询时面板顶部会给出快照陈旧的警告 |
+| `/stats` | **仅本地** | 弹框显示本地 OpenCode 的用量统计仪表盘:总览 / 模型 / 提供方三个分页,含活跃热力图与 token 折线图,可切 All / 7天 / 30天 范围 |
+| `/reg` | `cloud-master` | 给一台 worker 签发 pool key,见下文「cloud 模式:运维」 |
+
+`cloud-master` **只注册 `/reg`**——它既没有 `/usage` 也没有 `/stats`,master 端要看用量请打开 web 看板。
 
 Claude 页显示 5h / 7d 两个窗口,外加各受限模型的周窗口(如 `Fable`,由 Anthropic 的 `limits` 动态返回),均带进度条与重置倒计时。ChatGPT 的窗口长度**按订阅计划动态变化**,因此标签由接口返回的秒数换算,不假设固定两个窗口。
 
-两边的账号都会在**插件加载时**以及每次 `/usage` 时**自动收录**当前登录的账号,无需手动添加。撞到订阅额度上限时会**自动切号并续接**被打断的那一轮。
+两边的账号都会在**插件加载时**以及每次 `/usage` 时**自动收录**当前登录的账号,无需手动添加。**Claude** 撞到订阅额度上限时会**自动切号并续接**被打断的那一轮;**ChatGPT** 侧**尚未启用自动切号**,开关默认关闭且未经真机验证([见此](docs/limitations.md)),需要手动切。
 
 ## 三种模式
 
@@ -25,7 +31,7 @@ Claude 页显示 5h / 7d 两个窗口,外加各受限模型的周窗口(如 `Fab
 |---|---|---|
 | **`local`**(默认) | 你自己的机器 | 上游原有行为:`/usage`、`/stats`、多账号切换、撞限自动切号、token 保活 |
 | **`cloud-master`** | 一台中心主机 | 持有**全部**账号的真实 refresh token,是**整个系统里唯一的刷新者**;保活所有 token、按用量挑最空的号、通过 HTTP 把短时效 access token 租借给 worker。**它自己不跑推理** |
-| **`cloud-worker`** | 每个工程师的机器 | **永不持有可用的 refresh token**;向 master 租借 access token 并在过期前续租,撞限时由 master 换号、自动续接那一轮。ChatGPT 仍走本地,不纳入池子 |
+| **`cloud-worker`** | 每个工程师的机器 | **永不持有可用的 refresh token**;向 master 租借 access token 并在过期前续租。撞 **429** 时由 master 换一个账号、自动续接那一轮;租来的 token 撞 **401** 则属于租约失效(master 刷新某个账号会当场作废它在外的 access token),这时 worker 重租**同一个**账号,不冷却也不换号。ChatGPT 仍走本地,不纳入池子 |
 
 ## 前置条件
 
@@ -37,29 +43,14 @@ Claude 页显示 5h / 7d 两个窗口,外加各受限模型的周窗口(如 `Fab
 
 TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode.json`。
 
-### 方式一:npm(推荐)
-
-```json
-{
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["claude-accounts-pool@0.4.0"]
-}
-```
-
-OpenCode 会自动解析并安装该包,无需手动 `npm install`。这样写(不带参数)就是 **`local` 模式**。
-
-> 从 `claude-accounts-usage` 迁过来无需任何手工操作:旧的 `claude-accounts.json` 原样可读,`local` 行为与 `0.3.0` 一致。**两个包不要同时装**,择一即可。
->
-> **建议带上版本号**。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
-
-### 方式二:本地 clone(开发/离线)
+本插件**没有发布到 npm**,装法只有一种:本地 clone,然后让 `tui.json` 指向构建产物。
 
 ```bash
 git clone https://github.com/Daiwenxi798673133/claude-accounts-pool.git
 cd claude-accounts-pool && bun install && bun run build
 ```
 
-然后让 `tui.json` 指向 `bun run build` 产出的 `dist/tui.js`(也可以直接指 `tui.tsx`):
+`bun run build` 会产出 `dist/tui.js`(也可以直接指 `tui.tsx`):
 
 ```json
 {
@@ -68,18 +59,20 @@ cd claude-accounts-pool && bun install && bun run build
 }
 ```
 
-修改配置后**完全退出并重新打开** OpenCode。
+这样写(不带参数)就是 **`local` 模式**。修改配置后**完全退出并重新打开** OpenCode。
+
+> 从 `claude-accounts-usage` 迁过来无需任何手工操作:旧的 `claude-accounts.json` 原样可读,`local` 行为与 `0.3.0` 一致。**两个插件不要同时装**,择一即可。
 
 ## cloud 模式:配置
 
-模式来自 OpenCode 的**插件参数元组**——`plugin` 数组里的每一项既可以是一个字符串,也可以是 `[包名, 参数对象]` 这样一对。
+模式来自 OpenCode 的**插件参数元组**——`plugin` 数组里的每一项既可以是一个字符串,也可以是 `[插件路径, 参数对象]` 这样一对。
 
 **`cloud-master`**(中心主机):
 
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": [["claude-accounts-pool@0.4.0", { "mode": "cloud-master", "hostname": "127.0.0.1", "port": 8787 }]]
+  "plugin": [["/绝对路径/claude-accounts-pool/dist/tui.js", { "mode": "cloud-master", "hostname": "127.0.0.1", "port": 8787 }]]
 }
 ```
 
@@ -88,15 +81,15 @@ cd claude-accounts-pool && bun install && bun run build
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": [["claude-accounts-pool@0.4.0", { "mode": "cloud-worker", "masterUrl": "http://10.0.0.5:8787", "poolKey": "<master 打印给你的那把 key>", "workerId": "laptop-1" }]]
+  "plugin": [["/绝对路径/claude-accounts-pool/dist/tui.js", { "mode": "cloud-worker", "masterUrl": "http://10.0.0.5:8787", "poolKey": "<master 打印给你的那把 key>", "workerId": "laptop-1" }]]
 }
 ```
 
 参数规则:
 
-- `hostname` 省略时默认 **`127.0.0.1`**。这是**故意**的:这个端口对外发放的是活的 access token,想绑更宽的地址必须显式写出来。
+- `hostname` 省略时默认 **`127.0.0.1`**。这是**故意**的:这个端口对外发放的是活的 access token,想绑更宽的地址必须显式写出来。注意**写了但不是非空字符串**(空串、纯空白、数字)不会退回默认值,而是整份配置直接判为非法。
 - `port` 必须是 `1`–`65535` 的整数。
-- `cloud-worker` 三个字段 `masterUrl`(http/https)、`poolKey`、`workerId` **缺一不可**。
+- `cloud-worker` 三个字段 `masterUrl`(http/https)、`poolKey`、`workerId` **缺一不可**。其中 `workerId` 只是本机日志用的标签:master 认的身份只有 pool key,注册表会自己给每把 key 分配 `worker-N` 编号。
 - 参数不合法时,插件**什么都不装**,只弹一个错误提示——宁可不工作,也不半配置地跑。
 
 ## cloud 模式:运维
@@ -104,10 +97,11 @@ cd claude-accounts-pool && bun install && bun run build
 1. **把 Claude 账号纳管进池子**,两条路任选:
    - **浏览器**(推荐):打开 master 的看板,点右上角「添加账号」,照着弹窗里的链接登录授权,再把授权页给出的 code 粘回来即可。
    - **命令行**:在 master 主机上照常 `opencode auth login`(经 ex-machina),master 的 keeper 会自动收录进账号库。
-2. **在 master 上跑 `reg` 命令给每台 worker 签发 pool key**。**明文 key 只显示这一次**(库里只存 SHA-256 摘要),请立刻粘进那台 worker 的 `tui.json`。
-3. **每台 worker 一把独立的 key**,可以单独吊销某一把。
-4. **想看全池用量**:浏览器直接打开 `http://<master 的 hostname>:<port>/` 就是看板(JSON 接口是 `GET /v1/usage`),**免鉴权**。也就是说凡能连到这个端口的人都能看到池内账号与余量,**也能用上面那个「添加账号」按钮往池里加号**(但加不进来就拿不走——租借仍然要 pool key)。想收窄就收窄绑定地址——[取舍与理由见此](docs/cloud-mode.md#为什么这几条路由是裸的)。
-5. **一条硬规矩:纳入池子的账号,在池外不能再有任何刷新者。** 旧机器上残留的登录、第二个 master,都算。Anthropic 的 refresh token 是一次性并且轮换的,而且(**实测**)一次刷新还会**立刻作废上一枚已签发的 access token**——池外的第二个刷新者不仅会打断 refresh 链,还会当场击毙所有在外的租约。
+2. **在 master 那个 OpenCode 会话里执行斜杠命令 `/reg`**,给每台 worker 签发 pool key——它是 TUI 里的命令,不是 shell 命令。**明文 key 只在 toast 里出现这一次、停留 120 秒**(库里只存 SHA-256 摘要),请立刻粘进那台 worker 的 `tui.json`。
+3. **每台 worker 一把独立的 key**,库里按 worker 分开存摘要。但要清楚:目前**没有吊销入口**,也没有查看已发 key 清单的入口——想停用某一把,只能手工编辑 OpenCode KV 里的 `claude-accounts-usage.master.poolkeys` 条目。
+4. **想看全池用量**:浏览器直接打开 `http://<master 的 hostname>:<port>/` 就是看板(JSON 接口是 `GET /v1/usage`,另有 `GET /v1/health` 返回 `{"ok":true}` 供探活),**免鉴权**。也就是说凡能连到这个端口的人都能看到池内账号与余量,**也能用上面那个「添加账号」按钮往池里加号**(但加不进来就拿不走——租借仍然要 pool key)。想收窄就收窄绑定地址——[取舍与理由见此](docs/cloud-mode.md#为什么这几条路由是裸的)。
+5. **看板会自己跟上**:右上角的**刷新**按钮走 `POST /v1/usage/refresh`,让 master 立刻采集一轮;这条路由在服务端全局节流,**30 秒**一次,超频返回 429 并在按钮上显示倒计时。页面本身每 5 秒重拉一次 `/v1/usage`,切回标签页时也会立刻重拉,因此池外触发的采集(别人的浏览器,或 master 自己每 5 分钟的定时轮询)同样跟得上。账号卡片是自适应网格,每张卡显示邮箱、徽标(冷却中 / 需重新登录 / 不自动切 / 本轮无数据)、access token 剩余时间,以及各窗口的用量条与重置倒计时。
+6. **一条硬规矩:纳入池子的账号,在池外不能再有任何刷新者。** 旧机器上残留的登录、第二个 master,都算。Anthropic 的 refresh token 是一次性并且轮换的,而且(**实测**)一次刷新还会**立刻作废上一枚已签发的 access token**——池外的第二个刷新者不仅会打断 refresh 链,还会当场击毙所有在外的租约。
 
 ## 日志与排查
 
@@ -126,7 +120,7 @@ grep "claude-accounts-usage" ~/.local/share/opencode/log/opencode.log
 | 文档 | 内容 |
 |---|---|
 | [docs/local-mode.md](docs/local-mode.md) | 单机模式详解:账号管理流程、`/stats` 仪表盘、限流自动切号的完整机制、ChatGPT 多账号(含两个默认关闭的开关) |
-| [docs/cloud-mode.md](docs/cloud-mode.md) | 账号池详解:master/worker 职责划分、哨兵 refresh、租约视界与 401 恢复、pool key、内部标识符为何不改 |
+| [docs/cloud-mode.md](docs/cloud-mode.md) | 账号池详解:master/worker 职责划分、哨兵 refresh、租约视界与 401 恢复、pool key、只读用量看板与「添加账号」为什么是裸路由、内部标识符为何不改 |
 | [docs/internals.md](docs/internals.md) | 两种模式共通的实现机制:存储模型、跨进程锁、原子写、provider 隔离、后台保活、开发命令 |
 | [docs/limitations.md](docs/limitations.md) | **已知限制**(采用前建议先读) |
 | [docs/design/cloud-mode-adr.md](docs/design/cloud-mode-adr.md) | cloud 模式的架构决策记录,含 Gate-0 实测证据与被推翻的先验假设 |
