@@ -113,10 +113,25 @@ research 对该变体的定性必须原样带入本 ADR：**「唯一能干净�
 
 ⇒ **决策 1 + 修订 A1 在真实 API 上被验证**：worker 只持 `access + 哨兵` 即可跑真实推理，且不会成为第二个刷新者。
 
-### ⚠️ 计费桶归属 —— 本机无法测定（诚实记账）
-今晚无干净受试账号：一个 vince 号 7d 额度 100% 耗尽（请求撞 429），另一个正是执行本工作的 agent 会话所用账号（自身流量持续移动计数器，单次小请求的 delta 被噪声淹没），第三个账号所有者明令禁止使用。
+### ✅✅ 计费桶归属 —— **PASS，租借流量计入订阅额度**（决定整个价值主张的那一问）
+受试 `vince.dai2`，全新 5h 窗口。沙箱 `auth.json` = lease 形态（真 access + 哨兵 refresh），经**真实 ex-machina** 发出 3 次真实推理：
 
-**但更重要的是一个分析修正**：research §9 实验 1 的原协议测的是「原生客户端 + `ANTHROPIC_AUTH_TOKEN`」= **通道 1（绕过伪装）**，而本架构走**通道 2（写凭据文件 + 未经修改的真实 ex-machina）**。§3.1.3 的静默重分类风险源于**方案 A 自行重写伪装**；cloud-worker 的请求与今日常规流量同源。⇒ 真正剩余的未证问题窄化为「**Anthropic 是否按源 IP 区别计费**」——本机永不可测，需第二台机器；research 已有反面证据（access token 不绑 IP）。
+| 指标 | before | after | delta |
+|---|---|---|---|
+| `five_hour.utilization`（订阅桶） | 0.0% | **7.0%** | **+7** |
+| `seven_day.utilization`（订阅桶） | 0.0% | **1.0%** | **+1** |
+| `spend.used.amount_minor`（超额桶，**分**为单位） | 0 | **0** | **0** |
+| `extra_usage.is_enabled` | false | false | — |
+
+⇒ **订阅窗口被扣，超额桶分文未动。R1（静默计费漂移）在本通道上未发生。** 事后沙箱 `refresh` 仍是哨兵，ex-machina 全程未刷新；真实 `auth.json` 中**未出现哨兵**（已 grep 验证），三个 anthropic 号的 refresh 仍全是合法 `sk-ant-ort…` 形态。
+
+**测量仪器的发现（此前被忽略的字段）**：完整 usage 载荷含 `spend.used.amount_minor`（**分**级分辨率的超额计数器，远优于 `utilization` 的 1% 粒度）与 `extra_usage.*`。这两个字段才是检测「静默漂移」的正确仪器，`utilization` 单独看不出来。
+
+**并且一个反转风险评估的发现**：该账号 `extra_usage.is_enabled = false`、`user_disabled = true`、`spend.can_purchase_credits = false` —— **超额通道是关闭的**。而 R1「静默漂移到 overage」**要求 overage 处于开启状态**才可能发生；关闭时被重分类的流量只能**硬失败**（research 引的原文即 `400: "Extra usage is required…"` / `"Third-party apps now draw from your extra usage"`），而非无声烧钱。⇒ 对这批账号，R1 的失败形状从「静默」变成「响亮」。
+
+**仍未证的残余**：本测量在**同一台机器**完成。真实部署中 worker 在**另一台机器/另一出口 IP**。research 已有反面证据（access token 不绑 IP：迁移指南「踩坑 B」一手实测 + 34.5k★ 生产项目依赖此性质），但「跨 IP 是否影响计费归属」本机永不可测，需第二台机器复跑本协议。
+
+**顺带的分析修正**：research §9 实验 1 的原协议测的是「原生客户端 + `ANTHROPIC_AUTH_TOKEN`」= **通道 1（绕过伪装）**；而本架构走**通道 2（写凭据文件 + 未经修改的真实 ex-machina）**。§3.1.3 的静默重分类风险源于**方案 A 自行重写伪装**，cloud-worker 的请求与常规流量同源——这解释了为何本次测得的结果是干净的。
 
 ### 🚨 实验 2（refresh 归属权）—— 推翻先验，暴露真实设计缺陷
 | 步骤 | 观测 |
