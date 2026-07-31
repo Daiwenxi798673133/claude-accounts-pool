@@ -48,7 +48,33 @@ export type LeaseRequest = {
   workerId: string
   reason: LeaseReason
   currentAccountId?: string
+  // THE OPERATOR NAMED AN ACCOUNT — they pressed enter on a row of a worker's `/usage` panel, so
+  // serve that account instead of whatever the scheduler would have ranked or rotated to.
+  //
+  // A PREFIX, never a full account id, and that is not an accident: the panel is rendered from
+  // UsageAccountView, which carries `idPrefix` precisely because `/v1/usage` is UNAUTHENTICATED and
+  // must not publish full ids. So the worker can only ever name what it was shown, and turning that
+  // prefix back into an account happens on THIS route, which requires a pool key.
+  //
+  // REFUSED, NEVER SUBSTITUTED. A prefix matching nothing, matching several accounts, or naming one
+  // that cannot be served is answered with a LeaseRefusedBody — never by falling back to a normal
+  // pick. A worker that asked for account A and was handed B would report a switch that did not
+  // happen, and the operator would attribute the next turn's usage to the wrong subscription.
+  preferredAccountIdPrefix?: string
 }
+
+// Why a NAMED account could not be served. A closed union rather than a message string: the worker
+// renders each case as its own Chinese toast (the remedies differ — wait, re-login, or look again),
+// and a free-text reason would collapse them into one unactionable line.
+export type LeaseRefusal =
+  | "unknown" // the prefix matches no account in the pool
+  | "ambiguous" // it matches more than one, so which row the operator meant is not knowable
+  | "cooling" // the account is rate-limited; its quota is spent even though its token is fine
+  | "needs-reauth" // its refresh chain is broken, so no access token can be minted for it at all
+
+// `refused` is the field the worker branches on; `error` stays human-readable for anything reading
+// this route with curl.
+export type LeaseRefusedBody = ErrorBody & { refused: LeaseRefusal }
 
 // `expiresAt` is an absolute epoch-ms instant, not a duration: the worker writes it straight
 // into auth.json, where ex-machina compares it against Date.now().

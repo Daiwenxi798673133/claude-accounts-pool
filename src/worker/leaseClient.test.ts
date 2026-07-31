@@ -146,3 +146,59 @@ test("ratelimit report posts diagnostic headers", async () => {
   expect(await createLeaseClient({ ...base, fetchImpl: dead.impl }).reportRateLimit(report)).toBe(false)
   expect(dead.calls).toHaveLength(1)
 })
+
+test("lease carries the named prefix and maps 409 to a typed refusal", async () => {
+  // Given: the master refuses the account the operator named because it is spent
+  const { impl, calls } = fakeFetch(
+    async () => new Response('{"error":"account is rate-limited","refused":"cooling"}', { status: 409 }),
+  )
+  const { delays, sleep } = sleepRecorder()
+  const client = createLeaseClient({ fetchImpl: impl, sleep, masterUrl: MASTER, poolKey: POOL_KEY, workerId: WORKER_ID })
+
+  // When: the panel asks for that one account, with a single attempt because a human is watching
+  const out = await client.lease({ reason: "prelease", preferredAccountIdPrefix: "eaaa1a79", attempts: 1 })
+
+  // Then: the reason survives the wire as a value the caller can turn into ONE precise sentence.
+  // Collapsing it into `bad-response` would tell the operator the pool is broken when the truth is
+  // "that account is busy, pick another".
+  expect(out).toEqual({ ok: false, failure: { kind: "refused", refused: "cooling" } })
+  // The prefix went out as sent — never expanded, never replaced by a full id the panel never saw.
+  expect(bodyOf(calls[0])).toEqual({ workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "eaaa1a79" })
+  // TERMINAL: a 409 says this exact request can never succeed, so retrying it would only make the
+  // operator wait out a backoff ladder for an answer already given.
+  expect(calls).toHaveLength(1)
+  expect(delays).toEqual([])
+})
+
+test("a 409 without a recognisable reason degrades to bad-response rather than a guess", async () => {
+  // Given: a master that refused but did not say why (a version mismatch, say)
+  const { impl } = fakeFetch(async () => new Response('{"error":"nope"}', { status: 409 }))
+  const { sleep } = sleepRecorder()
+  const client = createLeaseClient({ fetchImpl: impl, sleep, masterUrl: MASTER, poolKey: POOL_KEY, workerId: WORKER_ID })
+
+  // When
+  const out = await client.lease({ reason: "prelease", preferredAccountIdPrefix: "acct-x", attempts: 1 })
+
+  // Then: NOT a fabricated reason. The reason is the remedy the operator acts on, so inventing one
+  // would send them to re-login for an account that is merely cooling.
+  expect(out).toEqual({ ok: false, failure: { kind: "bad-response", detail: expect.stringContaining("409") } })
+})
+
+test("attempts caps the retry ladder for interactive callers", async () => {
+  // Given: a master that is simply down
+  const { impl, calls } = fakeFetch(async () => {
+    throw new Error("ECONNREFUSED")
+  })
+  const { delays, sleep } = sleepRecorder()
+  const client = createLeaseClient({ fetchImpl: impl, sleep, masterUrl: MASTER, poolKey: POOL_KEY, workerId: WORKER_ID })
+
+  // When: the panel's switch asks once
+  const out = await client.lease({ reason: "prelease", preferredAccountIdPrefix: "acct-a", attempts: 1 })
+
+  // Then: one request, NO sleep, immediate verdict. The default ladder spends over ten minutes before
+  // answering — correct for the background renewal loop, unusable for an operator who just pressed
+  // enter and is waiting for a toast.
+  expect(calls).toHaveLength(1)
+  expect(delays).toEqual([])
+  expect(out).toEqual({ ok: false, failure: { kind: "unreachable", detail: expect.stringContaining("ECONNREFUSED") } })
+})

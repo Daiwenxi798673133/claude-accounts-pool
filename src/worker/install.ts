@@ -16,6 +16,7 @@ import { log } from "../logger.ts"
 import type { ModeConfig } from "../mode.ts"
 import { createLeaseClient } from "./leaseClient.ts"
 import { installLeaseKeeper } from "./leaseKeeper.ts"
+import { createManualSwitch } from "./manualSwitch.ts"
 import { createSwitchStrategy } from "./switchStrategy.ts"
 import { createUsageClient, type UsageFetchFailure } from "./usageClient.ts"
 import { openWorkerUsageDialog } from "../dialogs.tsx"
@@ -26,19 +27,31 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 // from tui.tsx: importing the plugin ENTRY from a composition root would depend on its own caller.
 const ID = "claude-accounts-usage"
 
-// A table keyed by failure kind (accounts.ts's TOKEN_WRITERS rule): adding a UsageFetchFailure kind
-// is a COMPILE error until someone decides what the user is told, rather than degrading to a
-// generic message for a fault whose remedy differs.
-const USAGE_FAILURE_MESSAGE: Record<UsageFetchFailure["kind"], string> = {
-  unreachable: "连不上云端账号池 master，无法获取用量，请检查网络或 master 状态",
-  http: "云端账号池暂时无法返回用量，请稍后重试",
-  "bad-response": "云端账号池返回了无法识别的用量数据",
+// A switch rather than accounts.ts's Record table, for ONE reason: `throttled` carries a number, and
+// a table of static strings has nowhere to put it. Exhaustiveness survives the change — the declared
+// `string` return means a kind added to UsageFetchFailure stops compiling here (the function would
+// fall through to an implicit undefined) until someone decides what the user is told.
+function usageFailureMessage(failure: UsageFetchFailure): string {
+  switch (failure.kind) {
+    case "unreachable":
+      return "连不上云端账号池 master，无法获取用量，请检查网络或 master 状态"
+    case "http":
+      return "云端账号池暂时无法返回用量，请稍后重试"
+    case "bad-response":
+      return "云端账号池返回了无法识别的用量数据"
+    case "throttled":
+      // NOT phrased as an error: the master is working exactly as designed. The countdown is what makes
+      // that legible — without it a throttled refresh reads as a broken `r` key.
+      return failure.retryAfterMs === undefined
+        ? "master 刚刷新过用量，请稍后再按 r"
+        : `master 刚刷新过用量，${Math.ceil(failure.retryAfterMs / 1000)} 秒后可再刷新`
+  }
 }
 
-// The SOLE credential-write seam on a worker, shared by the renewal loop and the rate-limit switch
-// so there is exactly one shape a worker can produce. `{kind:"lease"}` carries access + expiry and
-// fills the refresh slot with the sentinel; `{kind:"full"}` is structurally unreachable from here
-// because neither caller's dep type has a refresh field to pass.
+// The SOLE credential-write seam on a worker, shared by the renewal loop, the rate-limit switch and
+// the panel's manual switch, so there is exactly one shape a worker can produce. `{kind:"lease"}`
+// carries access + expiry and fills the refresh slot with the sentinel; `{kind:"full"}` is
+// structurally unreachable from here because no caller's dep type has a refresh field to pass.
 function writeLease(input: { access: string; expires: number }): Promise<void> {
   return writeAuthAnthropic({ kind: "lease", access: input.access, expires: input.expires })
 }
@@ -97,15 +110,21 @@ export function installCloudWorker(
 
   // FOLLOW-UP: request-level interception requires a server-plugin entry point — out of MVP scope (A3)
 
-  // READ-ONLY /usage for the worker: it fetches the master's already-polled usage snapshot rather
-  // than calling Anthropic's /api/oauth/usage itself, so N workers cannot hammer that endpoint.
+  // /usage for the worker. It never calls Anthropic's /api/oauth/usage itself — neither to READ (it
+  // fetches the master's already-polled snapshot) nor to REFRESH (the `r` key asks the master to
+  // sweep, where one throttle covers every worker) — so N tenants cannot hammer that endpoint.
   const usageClient = createUsageClient({ fetchImpl: fetch, masterUrl: cfg.masterUrl })
+
+  // The panel's `enter`. A worker cannot switch accounts by itself: this only NAMES the account the
+  // operator chose and writes whatever lease comes home (INV-CLOUD-1/2).
+  const manualSwitch = createManualSwitch({ client, writeLease, toast: api.ui.toast })
+
   let unregisterCommand: (() => void) | undefined
   const command = api.command
   if (command) {
     unregisterCommand = command.register(() => [
       {
-        title: "Claude: 查看账号池用量(只读)",
+        title: "Claude: 账号池用量与切号",
         value: `${ID}.usage`,
         category: "Claude",
         slash: { name: "usage" },
@@ -115,10 +134,30 @@ export function installCloudWorker(
           void (async () => {
             const outcome = await usageClient.fetchSnapshot()
             if (!outcome.ok) {
-              api.ui.toast({ variant: "error", message: USAGE_FAILURE_MESSAGE[outcome.failure.kind] })
+              api.ui.toast({ variant: "error", message: usageFailureMessage(outcome.failure) })
               return
             }
-            openWorkerUsageDialog(api, outcome.view)
+            openWorkerUsageDialog(api, {
+              view: outcome.view,
+              heldAccountId: leaseKeeper.heldAccountId(),
+              onSwitch: ({ prefix, label }) => {
+                void (async () => {
+                  const switched = await manualSwitch.switchTo({ prefix, label })
+                  // The renewal loop performed no lease, so it would otherwise keep naming the account
+                  // we just left as the one we hold — and that id is the master's rotation anchor.
+                  if (switched.ok) leaseKeeper.adoptAccount(switched.accountId)
+                })()
+              },
+              // The wording still belongs here, with every other string this transport can produce —
+              // but it is HANDED to the panel rather than toasted, because a toast raised over an open
+              // dialog loses its Chinese glyphs (see WorkerUsageDialogOptions.onRefresh).
+              onRefresh: async () => {
+                const refreshed = await usageClient.refreshSnapshot()
+                return refreshed.ok
+                  ? { ok: true, view: refreshed.view }
+                  : { ok: false, message: usageFailureMessage(refreshed.failure) }
+              },
+            })
           })()
         },
       },

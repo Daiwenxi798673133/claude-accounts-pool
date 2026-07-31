@@ -37,6 +37,9 @@ type Harness = {
   reports: Array<{ accountId: string; resetsAt?: number }>
   refreshed: string[]
   picks: Array<{ ids: string[]; exclude?: string }>
+  // One entry per NAMED pick. Kept apart from `picks` because the whole claim of the preference path
+  // is that ranked selection is not consulted at all, and one shared log could not show that.
+  preferred: Array<{ ids: string[]; prefix: string }>
   // One entry per usage sweep the server actually asked for — the only way to tell "the master went
   // and polled Anthropic" apart from "the page re-read the snapshot it already had".
   sweeps: number[]
@@ -66,6 +69,7 @@ function startHarness(options?: {
   const reports: Harness["reports"] = []
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
+  const preferred: Harness["preferred"] = []
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
 
@@ -74,6 +78,20 @@ function startHarness(options?: {
       pickAccount({ accounts: pool, exclude }) {
         picks.push({ ids: pool.map((a) => a.id), ...(exclude === undefined ? {} : { exclude }) })
         return pool.find((a) => a.id !== exclude && !cooled.has(a.id))
+      },
+      // Mirrors the real scheduler's verdicts (scheduler.test.ts owns proving those), reading the SAME
+      // `cooled` set as the pick filter and isCoolingDown so a row shown as 冷却中, an account skipped
+      // by selection, and a refused switch can never disagree in this harness. `excluded` is
+      // deliberately NOT a refusal, exactly as in the real one.
+      pickPreferred({ accounts: pool, prefix }) {
+        preferred.push({ ids: pool.map((a) => a.id), prefix })
+        const matches = pool.filter((a) => a.id.startsWith(prefix))
+        if (matches.length === 0) return { ok: false, refusal: "unknown" }
+        if (matches.length > 1) return { ok: false, refusal: "ambiguous" }
+        const target = matches[0]
+        if (target.needsReauth === true) return { ok: false, refusal: "needs-reauth" }
+        if (cooled.has(target.id)) return { ok: false, refusal: "cooling" }
+        return { ok: true, account: target }
       },
       reportRateLimit(accountId, resetsAt) {
         reports.push({ accountId, ...(resetsAt === undefined ? {} : { resetsAt }) })
@@ -115,6 +133,7 @@ function startHarness(options?: {
     reports,
     refreshed,
     picks,
+    preferred,
     sweeps,
     snapshotAt: () => usage.at,
     advance: (ms: number) => {
@@ -222,6 +241,142 @@ test("lease with valid key returns 200 with accountId access expiresAt", async (
     // The spoofed workerId changed nothing: identity comes from the KEY, and the body is a
     // client-supplied string anyone holding a key could forge.
     expect(lease.accountId).toBe("acct-a")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("lease naming an account serves THAT account and never consults ranked selection", async () => {
+  // Given: a pool whose ranked pick would answer acct-a (the fake returns the first servable account,
+  // as the 200 case above establishes) — so acct-b is only reachable by NAMING it
+  const harness = startHarness()
+  try {
+    // When: the operator pressed enter on acct-b's row, which carries only the id PREFIX
+    const res = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-b" } satisfies LeaseRequest,
+      `Bearer ${POOL_KEY}`,
+    )
+
+    // Then: acct-b, minted through the very same path a scheduled lease uses
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ accountId: "acct-b", access: "sk-ant-oat01-acct-b", expiresAt: EXPIRES_AT })
+    expect(harness.refreshed).toEqual(["acct-b"])
+    expect(harness.preferred).toEqual([{ ids: ["acct-a", "acct-b"], prefix: "acct-b" }])
+
+    // AND THE LOAD-BEARING ASSERTION: ranked selection was not consulted at all. A named account that
+    // still went through pickAccount would be silently re-ranked, and the operator would be told the
+    // switch succeeded while holding whichever account the pool preferred.
+    expect(harness.picks).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("lease naming an unservable account is refused 409 with the reason, never substituted", async () => {
+  // Given: acct-b is spent (a worker just reported its limit) and acct-c cannot mint a token at all
+  const harness = startHarness({ accounts: [account("acct-a"), account("acct-b"), { ...account("acct-c"), needsReauth: true }] })
+  try {
+    await post(
+      harness.base,
+      CLOUD_ROUTES.ratelimit,
+      { workerId: WORKER_ID, accountId: "acct-b", headers: {} } satisfies RateLimitReport,
+      `Bearer ${POOL_KEY}`,
+    )
+
+    // When / Then: each refusal names ITS OWN reason. The reason is the whole message the operator
+    // acts on — waiting out a cooldown and re-logging-in on the master are different remedies, so a
+    // single generic refusal would send them to fix the wrong thing.
+    const cooling = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-b" } satisfies LeaseRequest,
+      `Bearer ${POOL_KEY}`,
+    )
+    expect(cooling.status).toBe(409)
+    expect(await cooling.json()).toEqual({ error: expect.any(String), refused: "cooling" })
+
+    const reauth = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-c" } satisfies LeaseRequest,
+      `Bearer ${POOL_KEY}`,
+    )
+    expect(reauth.status).toBe(409)
+    expect(await reauth.json()).toEqual({ error: expect.any(String), refused: "needs-reauth" })
+
+    const gone = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-z" } satisfies LeaseRequest,
+      `Bearer ${POOL_KEY}`,
+    )
+    expect(gone.status).toBe(409)
+    expect(await gone.json()).toEqual({ error: expect.any(String), refused: "unknown" })
+
+    const ambiguous = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-" } satisfies LeaseRequest,
+      `Bearer ${POOL_KEY}`,
+    )
+    expect(ambiguous.status).toBe(409)
+    expect(await ambiguous.json()).toEqual({ error: expect.any(String), refused: "ambiguous" })
+
+    // NOT 503 for any of them: a 503 tells the worker's client "the pool is momentarily spent, come
+    // back", when the truth is that repeating this exact request can never succeed.
+    // And NOTHING WAS MINTED OR SUBSTITUTED — no token for the named account, and no fallback pick.
+    expect(harness.refreshed).toEqual([])
+    expect(harness.picks).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("lease with an empty preferred prefix is malformed, not a match-anything wildcard", async () => {
+  // Given: a client that sent the field but left it blank — a row whose prefix somehow came through
+  // empty, which must not degrade into "any account will do"
+  const harness = startHarness()
+  try {
+    // When
+    const res = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "" },
+      `Bearer ${POOL_KEY}`,
+    )
+
+    // Then: 400 at the boundary. An empty prefix matches every account, so it would resolve to
+    // `ambiguous` on this pool but succeed BY LUCK on a single-account one — behaviour that differs
+    // per pool size is exactly what a boundary check exists to prevent.
+    expect(res.status).toBe(400)
+    expect(harness.preferred).toEqual([])
+    expect(harness.picks).toEqual([])
+    expect(harness.refreshed).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a named account is still refused when its horizon is already spent", async () => {
+  // Given: the refresher hands back a token so close to expiry that the INV-CLOUD-4 floor leaves less
+  // than one worker check interval of usable life
+  const harness = startHarness({ accountExpiresAt: Date.now() + MASTER_MIN_REMAINING_MS + 1_000 })
+  try {
+    // When: the operator names it anyway
+    const res = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-a" } satisfies LeaseRequest,
+      `Bearer ${POOL_KEY}`,
+    )
+
+    // Then: the same 503 the scheduled path answers. The horizon check is NOT a selection rule the
+    // preference may override — a dead-on-arrival lease dooms the worker twice (revoked token now,
+    // sentinel self-refresh next), and an operator's pick cannot make that safe.
+    expect(res.status).toBe(503)
+    expect(harness.refreshed).toEqual(["acct-a"])
   } finally {
     harness.stop()
   }

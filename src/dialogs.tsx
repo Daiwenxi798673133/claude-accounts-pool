@@ -529,10 +529,14 @@ export function openUsageDialog(api: TuiPluginApi, options: UsageDialogOptions):
   ))
 }
 
-// ── cloud-worker read-only usage view ────────────────────────────────────────────────────────
-// Renders the master's UsageSnapshotView verbatim (a worker never collects usage itself). Strictly
-// READ-ONLY — no switch/delete/exclude keys — because a worker does not own these accounts
-// (INV-CLOUD-2), and the wire type carries no credential to leak.
+// ── cloud-worker usage view ──────────────────────────────────────────────────────────────────
+// Renders the master's UsageSnapshotView (a worker never collects usage itself) and offers the two
+// actions a worker is ALLOWED to take on accounts it does not own: `enter` asks the master to lease
+// the named account, `r` asks the master to sweep. Both are REQUESTS — every decision stays with the
+// master (INV-CLOUD-2), which is why the props below are callbacks and not clients.
+//
+// Deliberately NOT ported from the local panel: `d` (delete) and `m` (不自动切), because both write to
+// the account LIBRARY, which lives on the master and is not this machine's to edit.
 
 function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
   const theme = () => props.api.theme.current
@@ -549,14 +553,24 @@ function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
   )
 }
 
-function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView }) {
+// UNKNOWN IS NOT "NO". `held` is undefined when this worker has not leased in THIS process — its
+// on-disk lease was still fresh at startup, so the renewal loop never ran and nothing on this machine
+// can say which account that lease belongs to (a lease is an opaque access token, and a worker keeps
+// no account library to match it against). Drawing `○` on every row then would read as "I hold none
+// of these", so the marker column goes BLANK instead: absence of knowledge, rendered as absence.
+function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView; selected: boolean; held?: boolean }) {
   const theme = () => props.api.theme.current
   const account = () => props.account
+  const marker = () => (props.held === undefined ? " " : props.held ? "●" : "○")
   return (
     <box flexDirection="column">
       <box flexDirection="row" justifyContent="space-between" gap={1}>
         <box flexDirection="row" gap={1}>
-          <text fg={theme().text}>{account().label}</text>
+          <text fg={props.selected ? theme().primary : theme().textMuted}>{props.selected ? "▶" : " "}</text>
+          <text fg={props.selected ? theme().primary : theme().text}>
+            {marker()} {account().label}
+            {props.held === true ? " In Use" : ""}
+          </text>
           <Show when={account().coolingDown}>
             <text fg={theme().warning}>冷却中</text>
           </Show>
@@ -577,34 +591,137 @@ function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView 
   )
 }
 
-function WorkerUsagePanel(props: { api: TuiPluginApi; view: UsageSnapshotView }) {
+const WORKER_KEYS_HINT = "↑↓ 选择 · enter 切号 · r 刷新 · esc 关闭"
+
+export type WorkerUsageDialogOptions = {
+  view: UsageSnapshotView
+  // FULL id of the lease this worker currently holds — the only thing that can mark a row "In Use",
+  // and undefined until the first lease lands. Matched against a row by PREFIX because the prefix is
+  // all the snapshot carries (UsageAccountView.idPrefix).
+  heldAccountId?: string
+  // `enter`. The panel is CLOSED before this runs, exactly as the local panel does it, so the verdict
+  // arrives as a toast rather than as a dialog that has to describe its own failure.
+  onSwitch: (input: { prefix: string; label: string }) => void
+  // `r`. Either a fresher snapshot, or the sentence explaining why there is none.
+  //
+  // A MESSAGE RATHER THAN A TOAST, and this is MEASURED, not stylistic: a toast raised while this
+  // dialog is open comes out unreadable — the dialog's repaint blanks the double-width cells, so
+  // Chinese text loses every glyph while the ASCII around it survives ("master  28"). The same
+  // sentence toasted AFTER the dialog closes renders perfectly, which is why `enter` may still toast.
+  // `r` deliberately keeps the panel open, so its outcome has to be drawn INSIDE the panel.
+  onRefresh: () => Promise<WorkerUsageRefresh>
+}
+
+export type WorkerUsageRefresh = { ok: true; view: UsageSnapshotView } | { ok: false; message: string }
+
+function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialogOptions }) {
   const api = props.api
   const theme = () => api.theme.current
+  // The view is STATE, not a prop read: `r` replaces it in place, so the operator watches the same
+  // list update rather than losing their position to a reopened dialog.
+  const [view, setView] = createSignal(props.options.view)
+  const [selection, setSelection] = createSignal(0)
+  const [refreshing, setRefreshing] = createSignal(false)
+  const [notice, setNotice] = createSignal<string | undefined>(undefined)
+  const accounts = () => view().accounts
+  // Clamped on READ, like the local panel's selectedIndex: a refresh can return a shorter roster, and
+  // an index that outlived its row would otherwise switch to whatever slid into that position.
+  const index = () => clampSelection(selection(), accounts().length)
+  const selected = () => accounts()[index()]
+  // THREE-STATE, and it must stay that way: `undefined` means this worker does not know what it holds,
+  // which the row renders as a blank marker rather than as `○` ("not this one"). A `?.startsWith(…)
+  // === true` shorthand here would collapse unknown into false and put a confident `○` on every row.
+  const heldFor = (account: UsageAccountView): boolean | undefined => {
+    const held = props.options.heldAccountId
+    return held === undefined ? undefined : held.startsWith(account.idPrefix)
+  }
+
+  // Clamp, NOT wrap — moveSelection in panel-model.ts does the same, and the two panels must not feel
+  // different under the same keys.
+  function move(delta: number): void {
+    setSelection((current) => clampSelection(current + delta, accounts().length))
+  }
+
+  function confirm(): void {
+    const account = selected()
+    if (!account) return
+    api.ui.dialog.clear()
+    props.options.onSwitch({ prefix: account.idPrefix, label: account.label })
+  }
+
+  async function refresh(): Promise<void> {
+    // Guarded because a forced sweep is SLOW (the master spaces its calls between accounts) and every
+    // press costs the pool a real round of /api/oauth/usage requests.
+    if (refreshing()) return
+    setRefreshing(true)
+    // Cleared on the way IN, not on success: a stale "刚刷新过" line sitting above numbers that have
+    // since been refreshed would be a lie about the data below it.
+    setNotice(undefined)
+    try {
+      const outcome = await props.options.onRefresh()
+      if (outcome.ok) setView(outcome.view)
+      else setNotice(outcome.message)
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  useKeyboard((evt) => {
+    if (evt.name === "return") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      confirm()
+      return
+    }
+    if (evt.name === "up" || evt.name === "k") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      move(-1)
+      return
+    }
+    if (evt.name === "down" || evt.name === "j") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      move(1)
+      return
+    }
+    if (evt.name === "r") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      // Fire-and-forget: useKeyboard takes a synchronous handler, and the refresh reports its own
+      // failures through onRefresh's caller.
+      void refresh()
+      return
+    }
+  })
+
   return (
     <box paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1} flexDirection="column">
       <box flexDirection="row" justifyContent="center" width="100%">
         <text fg={theme().text}>
-          <b>账号池用量(只读)</b>
+          <b>账号池用量</b>
         </text>
       </box>
-      <Show when={props.view.stale}>
+      <Show when={view().stale}>
         <text fg={theme().warning}>⚠ 快照已陈旧,master 可能已停止轮询,以下数字仅供参考</text>
       </Show>
-      <Show
-        when={props.view.accounts.length > 0}
-        fallback={<text fg={theme().textMuted}>账号池暂无用量数据</text>}
-      >
-        <For each={props.view.accounts}>{(account) => <WorkerAccountRow api={api} account={account} />}</For>
+      <Show when={accounts().length > 0} fallback={<text fg={theme().textMuted}>账号池暂无用量数据</text>}>
+        <For each={accounts()}>
+          {(account, i) => (
+            <WorkerAccountRow api={api} account={account} selected={i() === index()} held={heldFor(account)} />
+          )}
+        </For>
       </Show>
+      <Show when={notice()}>{(message) => <text fg={theme().warning}>{message()}</text>}</Show>
       <box flexDirection="row" justifyContent="space-between" gap={2}>
-        <text fg={theme().textMuted}>esc 关闭</text>
-        <text fg={theme().textMuted}>快照于 {clockTime(props.view.at)}</text>
+        <text fg={theme().textMuted}>{WORKER_KEYS_HINT}</text>
+        <text fg={theme().textMuted}>{refreshing() ? "刷新中…" : `快照于 ${clockTime(view().at)}`}</text>
       </box>
     </box>
   )
 }
 
-export function openWorkerUsageDialog(api: TuiPluginApi, view: UsageSnapshotView): void {
+export function openWorkerUsageDialog(api: TuiPluginApi, options: WorkerUsageDialogOptions): void {
   api.ui.dialog.setSize("medium")
-  api.ui.dialog.replace(() => <WorkerUsagePanel api={api} view={view} />)
+  api.ui.dialog.replace(() => <WorkerUsagePanel api={api} options={options} />)
 }
