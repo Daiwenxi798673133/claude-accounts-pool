@@ -17,8 +17,23 @@ import type { ModeConfig } from "../mode.ts"
 import { createLeaseClient } from "./leaseClient.ts"
 import { installLeaseKeeper } from "./leaseKeeper.ts"
 import { createSwitchStrategy } from "./switchStrategy.ts"
+import { createUsageClient, type UsageFetchFailure } from "./usageClient.ts"
+import { openWorkerUsageDialog } from "../dialogs.tsx"
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+// Command-value namespace, matching master/install.ts's local `ID`. Restated rather than imported
+// from tui.tsx: importing the plugin ENTRY from a composition root would depend on its own caller.
+const ID = "claude-accounts-usage"
+
+// A table keyed by failure kind (accounts.ts's TOKEN_WRITERS rule): adding a UsageFetchFailure kind
+// is a COMPILE error until someone decides what the user is told, rather than degrading to a
+// generic message for a fault whose remedy differs.
+const USAGE_FAILURE_MESSAGE: Record<UsageFetchFailure["kind"], string> = {
+  unreachable: "连不上云端账号池 master，无法获取用量，请检查网络或 master 状态",
+  http: "云端账号池暂时无法返回用量，请稍后重试",
+  "bad-response": "云端账号池返回了无法识别的用量数据",
+}
 
 // The SOLE credential-write seam on a worker, shared by the renewal loop and the rate-limit switch
 // so there is exactly one shape a worker can produce. `{kind:"lease"}` carries access + expiry and
@@ -82,12 +97,45 @@ export function installCloudWorker(
 
   // FOLLOW-UP: request-level interception requires a server-plugin entry point — out of MVP scope (A3)
 
+  // READ-ONLY /usage for the worker: it fetches the master's already-polled usage snapshot rather
+  // than calling Anthropic's /api/oauth/usage itself, so N workers cannot hammer that endpoint.
+  const usageClient = createUsageClient({ fetchImpl: fetch, masterUrl: cfg.masterUrl })
+  let unregisterCommand: (() => void) | undefined
+  const command = api.command
+  if (command) {
+    unregisterCommand = command.register(() => [
+      {
+        title: "Claude: 查看账号池用量(只读)",
+        value: `${ID}.usage`,
+        category: "Claude",
+        slash: { name: "usage" },
+        onSelect: () => {
+          // Fire-and-forget with its own catch: command handlers are void, and a rejection here
+          // would surface as an unhandled rejection in the plugin host.
+          void (async () => {
+            const outcome = await usageClient.fetchSnapshot()
+            if (!outcome.ok) {
+              api.ui.toast({ variant: "error", message: USAGE_FAILURE_MESSAGE[outcome.failure.kind] })
+              return
+            }
+            openWorkerUsageDialog(api, outcome.view)
+          })()
+        },
+      },
+    ])
+  } else {
+    // Not fatal: /usage is a convenience, and a worker with no command surface still leases and
+    // renews. Stopping the install over a missing UI hook would be the worse outcome.
+    log.warn("worker:no-command-api")
+  }
+
   let disposed = false
   // Mirrors the master's aggregate: the per-piece lifecycle registrations above are the FLOOR, this
   // is the caller's explicit lever, and the flag keeps firing both a no-op rather than a double free.
   const dispose = (): void => {
     if (disposed) return
     disposed = true
+    unregisterCommand?.()
     leaseKeeper.dispose()
     keeper.dispose()
     autoSwitch.dispose()
