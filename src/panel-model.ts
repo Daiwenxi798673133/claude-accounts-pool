@@ -182,3 +182,23 @@ export function moveSelection(selection: PageSelection, page: PanelPage, delta: 
 export function selectedIndex(selection: PageSelection, page: PanelPage, length: number): number {
   return clampSelection(selection[page], length)
 }
+
+// ── worker panel (账号池用量) ─────────────────────────────────────────────────────────────────
+// A snapshot row carries only a PREFIX of the account uuid while a lease names the whole id, so
+// "is this the row I hold" is a prefix test and cannot be an equality one.
+//
+// THREE-STATE, and it must stay that way: `undefined` means this worker has never recorded a lease
+// and so does not KNOW what it holds — the row renders that as a blank marker. Collapsing it into
+// `false` would stamp a confident `○` ("not this one") on every row.
+export function heldStateFor(idPrefix: string, heldAccountId?: string): boolean | undefined {
+  return heldAccountId === undefined ? undefined : heldAccountId.startsWith(idPrefix)
+}
+
+// Seeds the cursor on the row the panel already marks as held, THROUGH heldStateFor rather than a
+// second prefix test of its own: one rule means `▶` can never land on a row that is not the `●`
+// one. Two rules is precisely how they drifted apart. No held row — nothing leased yet, or a lease
+// whose account is missing from this snapshot — falls back to the first row.
+export function initialWorkerSelection(accounts: readonly { idPrefix: string }[], heldAccountId?: string): number {
+  const at = accounts.findIndex((account) => heldStateFor(account.idPrefix, heldAccountId) === true)
+  return at < 0 ? 0 : at
+}

@@ -3,7 +3,9 @@ import type { StoredAccount } from "./accounts.ts"
 import type { OpenaiUsage } from "./openai-usage.ts"
 import {
   clampSelection,
+  heldStateFor,
   initialPageSelection,
+  initialWorkerSelection,
   moveSelection,
   openaiRows,
   panelPages,
@@ -242,4 +244,31 @@ test("U22:响应不带 accountId → 无法归属,谁都不认领这份邮箱", 
   const [row] = openaiRows({ accounts: [account], activeId: account.id, usage: liveOf(ACCT, { accountId: undefined }), loading: false })
   expect(row.label).toBe(placeholderOpenaiLabel(ACCT))
   expect(row.plan).toBeUndefined()
+})
+
+// ── worker 面板(账号池用量) ────────────────────────────────────────────────────────────────
+// 快照只带 id 前缀,租约带完整 id,所以"这一行是不是我持有的那个号"永远是前缀判定。
+const HELD = "3f9c1a20-77bd-4c11-8e0e-2a55d9f0c4b1"
+const pooled = (idPrefix: string) => ({ idPrefix })
+
+// 三态必须原样保留:undefined 是"这台机器还没租过号,不知道",渲染成空白标记;
+// 一旦被压成 false,每一行都会被扣上一个笃定的 ○("我不持有这个"),那是在替它撒谎。
+test("U23:持有判定三态 —— 不知道保持 undefined,前缀命中为 true,不命中为 false", () => {
+  expect(heldStateFor("3f9c1a20", undefined)).toBeUndefined()
+  expect(heldStateFor("3f9c1a20", HELD)).toBe(true)
+  expect(heldStateFor("0f1e2d3c", HELD)).toBe(false)
+})
+
+// issue #29:箭头恒停在第一行。初始选中必须由 ● 那一行(持有行)决定,和标记同一条判定。
+test("U24:worker 面板初始选中落在持有的那一行", () => {
+  const accounts = [pooled("0f1e2d3c"), pooled("78bbaee7"), pooled("3f9c1a20")]
+  expect(initialWorkerSelection(accounts, HELD)).toBe(2)
+  expect(heldStateFor(accounts[initialWorkerSelection(accounts, HELD)].idPrefix, HELD)).toBe(true)
+})
+
+test("U25:没有持有的号 / 持有的号不在快照里 → 退回第一行", () => {
+  const accounts = [pooled("0f1e2d3c"), pooled("78bbaee7")]
+  expect(initialWorkerSelection(accounts, undefined)).toBe(0)
+  expect(initialWorkerSelection(accounts, HELD)).toBe(0)
+  expect(initialWorkerSelection([], HELD)).toBe(0)
 })
