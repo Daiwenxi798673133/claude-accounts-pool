@@ -48,6 +48,11 @@ const FAILURE_MESSAGE: Record<LeaseFailure["kind"], string> = {
   "no-account": "云端账号池暂无可用账号，已停在当前账号，请稍后重试",
   unreachable: "连不上云端账号池，无法切号，请检查网络或 master 服务",
   "bad-response": "云端账号池返回了无法识别的响应，未切号",
+  // NOT REACHABLE FROM EITHER VERB BELOW — a `refused` answer requires having NAMED an account, and
+  // neither of them does (the master picks). The exhaustive table demands an entry anyway, and the
+  // wording still has to hold if one ever appears; the operator-facing refusal messages, which name
+  // the specific reason, live with the manual switch that can actually provoke one.
+  refused: "云端账号池拒绝了本次租借请求，未切号",
 }
 
 export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {

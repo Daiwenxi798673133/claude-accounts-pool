@@ -8,17 +8,30 @@
 // rotate a real chain on a paid account, so there are no defaults anywhere in LeaseServerDeps.
 
 import type { StoredAccount } from "../accounts.ts"
-import type { ErrorBody, LeaseReason, LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
+import type {
+  ErrorBody,
+  LeaseReason,
+  LeaseRefusal,
+  LeaseRefusedBody,
+  LeaseRequest,
+  LeaseResponse,
+  RateLimitReport,
+  ThrottledBody,
+  UsageSnapshotView,
+} from "../cloud/protocol.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
 import { dashboardHtml } from "./dashboardHtml.ts"
-import type { UsageSnapshot } from "./scheduler.ts"
+import type { PreferredInput, PreferredPick, UsageSnapshot } from "./scheduler.ts"
 import { buildUsageView } from "./usageView.ts"
 
 export type LeaseServerDeps = {
   scheduler: {
     pickAccount(input: { accounts: StoredAccount[]; exclude?: string }): StoredAccount | undefined
+    // Selection for a lease that NAMES its account, kept a separate verb from pickAccount so the
+    // ranked path cannot accidentally inherit "excluded is servable" and vice versa.
+    pickPreferred(input: PreferredInput): PreferredPick
     reportRateLimit(accountId: string, resetsAt?: number): void
     // The two READ-ONLY halves of the dashboard's payload. Required, not optional: a master serving
     // leases without a usage view would answer the dashboard route with an empty page and look like
@@ -51,7 +64,10 @@ type RouteHandler = (req: Request) => Promise<Response>
 // KEY resolved to — it never has to (and never can) look for identity in the payload.
 type AuthedHandler = (req: Request, workerId: string) => Promise<Response>
 
-function json(status: number, body: ErrorBody | LeaseResponse | UsageSnapshotView | ThrottledBody | { ok: true }): Response {
+function json(
+  status: number,
+  body: ErrorBody | LeaseResponse | UsageSnapshotView | ThrottledBody | LeaseRefusedBody | { ok: true },
+): Response {
   return Response.json(body, { status })
 }
 
@@ -84,7 +100,7 @@ async function readJson(req: Request): Promise<unknown> {
 
 function parseLeaseRequest(raw: unknown): LeaseRequest | undefined {
   if (typeof raw !== "object" || raw === null) return undefined
-  const { workerId, reason, currentAccountId } = raw as Record<string, unknown>
+  const { workerId, reason, currentAccountId, preferredAccountIdPrefix } = raw as Record<string, unknown>
   // `workerId` is validated to keep the wire contract honest (a client omitting it is
   // mismatched, and failing loudly at the boundary beats accepting a half-formed request) and is
   // then DELIBERATELY never read again: see handleLease.
@@ -94,7 +110,27 @@ function parseLeaseRequest(raw: unknown): LeaseRequest | undefined {
   // just hit its limit — the one outcome the ratelimit path exists to prevent.
   if (!isLeaseReason(reason)) return undefined
   if (currentAccountId !== undefined && typeof currentAccountId !== "string") return undefined
-  return { workerId, reason, ...(currentAccountId === undefined ? {} : { currentAccountId }) }
+  // An EMPTY prefix is malformed, not a match-anything wildcard: it would resolve to `ambiguous` on
+  // a multi-account pool but succeed by luck on a single-account one, so a request that names nothing
+  // must be refused at the boundary rather than behave differently per pool size.
+  if (preferredAccountIdPrefix !== undefined && (typeof preferredAccountIdPrefix !== "string" || preferredAccountIdPrefix.length === 0)) {
+    return undefined
+  }
+  return {
+    workerId,
+    reason,
+    ...(currentAccountId === undefined ? {} : { currentAccountId }),
+    ...(preferredAccountIdPrefix === undefined ? {} : { preferredAccountIdPrefix }),
+  }
+}
+
+// English, like every other `error` string on this wire: the worker branches on `refused` and renders
+// its own Chinese, so these exist for whoever is reading the route with curl.
+const LEASE_REFUSAL_DETAIL: Record<LeaseRefusal, string> = {
+  unknown: "no such account in the pool",
+  ambiguous: "account prefix matches more than one account",
+  cooling: "account is rate-limited",
+  "needs-reauth": "account needs re-authentication",
 }
 
 // Copies string entries only. The headers are quota telemetry the master logs by KEY, so a
@@ -162,11 +198,29 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // which the worker client would treat as a transient fault and retry verbatim, forever.
     const request = parseLeaseRequest(await readJson(req))
     if (!request) return badRequest("malformed lease request")
+    const accounts = await deps.loadAccounts()
+    // A NAMED account short-circuits selection completely. `reason` still says why the worker is
+    // asking, but it no longer influences WHICH account is served — the operator pressed a row.
+    // Naming the account a `ratelimit` report just cooled therefore comes back as a `cooling`
+    // refusal rather than re-issuing a spent account, because the report lands before this request.
+    if (request.preferredAccountIdPrefix !== undefined) {
+      const preferred = deps.scheduler.pickPreferred({ accounts, prefix: request.preferredAccountIdPrefix })
+      if (!preferred.ok) {
+        // 409, deliberately none of the statuses above: 503 would tell the worker's client "the pool
+        // is momentarily spent, retry", when the truth is that THIS account is unservable and
+        // retrying the same request cannot change that. The worker turns `refused` into the one
+        // Chinese sentence that names the operator's actual remedy.
+        log.warn("master:lease-refused", { workerId, prefix: request.preferredAccountIdPrefix, refused: preferred.refusal })
+        return json(409, { error: LEASE_REFUSAL_DETAIL[preferred.refusal], refused: preferred.refusal })
+      }
+      log.info("master:lease-preferred", { workerId, accountId: preferred.account.id })
+      return serveLease(workerId, preferred.account)
+    }
     // `ratelimit` names an account that is SPENT, so it is excluded from this pick. `prelease` is
     // the routine renewal path with nothing to avoid — handing back the same account is the
     // expected answer there, and excluding it would rotate the pool for no reason.
     const exclude = request.reason === "ratelimit" ? request.currentAccountId : undefined
-    const account = deps.scheduler.pickAccount({ accounts: await deps.loadAccounts(), exclude })
+    const account = deps.scheduler.pickAccount({ accounts, exclude })
     if (!account) {
       // 503, kept DISTINCT from the 401 above: both refuse, but the worker acts on them
       // differently. A 401 says "this key will never work, stop"; a 503 says "the pool is
@@ -175,6 +229,13 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       log.warn("master:lease-unavailable", { workerId, reason: request.reason, exclude })
       return json(503, { error: "no account available" })
     }
+    return serveLease(workerId, account)
+  }
+
+  // The tail BOTH lease paths share: mint a fresh access token, bound its horizon, answer. Extracted
+  // rather than duplicated because the arithmetic below is INV-CLOUD-4 — two copies of it would let
+  // the named-account path drift into serving a lease that outlives the master's own refresh point.
+  async function serveLease(workerId: string, account: StoredAccount): Promise<Response> {
     const fresh = await deps.refresher.getFreshAccess(account.id)
     // INV-CLOUD-4 — A LEASE MAY NEVER OUTLIVE THE MASTER'S OWN REFRESH POINT. Anthropic REVOKES the previously
     // issued access token the instant a refresh succeeds — MEASURED against the live API, not inferred, and
