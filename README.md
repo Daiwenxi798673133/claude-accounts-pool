@@ -1,8 +1,22 @@
-# claude-accounts-usage
+# claude-accounts-pool
 
-一个 OpenCode **TUI 插件**,用来查看多个 Claude(Pro/Max)与 ChatGPT(Plus/Pro)账号的订阅用量、在账号之间切换,并查看本地 OpenCode 的用量统计仪表盘(`/stats`)。
+一个 OpenCode **TUI 插件**,用来查看多个 Claude(Pro/Max)与 ChatGPT(Plus/Pro)账号的订阅用量、在账号之间切换,并查看本地 OpenCode 的用量统计仪表盘(`/stats`)。在此之上,它还支持把一批 Claude 账号做成**跨机器共享的账号池**。
 
 它**不接管**任何 auth provider:`anthropic` 条目仍由 [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth) 负责 OAuth 登录与请求注入,`openai` 条目仍由 OpenCode **自带的 codex 插件**负责登录与 token 刷新。本插件只在工具层做"账号档案 + 切换 + 用量展示",因此与两者**共存**。
+
+> 本仓是 [`Daiwenxi798673133/claude-accounts-usage`](https://github.com/Daiwenxi798673133/claude-accounts-usage) 的 fork,在其之上新增了 cloud 模式(账号池)。上游的单机功能全部保留且行为不变。
+
+## 三种模式
+
+插件的行为由 `tui.json` 里的**插件参数**决定,**不配置参数就是 `local`**——也就是上游那套单机行为,一切照旧。
+
+| 模式 | 跑在哪 | 做什么 |
+|---|---|---|
+| **`local`**(默认) | 你自己的机器 | 上游原有行为:`/usage`、`/stats`、多账号切换、撞限自动切号、token 保活。本文除「cloud 模式」几节外描述的都是它。 |
+| **`cloud-master`** | 一台中心主机 | 持有**全部** Claude 账号的真实 refresh token,是**整个系统里唯一的刷新者**。保活所有账号的 token、轮询各账号订阅用量挑最空的号、通过 HTTP 把短时效 access token 租借给 worker(每台 worker 一把 Bearer pool key)。**它自己不跑推理。** |
+| **`cloud-worker`** | 每个工程师的机器 | **永不持有可用的 refresh token**。向 master 租借短时效 access token 写进本地 `auth.json`,并在过期前续租。租借的账号撞到订阅限额时,worker 上报 master、master 换一个号回来,worker 自动续接被打断的那一轮。ChatGPT/OpenAI 仍走本地,不纳入池子。 |
+
+架构决策的完整记录与实测证据见 [`docs/design/cloud-mode-adr.md`](docs/design/cloud-mode-adr.md)。
 
 ## 功能
 
@@ -81,7 +95,7 @@ grep "claude-accounts-usage" ~/.local/share/opencode/log/opencode.log
 
 想看更详细的 debug 级日志(比如限流检测的原始样本):启动 opencode 时加上 `OPENCODE_LOG_LEVEL=DEBUG`(或 `--log-level DEBUG`),并设环境变量 `CLAUDE_AUTOSWITCH_DEBUG=1`。两者配合才会输出 debug 级别的诊断信息。
 
-提 issue 时:把相关日志行 grep 出来,贴到 <https://github.com/Daiwenxi798673133/claude-accounts-usage/issues>,并附上复现步骤。日志已对 token 做脱敏处理,但仍建议你粘贴前自查一遍,确认没有夹带敏感信息。
+提 issue 时:把相关日志行 grep 出来,贴到 <https://github.com/Daiwenxi798673133/claude-accounts-pool/issues>,并附上复现步骤。日志已对 token 做脱敏处理,但仍建议你粘贴前自查一遍,确认没有夹带敏感信息。
 
 ## 前置条件
 
@@ -98,35 +112,80 @@ TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["claude-accounts-usage@0.3.0"]
+  "plugin": ["claude-accounts-pool@0.4.0"]
 }
 ```
 
-OpenCode 会自动解析并安装该包,无需手动 `npm install`。
+OpenCode 会自动解析并安装该包,无需手动 `npm install`。这样写(不带参数)就是 **`local` 模式**;cloud 模式的写法见下一节。
 
-> `0.3.0` 是当前**最新稳定版**,新增 **ChatGPT(OpenAI)多账号支持**:`/usage` 按 provider 分页,ChatGPT 账号可收录、可手动切号、可删除;账号库加上了 provider 判别字段(旧文件零迁移);跨 provider 的选号与刷新被结构性隔离,顺带修掉了一个既有缺陷——一次成功的 ChatGPT 对话会误解除某个 Claude 账号的冷却。ChatGPT 的**自动切号**与**非活跃账号保活**已实现但**默认关闭**,原因见「ChatGPT(OpenAI)多账号」一节。
+> `0.4.0` 在上游 `claude-accounts-usage@0.3.0` 的基础上新增 **cloud 模式(账号池)**:`local` / `cloud-master` / `cloud-worker` 三态,由插件参数选择,**不配参数即为 `local`,行为与 0.3.0 逐字节一致**(上游那 309 个测试全部未经修改地通过)。
 >
-> 升级到 0.3.0 无需任何手工操作:旧的 `claude-accounts.json` 原样可读,Claude 侧行为不变。
+> 从 `claude-accounts-usage` 迁过来无需任何手工操作:旧的 `claude-accounts.json` 原样可读。**注意两个包不要同时装**,择一即可。
 >
 > **建议带上版本号**。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
 
 ### 方式二:本地 clone(开发/离线)
 
 ```bash
-git clone https://github.com/Daiwenxi798673133/claude-accounts-usage.git
-cd claude-accounts-usage && bun install
+git clone https://github.com/Daiwenxi798673133/claude-accounts-pool.git
+cd claude-accounts-pool && bun install && bun run build
 ```
 
-然后让 `tui.json` 指向克隆下来的 `tui.tsx` 绝对路径:
+然后让 `tui.json` 指向克隆下来的入口。可以直接指 `tui.tsx`,也可以指 `bun run build` 产出的 `dist/tui.js`:
 
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["/绝对路径/claude-accounts-usage/tui.tsx"]
+  "plugin": ["/绝对路径/claude-accounts-pool/dist/tui.js"]
 }
 ```
 
 修改配置后**完全退出并重新打开** OpenCode。
+
+## cloud 模式:配置
+
+模式来自 OpenCode 的**插件参数元组**——`plugin` 数组里的每一项既可以是一个字符串,也可以是 `[包名, 参数对象]` 这样一对。
+
+**`local`**(不给参数):
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": ["claude-accounts-pool@0.4.0"]
+}
+```
+
+**`cloud-master`**(中心主机):
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [["claude-accounts-pool@0.4.0", { "mode": "cloud-master", "hostname": "127.0.0.1", "port": 8787 }]]
+}
+```
+
+**`cloud-worker`**(工程师机器):
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [["claude-accounts-pool@0.4.0", { "mode": "cloud-worker", "masterUrl": "http://10.0.0.5:8787", "poolKey": "<master 打印给你的那把 key>", "workerId": "laptop-1" }]]
+}
+```
+
+参数规则:
+
+- `hostname` 省略时默认 **`127.0.0.1`**。这是**故意**的:这个端口对外发放的是活的 access token,想绑更宽的地址必须显式写出来。
+- `port` 必须是 `1`–`65535` 的整数。
+- `cloud-worker` 三个字段 `masterUrl`(http/https)、`poolKey`、`workerId` **缺一不可**。
+- 参数不合法时,插件**什么都不装**,只弹一个错误提示——宁可不工作,也不半配置地跑。
+
+## cloud 模式:运维
+
+1. **在 master 主机上逐个登录 Claude 账号**:照常 `opencode auth login`(经 `@ex-machina/opencode-anthropic-auth`),master 的 keeper 会自动把它收录进账号库。
+2. **在 master 上跑 `reg` 命令给每台 worker 签发 pool key**。**明文 key 只显示这一次**(库里只存它的 SHA-256 摘要),请立刻粘进那台 worker 的 `tui.json`。
+3. **每台 worker 一把独立的 key**,可以单独吊销某一把。
+4. **一条硬规矩:纳入池子的账号,在池外不能再有任何刷新者。** 旧机器上残留的登录、第二个 master,都算。Anthropic 的 refresh token 是一次性并且轮换的,而且(**实测**)一次刷新还会**立刻作废上一枚已签发的 access token**——所以池外的第二个刷新者不仅会打断 refresh 链,还会当场击毙所有在外的租约。
 
 ## 账号管理流程
 
@@ -149,6 +208,22 @@ cd claude-accounts-usage && bun install
 - 每次写 `auth.json` 都是"读整个文件 → 只改自己那一个 provider 的条目 → 整体原子写回",其他 provider 的条目原样保留。写入前会**紧邻原子写再重读一次**,把与另一个写入者互相覆盖的窗口压到毫秒级。
 - 账号库里每条记录都带 `provider` 判别字段(旧文件里没有这个字段的记录一律读作 `anthropic`,**零迁移成本**),Claude 与 ChatGPT 各有独立的"当前账号"指针。选号、轮询、计数、刷新全部按 provider 过滤,所以一个 Claude 会话在结构上不可能被切到 ChatGPT 账号上,反之亦然。
 
+### cloud-worker 的 `auth.json` 里那个奇怪的 refresh 是什么
+
+如果你在 worker 上打开 `auth.json`,会看到 `anthropic` 条目的 `refresh` 是一串**明显不像 token 的常量**。这是故意的:实测发现 **OpenCode 会静默丢弃缺少 `refresh` 字段的 `anthropic` 条目**——带一个假值时 `opencode auth list` 报 `1 credentials`,去掉该字段就变成 `0 credentials`,而且退出码 0、一句报错都没有。所以租约只能写成 `access` + `expires` + 一个**可识别的哨兵字符串**。账号库的收录路径会**拒绝**这个哨兵,因此它永远不会被误当成真凭据存起来或回传给 master。
+
+### 为什么租约的到期时间比账号 token 的真实到期更早
+
+master 会在账号 token 即将过期前把它刷新掉,而这次刷新会**作废上一枚 access token**(实测)。所以 master 下发租约时,故意把到期时间**封顶在自己动手刷新的那一刻之前**,worker 再提前一段续租——这样 worker 永远在 master 轮换之前就换到了新 token。万一仍然拿到了被轮换掉的 token(时钟偏移、笔记本休眠唤醒),worker 会把 `401` 当作"租约被轮换"处理:立刻重新领租并续接那一轮,**不会**把这个健康账号误判成撞限而冷却掉。
+
+### 为什么内部标识符仍然叫 `claude-accounts-usage`
+
+包名改了,但代码里的内部标识符**一律保持原样**,这是刻意的,**请不要"顺手统一"**:
+
+- 跨进程锁文件名 `claude-accounts-usage.lock`——这把锁防的正是"两个插件实例并发轮换同一张一次性 refresh token"。如果某台机器上新旧两个包同时存在而锁名不同,**互斥会直接消失**。
+- OpenCode 的 KV 命名空间——已签发的 pool key 存在里面,改了会全部孤立。
+- 日志服务名(所以下面那条 `grep` 命令不变)与租约哨兵字符串(改了两个版本就互不认识对方的租约)。
+
 ## 已知限制
 
 - ex-machina 同一时刻只持有一个账号,所以一个新账号必须先用 ex-machina 登录过一次,插件才能在下次加载/操作时收录它。
@@ -158,6 +233,9 @@ cd claude-accounts-usage && bun install
 - ChatGPT 的隔离期是唯一依赖**挂钟**的判定。时钟往后跳是安全的;往前跳(NTP 校正、虚机迁移、长时间睡眠恢复)若超过隔离窗口,会让所有时间戳一次性"老化"、隔离失效。当前槽位占用者不受影响(它靠身份比对,与时钟无关),暴露面仅限刚被换出去的账号——而能让时钟跳那么远的场景里,那些还在飞的请求基本上早已随连接一起断掉。
 - `auth.json` 的路径是插件自己按 `XDG_DATA_HOME` → `~/.local/share` → `~/Library/Application Support` 顺序推断的,取第一个能解析成 JSON 的。正常安装下与 OpenCode 一致;若历史遗留导致候选顺序错位,插件与 OpenCode 可能读写不同的文件(这是既有行为,与本次多 provider 支持无关)。
 - **只用一个 ChatGPT 账号验证过。** 选号、冷却、以及非活跃账号保活这些只有多账号才走得到的路径,目前只有单元测试覆盖,没有真机验证——这也是两个开关默认关闭的直接原因。
+- **cloud 模式的计费归属只在同一台机器上验证过。** 实测确认:用租借来的 access token 经真实 ex-machina 发推理,用量扣在该账号的**订阅窗口**上,超额(overage)计数器分文未动。但这次测量是在**持有该账号的那台机器**上做的;真实部署里 worker 在**另一台机器、另一个出口 IP**。「跨 IP 是否影响计费归属」**尚未验证**,需要在第二台机器上重跑同一套协议(脚本见 `scripts/gate0-billing-attribution.ts`)。
+- **本仓是 fork,上游修复需要手动同步。** `claude-accounts-usage` 之后的修复不会自动流进来,得手动 merge 或移植。
+- **cloud 模式下 worker 无法在请求层被拦住。** OpenCode 的 TUI 插件拿不到请求级钩子(`Hooks` 只属于 server 插件),所以"租约失效时阻止请求发出"做不到。当前的兜底是:keeper 提前续租、失败时明确报错并拒绝写入陈旧租约,再加上 `401` 的重领租恢复。真正的请求拦截需要额外注册一个 server 插件入口,尚未做。
 
 ## License
 
