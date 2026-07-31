@@ -2,8 +2,8 @@ import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
 import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
-import type { LeaseRequest, LeaseResponse, RateLimitReport, UsageSnapshotView } from "../cloud/protocol.ts"
-import { startLeaseServer } from "./leaseServer.ts"
+import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
+import { startLeaseServer, USAGE_REFRESH_MIN_INTERVAL_MS } from "./leaseServer.ts"
 import type { UsageSnapshot } from "./scheduler.ts"
 
 // A REAL Bun.serve on an EPHEMERAL port, driven by REAL fetch. The deliverable here is HTTP
@@ -37,6 +37,11 @@ type Harness = {
   reports: Array<{ accountId: string; resetsAt?: number }>
   refreshed: string[]
   picks: Array<{ ids: string[]; exclude?: string }>
+  // One entry per usage sweep the server actually asked for — the only way to tell "the master went
+  // and polled Anthropic" apart from "the page re-read the snapshot it already had".
+  sweeps: number[]
+  snapshotAt: () => number
+  advance: (ms: number) => void
 }
 
 function startHarness(options?: {
@@ -52,7 +57,12 @@ function startHarness(options?: {
   // Empty and STALE by default — the shape a master has before its first poll completes. Every
   // lease case below therefore runs against a server whose dashboard data is absent, proving the two
   // concerns share a port without sharing a failure mode.
-  const usage: UsageSnapshot = options?.usage ?? { at: 0, stale: true, byId: new Map() }
+  let usage: UsageSnapshot = options?.usage ?? { at: 0, stale: true, byId: new Map() }
+  // FROZEN by default so the refresh throttle can be stepped deliberately; `advance` is the only way
+  // time moves. Anchored to the real clock because the lease cases express their fixtures in it.
+  let nowMs = Date.now()
+  const clock = (): number => nowMs
+  const sweeps: number[] = []
   const reports: Harness["reports"] = []
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
@@ -84,6 +94,14 @@ function startHarness(options?: {
       verify: (header) => (header === `Bearer ${POOL_KEY}` ? WORKER_ID : undefined),
     },
     loadAccounts: async () => accounts,
+    // Stands in for the usage poller's tickOnce. It ADVANCES THE SNAPSHOT INSTANT, because that is
+    // the real thing a completed sweep changes — a fake that only counted calls could not tell the
+    // difference between the route sweeping and the route lying about it.
+    refreshUsage: async () => {
+      sweeps.push(clock())
+      usage = { at: clock(), stale: false, byId: usage.byId }
+    },
+    now: clock,
     // Loopback only — a test must never expose a lease endpoint on a real interface.
     hostname: "127.0.0.1",
     port: 0,
@@ -97,6 +115,11 @@ function startHarness(options?: {
     reports,
     refreshed,
     picks,
+    sweeps,
+    snapshotAt: () => usage.at,
+    advance: (ms: number) => {
+      nowMs += ms
+    },
   }
 }
 
@@ -419,6 +442,88 @@ test("usage marks a stale snapshot instead of presenting it as current", async (
   }
 })
 
+test("refresh sweeps now and answers with what that sweep collected", async () => {
+  // Given: a snapshot that is already stale — the situation the button exists for.
+  const harness = dashboardHarness(true)
+  try {
+    const before = harness.snapshotAt()
+
+    // When: the button's request, with no credential of any kind.
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usageRefresh}`, { method: "POST" })
+
+    // Then: a sweep really ran, and the response carries ITS result rather than the snapshot that was
+    // already sitting there. Pressing 刷新 and getting the same instant back would be a button that
+    // lies about having done something — the failure this route exists to avoid.
+    expect(res.status).toBe(200)
+    const view = (await res.json()) as UsageSnapshotView
+    expect(harness.sweeps).toHaveLength(1)
+    expect(view.at).toBeGreaterThan(before)
+    expect(view.at).toBe(harness.snapshotAt())
+    expect(view.stale).toBe(false)
+    expect(view.accounts).toHaveLength(3)
+    // Still no credential in the payload — the route being keyless makes this stricter, not looser.
+    expect(JSON.stringify(view)).not.toContain("sk-ant-")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("refresh is throttled server-wide and says how long to wait", async () => {
+  const harness = dashboardHarness(false)
+  const url = `${harness.base}${CLOUD_ROUTES.usageRefresh}`
+  try {
+    expect((await fetch(url, { method: "POST" })).status).toBe(200)
+    expect(harness.sweeps).toHaveLength(1)
+
+    // A second press inside the window is REFUSED, and the refusal is what makes a keyless route that
+    // reaches Anthropic defensible at all: `/api/oauth/usage` answers a burst with a 429 that lasts
+    // minutes and is charged to this master's egress IP — i.e. to every account in the pool at once.
+    const throttled = await fetch(url, { method: "POST" })
+    expect(throttled.status).toBe(429)
+    const body = (await throttled.json()) as ThrottledBody
+    expect(body.retryAfterMs).toBeGreaterThan(0)
+    expect(body.retryAfterMs).toBeLessThanOrEqual(USAGE_REFRESH_MIN_INTERVAL_MS)
+    // The header for anything speaking plain HTTP, in whole seconds; the body's exact ms is what the
+    // page counts down. Both, because a disabled button with no stated reason is the thing to avoid.
+    expect(throttled.headers.get("retry-after")).toBe(String(Math.ceil(body.retryAfterMs / 1000)))
+    // NO sweep happened — that, not the status code, is the property being protected.
+    expect(harness.sweeps).toHaveLength(1)
+
+    // One millisecond short of the window: still refused. Exactly at it: allowed. Both asserted so
+    // that neither a `<` / `<=` slip nor a throttle that never lifts can pass.
+    harness.advance(USAGE_REFRESH_MIN_INTERVAL_MS - 1)
+    expect((await fetch(url, { method: "POST" })).status).toBe(429)
+    harness.advance(1)
+    expect((await fetch(url, { method: "POST" })).status).toBe(200)
+    expect(harness.sweeps).toHaveLength(2)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a GET can never trigger a sweep", async () => {
+  const harness = dashboardHarness(false)
+  try {
+    // When: the refresh path is fetched the way a browser, a link scanner or a chat-app unfurler
+    // would speculatively fetch any URL it sees.
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.usageRefresh}`)
+
+    // Then: refused, and — the assertion that matters — NOTHING was polled. If a GET swept, merely
+    // pasting the dashboard's link into a chat window could provoke upstream traffic for every
+    // account in the pool. 405 rather than 404 so the fault is legible as "wrong method" instead of
+    // reading like a master too old to have the button.
+    expect(res.status).toBe(405)
+    expect(harness.sweeps).toEqual([])
+
+    // And the READ route is deliberately exempt from that rule: it is safe to GET precisely because
+    // it sweeps nothing.
+    expect((await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)).status).toBe(200)
+    expect(harness.sweeps).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
 test("dashboard serves a data-free HTML page, repeatedly", async () => {
   const harness = dashboardHarness(false)
   try {
@@ -433,6 +538,10 @@ test("dashboard serves a data-free HTML page, repeatedly", async () => {
     const body = await res.text()
     expect(body).toContain("<!doctype html>")
     expect(body).toContain(CLOUD_ROUTES.usage)
+    // Both routes and the throttle window are INJECTED into the page, so the countdown it shows can
+    // never drift from the window the server actually enforces.
+    expect(body).toContain(CLOUD_ROUTES.usageRefresh)
+    expect(body).toContain(String(USAGE_REFRESH_MIN_INTERVAL_MS))
     expect(body).not.toContain("example.test")
     expect(body).not.toContain("sk-ant-")
     expect(body).not.toContain("acct-")

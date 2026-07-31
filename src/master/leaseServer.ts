@@ -8,7 +8,7 @@
 // rotate a real chain on a paid account, so there are no defaults anywhere in LeaseServerDeps.
 
 import type { StoredAccount } from "../accounts.ts"
-import type { ErrorBody, LeaseReason, LeaseRequest, LeaseResponse, RateLimitReport, UsageSnapshotView } from "../cloud/protocol.ts"
+import type { ErrorBody, LeaseReason, LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
@@ -29,6 +29,13 @@ export type LeaseServerDeps = {
   refresher: { getFreshAccess(accountId: string): Promise<{ access: string; expiresAt: number }> }
   registry: { verify(authorizationHeader: string | null | undefined): string | undefined }
   loadAccounts: () => Promise<StoredAccount[]>
+  // Runs ONE usage sweep and resolves when the snapshot has been handed to the scheduler — the usage
+  // poller's own tickOnce. Injected as a bare thunk so this server never learns what a poller is, and
+  // so a test can prove the route triggers a sweep without any network at all.
+  refreshUsage: () => Promise<void>
+  // Injected so a test can drive the refresh throttle deterministically. EVERY time read in this
+  // module goes through it; a stray Date.now() would silently escape the injected clock.
+  now?: () => number
   // No default, and never `0.0.0.0`: this port hands out live credentials, so the interface it
   // binds is the caller's explicit decision (a loopback/VPN address), never something inferred.
   hostname: string
@@ -44,7 +51,7 @@ type RouteHandler = (req: Request) => Promise<Response>
 // KEY resolved to — it never has to (and never can) look for identity in the payload.
 type AuthedHandler = (req: Request, workerId: string) => Promise<Response>
 
-function json(status: number, body: ErrorBody | LeaseResponse | UsageSnapshotView | { ok: true }): Response {
+function json(status: number, body: ErrorBody | LeaseResponse | UsageSnapshotView | ThrottledBody | { ok: true }): Response {
   return Response.json(body, { status })
 }
 
@@ -120,7 +127,19 @@ function parseRateLimitReport(raw: unknown): RateLimitReport | undefined {
   }
 }
 
+// One forced sweep per this window, server-wide. NOT per caller: what it protects is the master's
+// single egress IP, and `/api/oauth/usage` answers a burst with a 429 that lasts minutes and applies
+// to every account behind that IP — so one person's press must throttle everyone. Chosen an order of
+// magnitude below the scheduled interval so the button is genuinely useful, while still turning an
+// unbounded anonymous lever into at most two sweeps a minute.
+export const USAGE_REFRESH_MIN_INTERVAL_MS = 30_000
+
 export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: () => void } {
+  const now = deps.now ?? Date.now
+  // Seeded at 0, not at startup: the first press after a master boots is the one most worth serving —
+  // the scheduled poller has not swept yet, so the dashboard is empty until it does.
+  let lastForcedSweepAt = 0
+
   function badRequest(detail: string): Response {
     return json(400, { error: detail })
   }
@@ -174,7 +193,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // refresh against — a spent horizon therefore dooms it twice: revoked token now, failed self-refresh next.
     // The floor is one worker check interval, because a lease is inspected only that often. Deliberately the
     // SAME 503 as an empty pool: the worker's back-off-and-retry is already the right recovery here.
-    if (expiresAt - Date.now() < LEASE_CHECK_INTERVAL_MS) {
+    if (expiresAt - now() < LEASE_CHECK_INTERVAL_MS) {
       log.warn("master:lease-horizon-spent", { workerId, accountId: account.id, expiresAt })
       return json(503, { error: "no account available" })
     }
@@ -214,22 +233,60 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
   //      issues no request of its own, so an anonymous caller hammering this route cannot provoke
   //      `/api/oauth/usage` (whose 429 lasts minutes and is charged to this master's egress IP),
   //      cannot mint a token, and cannot move an account.
-  async function handleUsage(): Promise<Response> {
-    const view = buildUsageView({
+  async function usageView(): Promise<UsageSnapshotView> {
+    return buildUsageView({
       accounts: await deps.loadAccounts(),
       snapshot: deps.scheduler.getUsageSnapshot(),
       // Wrapped rather than passed by reference: the scheduler is an injected object here, and a
       // detached method would break on any implementation that is not closure-based.
       isCoolingDown: (accountId) => deps.scheduler.isCoolingDown(accountId),
     })
+  }
+
+  async function handleUsage(): Promise<Response> {
+    const view = await usageView()
     log.debug("master:usage-served", { accounts: view.accounts.length, stale: view.stale })
+    return json(200, view)
+  }
+
+  // The dashboard's 刷新 button. The ONE public route that reaches outside this machine, so it is the
+  // one place the two guards below are load-bearing rather than ceremonial.
+  async function handleUsageRefresh(req: Request): Promise<Response> {
+    // METHOD ENFORCED, unlike every other route here — a GET on this path must not sweep, or a
+    // speculative fetch of a pasted link would. 405 names the actual fault instead of 404, which
+    // would read as "this master is too old to have the button".
+    if (req.method !== "POST") {
+      return json(405, { error: "use POST" })
+    }
+    const elapsed = now() - lastForcedSweepAt
+    if (elapsed < USAGE_REFRESH_MIN_INTERVAL_MS) {
+      const retryAfterMs = USAGE_REFRESH_MIN_INTERVAL_MS - elapsed
+      log.debug("master:usage-refresh-throttled", { retryAfterMs })
+      // Retry-After (seconds, per RFC 9110) for anything speaking plain HTTP, and the exact
+      // millisecond figure in the body for the page's own countdown.
+      return new Response(JSON.stringify({ error: "refresh throttled", retryAfterMs } satisfies ThrottledBody), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(retryAfterMs / 1000)) },
+      })
+    }
+    // Stamped BEFORE the sweep, not after: a sweep serialises behind the poller's own re-entrancy
+    // guard and can take seconds, and stamping afterwards would let a double-click queue a second
+    // sweep that the window was supposed to refuse.
+    lastForcedSweepAt = now()
+    await deps.refreshUsage()
+    const view = await usageView()
+    log.info("master:usage-refresh-served", { accounts: view.accounts.length, stale: view.stale })
     return json(200, view)
   }
 
   // The STRING is built once (the shell is a constant), but each request gets a FRESH Response: a
   // Response body is a single-use stream, so sharing one object would serve the first browser and
   // then fail every reload after it.
-  const dashboardShell = dashboardHtml(CLOUD_ROUTES.usage)
+  const dashboardShell = dashboardHtml({
+    usageRoute: CLOUD_ROUTES.usage,
+    refreshRoute: CLOUD_ROUTES.usageRefresh,
+    throttleMs: USAGE_REFRESH_MIN_INTERVAL_MS,
+  })
 
   const routes: Record<Route, RouteHandler> = {
     // UNAUTHENTICATED BY DESIGN, and the only route that is. A worker probes this BEFORE it
@@ -247,6 +304,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // table is the one place that contrast is visible, so keep it that way.
     [CLOUD_ROUTES.usage]: () => handleUsage(),
     [CLOUD_ROUTES.dashboard]: async () => html(dashboardShell),
+    [CLOUD_ROUTES.usageRefresh]: (req) => handleUsageRefresh(req),
   }
 
   // A table lookup, not an if/else chain over paths: the chain's fallthrough silently answers an

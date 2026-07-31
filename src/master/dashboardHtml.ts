@@ -19,11 +19,14 @@
 // `@media` collapse or the state classes (`.cooling`, `.stale`, the four bar tones) this page needs
 // in order to show the states a happy-path mock never has to.
 
-// `usageRoute` comes from the frozen CLOUD_ROUTES table (a compile-time literal, never user input),
-// which is why interpolating it into a JS string literal here needs no escaping. It is a parameter
-// rather than a hard-coded "/v1/usage" so the route table stays the single source of truth and a
-// renamed route cannot leave a silently broken page behind.
-export function dashboardHtml(usageRoute: string): string {
+// Every value below is a compile-time constant owned by this codebase (two frozen CLOUD_ROUTES
+// entries and the server's own throttle window), never user input — which is why interpolating them
+// into the script needs no escaping. They are parameters rather than literals so the route table and
+// the throttle each stay a SINGLE source of truth: a renamed route cannot leave a silently broken
+// page behind, and the countdown the page shows cannot drift from the window the server enforces.
+export type DashboardConfig = { usageRoute: string; refreshRoute: string; throttleMs: number }
+
+export function dashboardHtml(config: DashboardConfig): string {
   return `<!doctype html>
 <html lang="zh">
 <head>
@@ -75,6 +78,18 @@ export function dashboardHtml(usageRoute: string): string {
         color: var(--text-2); }
   .ro .dot { flex: 0 0 auto; display: block; width: 7px; height: 7px; border-radius: 50%;
              background: var(--accent); }
+  .actions { display: flex; align-items: center; gap: 12px; }
+  #refresh { display: flex; align-items: center; gap: 8px; padding: 7px 14px; font: 500 13px/normal var(--sans);
+             border: 1px solid var(--accent); border-radius: 999px; background: var(--accent);
+             color: var(--card-bg); cursor: pointer; transition: background 120ms ease; }
+  #refresh:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+  #refresh:active { background: #93401F; border-color: #93401F; }
+  #refresh:disabled { opacity: 0.75; cursor: default; }
+  #refresh .spin { display: flex; align-items: center; }
+  /* Animated ONLY while a sweep is in flight, so the spinner is a statement of fact rather than
+     decoration: if it is turning, the master is really talking to Anthropic right now. */
+  #refresh.busy .spin { animation: spin 800ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   #rows { display: flex; flex-direction: column; gap: 20px; }
   .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px;
@@ -128,7 +143,13 @@ export function dashboardHtml(usageRoute: string): string {
       <h1>账号池用量</h1>
       <p id="meta">加载中…</p>
     </div>
-    <div class="ro"><span class="dot"></span><span>只读视图</span></div>
+    <div class="actions">
+      <div class="ro"><span class="dot"></span><span>只读视图</span></div>
+      <button id="refresh" type="button">
+        <span class="spin" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.7 6.6A6 6 0 0 0 3.1 4.6"></path><path d="M2.3 9.4A6 6 0 0 0 12.9 11.4"></path><path d="M13.9 2.6v4h-4"></path><path d="M2.1 13.4v-4h4"></path></svg></span>
+        <span id="refresh-label">刷新</span>
+      </button>
+    </div>
   </header>
   <div id="rows"></div>
   <footer>只读视图：不含任何 token，也不提供任何改状态的操作。</footer>
@@ -136,7 +157,9 @@ export function dashboardHtml(usageRoute: string): string {
 <script>
 (function () {
   "use strict";
-  var USAGE_URL = "${usageRoute}";
+  var USAGE_URL = "${config.usageRoute}";
+  var REFRESH_URL = "${config.refreshRoute}";
+  var THROTTLE_MS = ${String(config.throttleMs)};
   var RELOAD_MS = 60000;
   var TICK_MS = 1000;
 
@@ -153,7 +176,14 @@ export function dashboardHtml(usageRoute: string): string {
 
   var rows = document.getElementById("rows");
   var meta = document.getElementById("meta");
+  var button = document.getElementById("refresh");
+  var buttonLabel = document.getElementById("refresh-label");
   var latest = null;
+  var sweeping = false;
+  // Set when the server refuses a press; while it is in the future the meta line says how long is
+  // left instead of the snapshot age, so a disabled-looking button always has a reason next to it.
+  var throttledUntil = 0;
+  var errorText = "";
 
   function el(tag, className, text) {
     var node = document.createElement(tag);
@@ -197,21 +227,43 @@ export function dashboardHtml(usageRoute: string): string {
     return minutes + "m";
   }
 
-  function renderMeta() {
-    if (latest.at === 0) {
-      meta.className = "stale";
-      meta.textContent = "尚未完成任何一轮轮询——master 重启后首轮用量采集要等一个轮询周期(5 分钟)。";
-      return;
-    }
+  function snapshotText() {
+    if (!latest) return "加载中…";
+    if (latest.at === 0) return "尚未完成任何一轮轮询——按「刷新」立即采集一次，否则要等下一个轮询周期(5 分钟)。";
     var when = new Date(latest.at).toLocaleTimeString();
     var age = fmtSpan(Date.now() - latest.at);
     if (latest.stale) {
-      meta.className = "stale";
-      meta.textContent = "数据陈旧：快照采集于 " + when + "（" + age + "前），调度器已停止按它排序，下面的数字不代表当前状态。";
+      return "数据陈旧：快照采集于 " + when + "（" + age + "前），调度器已停止按它排序，下面的数字不代表当前状态。";
+    }
+    return "快照采集于 " + when + "（" + age + "前）· " + latest.accounts.length + " 个 anthropic 账号";
+  }
+
+  // Precedence is deliberate: what is happening RIGHT NOW beats a failure, which beats the snapshot's
+  // own age. Rebuilt from state on every tick rather than written at the point of each event — the
+  // one-second re-render used to erase a fetch error a moment after it appeared, because whoever set
+  // the text was racing the timer that rewrote it.
+  function renderMeta() {
+    if (sweeping) {
+      meta.className = "";
+      meta.textContent = "正在采集全池用量…";
       return;
     }
-    meta.className = "";
-    meta.textContent = "快照采集于 " + when + "（" + age + "前）· " + latest.accounts.length + " 个 anthropic 账号";
+    if (errorText) {
+      meta.className = "stale";
+      meta.textContent = errorText;
+      return;
+    }
+    var wait = throttledUntil - Date.now();
+    var suffix = wait > 0 ? "（刚刚已采集，" + Math.ceil(wait / 1000) + " 秒后可再刷新）" : "";
+    meta.className = latest && (latest.stale || latest.at === 0) ? "stale" : "";
+    meta.textContent = snapshotText() + suffix;
+  }
+
+  function syncButton() {
+    var waiting = throttledUntil - Date.now() > 0;
+    button.disabled = sweeping || waiting;
+    button.className = sweeping ? "busy" : "";
+    buttonLabel.textContent = sweeping ? "刷新中…" : "刷新";
   }
 
   function renderWindow(win) {
@@ -262,8 +314,9 @@ export function dashboardHtml(usageRoute: string): string {
   }
 
   function render() {
-    if (!latest) return;
     renderMeta();
+    syncButton();
+    if (!latest) return;
     rows.textContent = "";
     if (latest.accounts.length === 0) {
       rows.appendChild(el("div", "empty", "池内没有 anthropic 账号。"));
@@ -280,18 +333,57 @@ export function dashboardHtml(usageRoute: string): string {
       })
       .then(function (payload) {
         latest = payload;
+        errorText = "";
         render();
       })
       .catch(function (error) {
-        meta.className = "stale";
-        meta.textContent = "拉取失败：" + error.message;
+        errorText = "拉取失败：" + error.message;
+        render();
       });
   }
 
+  // Asks the master to sweep NOW rather than re-reading the snapshot it already has: pressing 刷新 and
+  // landing on the same timestamp would be a button that lies about having done something.
+  function refresh() {
+    if (sweeping || throttledUntil - Date.now() > 0) return;
+    sweeping = true;
+    errorText = "";
+    render();
+    fetch(REFRESH_URL, { method: "POST", cache: "no-store" })
+      .then(function (res) {
+        if (res.status === 429) {
+          // The server owns the window, so its figure is the one to trust; the fallback only covers a
+          // body we could not read, and erring long is right — erring short re-presses into a refusal.
+          return res.json().catch(function () { return null; }).then(function (body) {
+            var wait = body && typeof body.retryAfterMs === "number" && body.retryAfterMs > 0 ? body.retryAfterMs : 30000;
+            throttledUntil = Date.now() + wait;
+            return null;
+          });
+        }
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (payload) {
+        if (payload) latest = payload;
+        // Every accepted sweep starts the server's window, so mirror it locally instead of waiting to
+        // be refused: the button goes quiet for the same period the master would have refused anyway.
+        if (payload) throttledUntil = Date.now() + THROTTLE_MS;
+      })
+      .catch(function (error) {
+        errorText = "刷新失败：" + error.message;
+      })
+      .then(function () {
+        sweeping = false;
+        render();
+      });
+  }
+
+  button.addEventListener("click", refresh);
+
   load();
-  // Two clocks: the countdowns tick locally every second, while the snapshot itself is refetched
-  // only once a minute — the master polls the upstream usage API on its own multi-minute schedule,
-  // so a faster refetch would just re-serve the same numbers.
+  // Two clocks: the countdowns (and the throttle's own countdown) tick locally every second, while the
+  // snapshot is refetched only once a minute — the master polls the upstream usage API on its own
+  // multi-minute schedule, so a faster refetch would just re-serve the same numbers.
   setInterval(render, TICK_MS);
   setInterval(load, RELOAD_MS);
 })();

@@ -102,6 +102,10 @@ export function installCloudMaster(
     refresher,
     registry,
     loadAccounts: roster,
+    // The dashboard's refresh button reuses the poller's OWN sweep rather than fetching usage itself,
+    // so a forced refresh inherits every protection the scheduled path already has: the re-entrancy
+    // guard, the 500ms spacing between accounts, and the per-account 429 cooldown.
+    refreshUsage: usagePoller.tickOnce,
     hostname: cfg.hostname,
     port: cfg.port,
     // The plugin's own abort signal, so the port dies with the plugin rather than outliving it as

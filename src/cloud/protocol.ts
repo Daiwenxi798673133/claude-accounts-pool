@@ -25,6 +25,18 @@ export const CLOUD_ROUTES = Object.freeze({
   // included. What narrows that is the BIND ADDRESS, not a key on these two routes.
   usage: "/v1/usage",
   dashboard: "/",
+  // POST — the dashboard's "刷新" button: run ONE usage sweep now instead of waiting out the poll
+  // interval, then answer with the resulting snapshot.
+  //
+  // POST, NOT GET, even though the payload is the same as `usage`. This is the one dashboard route
+  // with a side effect that leaves the machine — it makes the master call Anthropic once per account
+  // — and browsers, link scanners and chat-app unfurlers all speculatively GET a URL they see. A GET
+  // here would let a pasted link provoke upstream traffic; a POST cannot be triggered that way.
+  //
+  // Also keyless, which only holds because the server throttles it (see leaseServer.ts): the usage
+  // endpoint answers a burst with a 429 that lasts minutes and is charged to this master's egress IP,
+  // i.e. to EVERY account in the pool at once. The throttle, not a key, is what bounds that.
+  usageRefresh: "/v1/usage/refresh",
 } as const)
 
 // Why the worker is asking. `prelease` is the routine path (startup or renewal before the
@@ -58,6 +70,11 @@ export type RateLimitReport = {
 export type ErrorBody = {
   error: string
 }
+
+// The refresh route's 429 body. Carries the wait explicitly so the page can SAY it ("N 秒后可再刷新")
+// rather than leaving a button that looks broken — the same rule that killed the "重置未知"
+// placeholder: never let the UI imply something is wrong when the truth is simply "not yet".
+export type ThrottledBody = ErrorBody & { retryAfterMs: number }
 
 // ── Dashboard payload (master → the operator's browser) ────────────────────────────────────────
 // PRIVACY IS ENFORCED BY THIS TYPE, not by the care taken in the builder. There is no field below
