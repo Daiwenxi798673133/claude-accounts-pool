@@ -6,7 +6,7 @@
 // the caller is a renewal loop whose whole job is to keep running: a thrown error there is
 // either swallowed by a catch-all (silently killing renewal) or kills the loop outright.
 // A union forces each case to be answered explicitly instead.
-import type { ErrorBody, LeaseReason, LeaseRequest, LeaseResponse, RateLimitReport } from "../cloud/protocol.ts"
+import type { ErrorBody, LeaseReason, LeaseRefusal, LeaseRequest, LeaseResponse, RateLimitReport } from "../cloud/protocol.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import { LEASE_BACKOFF_BASE_MS, LEASE_BACKOFF_CAP_MS, NETWORK_TIMEOUT_MS } from "../constants.ts"
 import { log, redactBody, redactHeaders } from "../logger.ts"
@@ -14,6 +14,7 @@ import { log, redactBody, redactHeaders } from "../logger.ts"
 export type LeaseFailure =
   | { kind: "auth" } // 401 — pool key rejected
   | { kind: "no-account" } // 503 — master has no account available
+  | { kind: "refused"; refused: LeaseRefusal } // 409 — we NAMED an account the master will not serve
   | { kind: "unreachable"; detail: string } // network / retries exhausted
   | { kind: "bad-response"; detail: string } // unparseable or schema-invalid body
 
@@ -52,6 +53,22 @@ function detailOf(status: number, body: string): string {
   return `HTTP ${status}: ${redactBody(body, 200)}`
 }
 
+// A table keyed by LeaseRefusal, mirroring the server's own LEASE_REASONS guard: a reason added to
+// the protocol becomes a COMPILE error here instead of silently degrading to "bad response".
+const LEASE_REFUSALS: Record<LeaseRefusal, true> = { unknown: true, ambiguous: true, cooling: true, "needs-reauth": true }
+
+// A 409 whose body does not name a reason we know is treated as a BAD RESPONSE, never guessed at:
+// the reason IS the message the operator acts on, so inventing one would send them to fix the wrong
+// thing (re-login for an account that is merely cooling, say).
+function parseRefusal(body: string): LeaseRefusal | undefined {
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>
+    const refused = parsed?.["refused"]
+    if (typeof refused === "string" && Object.hasOwn(LEASE_REFUSALS, refused)) return refused as LeaseRefusal
+  } catch {}
+  return undefined
+}
+
 // A 200 is NOT proof of a usable lease. The worker writes these three fields straight into
 // its opencode auth.json, where a missing/blank access or a NaN expiry becomes a broken
 // login that no later retry repairs — so a malformed body is refused HERE, while it is
@@ -72,7 +89,16 @@ const RETRY: (detail: string) => Attempt = (detail) => ({ retry: true, detail })
 const DONE: (outcome: LeaseOutcome) => Attempt = (outcome) => ({ retry: false, outcome })
 
 export function createLeaseClient(deps: LeaseClientDeps): {
-  lease(input: { reason: LeaseReason; currentAccountId?: string }): Promise<LeaseOutcome>
+  lease(input: {
+    reason: LeaseReason
+    currentAccountId?: string
+    // The account the operator named in a worker's /usage panel, as the prefix that panel showed.
+    preferredAccountIdPrefix?: string
+    // How many times to try before giving up. INTERACTIVE CALLERS PASS 1: an operator who just
+    // pressed enter is watching a dialog, and the ladder below can spend minutes reaching its
+    // verdict. Only the background renewal loop can afford that, so only it takes the default.
+    attempts?: number
+  }): Promise<LeaseOutcome>
   reportRateLimit(input: { accountId: string; headers: Record<string, string>; resetsAt?: number }): Promise<boolean>
 } {
   // A configured base URL routinely carries a trailing slash; CLOUD_ROUTES paths are absolute.
@@ -111,6 +137,18 @@ export function createLeaseClient(deps: LeaseClientDeps): {
     }
 
     const text = await res.text().catch(() => "")
+    // 409 — this request NAMED an account and the master will not serve that one. Terminal, and kept
+    // out of the generic 4xx branch below because the refusal reason is the entire message the
+    // operator needs; collapsing it into "bad response" would tell them the pool is broken instead.
+    if (res.status === 409) {
+      const refused = parseRefusal(text)
+      if (refused === undefined) {
+        log.error("lease:refusal-schema-invalid", { body: redactBody(text, 200) })
+        return DONE({ ok: false, failure: { kind: "bad-response", detail: detailOf(res.status, text) } })
+      }
+      log.warn("lease:refused", { refused })
+      return DONE({ ok: false, failure: { kind: "refused", refused } })
+    }
     if (res.status >= 500) {
       log.warn("lease:server-error", { status: res.status, body: redactBody(text, 200) })
       return RETRY(detailOf(res.status, text))
@@ -144,17 +182,19 @@ export function createLeaseClient(deps: LeaseClientDeps): {
         workerId: deps.workerId,
         reason: input.reason,
         ...(input.currentAccountId === undefined ? {} : { currentAccountId: input.currentAccountId }),
+        ...(input.preferredAccountIdPrefix === undefined ? {} : { preferredAccountIdPrefix: input.preferredAccountIdPrefix }),
       }
+      const maxAttempts = input.attempts ?? MAX_LEASE_ATTEMPTS
       let detail = "no attempt made"
-      for (let attempt = 0; attempt < MAX_LEASE_ATTEMPTS; attempt++) {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const result = await attemptLease(payload)
         if (!result.retry) return result.outcome
         detail = result.detail
         // The final failure is reported, not slept on: a trailing delay would just stall
         // the caller after the decision is already made.
-        if (attempt < MAX_LEASE_ATTEMPTS - 1) await deps.sleep(backoffFor(attempt))
+        if (attempt < maxAttempts - 1) await deps.sleep(backoffFor(attempt))
       }
-      log.error("lease:exhausted", { attempts: MAX_LEASE_ATTEMPTS, detail })
+      log.error("lease:exhausted", { attempts: maxAttempts, detail })
       return { ok: false, failure: { kind: "unreachable", detail } }
     },
 

@@ -281,3 +281,78 @@ test("cooldown state round-trips through injected kv", () => {
   // The restored cooldowns really do steer selection in the new process, not just isCoolingDown.
   expect(second.pickAccount({ accounts: [account("live"), account("fresh"), account("spare")] })?.id).toBe("spare")
 })
+
+test("pickPreferred serves the named account regardless of rank, and refuses what it cannot serve", () => {
+  const clock = 1_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => clock })
+  const accounts = [
+    account("aaaa1111-full"),
+    account("bbbb2222-idle"),
+    account("cccc3333-off", { excluded: true }),
+    account("dddd4444-dead", { needsReauth: true }),
+    account("eeee5555-gpt", { provider: "openai" }),
+  ]
+
+  // Given `bbbb2222-idle` is the emptiest account, so ranked selection would always answer it...
+  scheduler.setUsageCache([
+    { id: "aaaa1111-full", usage: usage(91) },
+    { id: "bbbb2222-idle", usage: usage(4) },
+    { id: "cccc3333-off", usage: usage(20) },
+  ])
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("bbbb2222-idle")
+
+  // ...naming the FULLEST one still hands it over. Rank has no vote once a human has chosen: the
+  // operator can see the same 91% we can, and may have a reason (a specific subscription's model
+  // access, say) that no utilization number encodes.
+  const named = scheduler.pickPreferred({ accounts, prefix: "aaaa1111" })
+  expect(named).toEqual({ ok: true, account: accounts[0] })
+
+  // `excluded` IS SERVABLE HERE, and that asymmetry with pickAccount is the design: the flag means
+  // "never AUTO-switch to this one", which is exactly the case a manual pick is not.
+  expect(scheduler.pickAccount({ accounts })?.id).not.toBe("cccc3333-off")
+  expect(scheduler.pickPreferred({ accounts, prefix: "cccc3333" })).toEqual({ ok: true, account: accounts[2] })
+
+  // A broken refresh chain is refused: the master cannot mint an access token for it at all, so
+  // "switching" would hand the worker nothing and strand the session.
+  expect(scheduler.pickPreferred({ accounts, prefix: "dddd4444" })).toEqual({ ok: false, refusal: "needs-reauth" })
+
+  // A spent account is refused too, even though its token is perfectly valid — the switch would
+  // "succeed" and the operator's very next request would 429.
+  scheduler.reportRateLimit("aaaa1111-full", clock + 60 * 60_000)
+  expect(scheduler.pickPreferred({ accounts, prefix: "aaaa1111" })).toEqual({ ok: false, refusal: "cooling" })
+
+  // Unknown, and ANTHROPIC-ONLY: the ChatGPT record is not merely deprioritised but unnameable, since
+  // a lease is written into the worker's `anthropic` auth entry (INV-M1).
+  expect(scheduler.pickPreferred({ accounts, prefix: "zzzz9999" })).toEqual({ ok: false, refusal: "unknown" })
+  expect(scheduler.pickPreferred({ accounts, prefix: "eeee5555" })).toEqual({ ok: false, refusal: "unknown" })
+
+  // Ambiguity is refused rather than resolved to the first match: the row the operator pressed and
+  // the account we would serve may be different ones, and switching to the wrong subscription
+  // silently is worse than not switching.
+  const twins = [account("ffff6666-one"), account("ffff6666-two")]
+  expect(scheduler.pickPreferred({ accounts: twins, prefix: "ffff6666" })).toEqual({ ok: false, refusal: "ambiguous" })
+})
+
+test("a named pick moves the rotation cursor but creates no affinity", () => {
+  const clock = 2_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => clock })
+  const accounts = [account("a"), account("b"), account("c")]
+
+  // Given no usage data at all, selection is pure round-robin from the last account handed out
+  expect(scheduler.pickPreferred({ accounts, prefix: "b" })).toEqual({ ok: true, account: accounts[1] })
+
+  // The next rotation continues from `b` — the account really was handed out, and a cursor left
+  // pointing at whoever preceded it would replay a stale turn order.
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("c")
+
+  // AND NOTHING IS STICKY. With a snapshot present, the very next renewal ranks by utilization like
+  // any other pick: the manual choice is not remembered, which is the documented no-affinity design
+  // (the operator is told as much when the switch succeeds).
+  scheduler.setUsageCache([
+    { id: "a", usage: usage(2) },
+    { id: "b", usage: usage(97) },
+    { id: "c", usage: usage(50) },
+  ])
+  expect(scheduler.pickPreferred({ accounts, prefix: "b" })).toEqual({ ok: true, account: accounts[1] })
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("a")
+})

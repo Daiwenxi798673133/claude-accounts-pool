@@ -1,4 +1,5 @@
 import { providerOf, type StoredAccount } from "../accounts.ts"
+import type { LeaseRefusal } from "../cloud/protocol.ts"
 import { MASTER_USAGE_POLL_INTERVAL_MS } from "../constants.ts"
 import { latestMaxedReset, PROVIDERS, scoreWindows } from "../providers.ts"
 import type { UsageResponse } from "../usage.ts"
@@ -16,6 +17,8 @@ import type { UsageResponse } from "../usage.ts"
 //
 // DELIBERATELY NO STICKINESS. There is no worker→account affinity anywhere in this file: the owner
 // chose maximum throughput (usage-based rotation) over prompt-cache locality. Do not add one.
+// pickPreferred is NOT an exception to that: it answers ONE request naming ONE account and remembers
+// nothing about who asked, so the very next renewal ranks by usage like every other pick.
 
 const COOLDOWN_KV_KEY = "claude-accounts-usage.master.cooldown"
 
@@ -56,8 +59,19 @@ export type PickInput = {
   exclude?: string
 }
 
+// What the operator's named account resolved to. A union rather than `StoredAccount | undefined`
+// because the caller must tell the four refusals apart to say anything useful about them.
+export type PreferredPick = { ok: true; account: StoredAccount } | { ok: false; refusal: LeaseRefusal }
+
+export type PreferredInput = {
+  accounts: StoredAccount[]
+  // The prefix as the usage view published it (UsageAccountView.idPrefix), not a full account id.
+  prefix: string
+}
+
 export type Scheduler = {
   pickAccount: (input: PickInput) => StoredAccount | undefined
+  pickPreferred: (input: PreferredInput) => PreferredPick
   reportRateLimit: (accountId: string, resetsAt?: number) => void
   setUsageCache: (entries: UsageSnapshotEntry[]) => void
   isCoolingDown: (accountId: string) => boolean
@@ -197,6 +211,36 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     return picked
   }
 
+  // The OPERATOR's pick, arriving as the prefix the usage view publishes. Deliberately NOT a branch
+  // inside pickAccount: that function's whole job is to rank and rotate, and a named account must do
+  // neither — the human has already decided.
+  //
+  // `excluded` IS NOT A REFUSAL HERE, unlike in pickAccount, and that asymmetry is the point: the
+  // flag means "never AUTO-switch to this one", so a human naming it in a panel is the exact case it
+  // does not cover. The other two flags are refusals because serving them cannot work: a cooling
+  // account's quota is spent (its token is fine, so the switch would "succeed" and the next turn
+  // would 429), and a needs-reauth account's refresh chain is broken, so no access can be minted.
+  function pickPreferred(input: PreferredInput): PreferredPick {
+    // ANTHROPIC-only through providerOf, exactly as pickAccount (INV-M1): a lease is written into the
+    // worker's `anthropic` auth entry, so a ChatGPT record must not be nameable through here either.
+    const matches = input.accounts.filter(
+      (account) => providerOf(account) === "anthropic" && account.id.startsWith(input.prefix),
+    )
+    if (matches.length === 0) return { ok: false, refusal: "unknown" }
+    // Refused, NOT resolved to the first match. Two accounts sharing a prefix means the row the
+    // operator pressed and the account we would serve may be different ones, and silently switching
+    // to the wrong subscription is worse than not switching at all.
+    if (matches.length > 1) return { ok: false, refusal: "ambiguous" }
+    const account = matches[0]
+    if (account.needsReauth === true) return { ok: false, refusal: "needs-reauth" }
+    if (isCoolingDown(account.id)) return { ok: false, refusal: "cooling" }
+    // The rotation cursor names whoever was handed out LAST, and that is now this account. Leaving it
+    // stale would make the next round-robin walk start from an account nobody holds. A cursor, not
+    // affinity: see the no-stickiness note at the top of this file.
+    lastPickedId = account.id
+    return { ok: true, account }
+  }
+
   function setUsageCache(entries: UsageSnapshotEntry[]): void {
     const byId = new Map<string, UsageResponse>()
     for (const entry of entries) byId.set(entry.id, entry.usage)
@@ -238,6 +282,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 
   return {
     pickAccount,
+    pickPreferred,
     reportRateLimit: (accountId: string, resetsAt?: number) => markCooldown(accountId, resetsAt),
     setUsageCache,
     isCoolingDown,

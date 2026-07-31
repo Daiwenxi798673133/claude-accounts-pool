@@ -87,7 +87,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-export function installLeaseKeeper(deps: LeaseKeeperDeps): { dispose: () => void; tickOnce: () => Promise<void> } {
+export function installLeaseKeeper(deps: LeaseKeeperDeps): {
+  dispose: () => void
+  tickOnce: () => Promise<void>
+  heldAccountId: () => string | undefined
+  adoptAccount: (accountId: string) => void
+} {
   const clock = deps.now ?? Date.now
   // Consecutive failed renewals, reset ONLY by a write that actually landed. A stale answer
   // counts as a failure: treating it as success would reset the backoff and hammer a broken
@@ -185,5 +190,16 @@ export function installLeaseKeeper(deps: LeaseKeeperDeps): { dispose: () => void
       clearInterval(interval)
     },
     tickOnce,
+    // Which account this worker holds, as the master last told us. THE ONLY PLACE THAT KNOWS: a lease
+    // writes access + expiry into auth.json and nothing else, and a worker deliberately never captures
+    // its tip into the account library — so neither file can answer this. The /usage panel needs it to
+    // mark a row "In Use".
+    heldAccountId: () => heldAccountId,
+    // A lease this loop did not perform (the operator switched by hand). Told so the next renewal's
+    // `currentAccountId` names the account we ACTUALLY hold instead of the one we left, which is what
+    // the master uses as its rotation anchor.
+    adoptAccount(accountId: string) {
+      heldAccountId = accountId
+    },
   }
 }
