@@ -8,15 +8,23 @@
 // rotate a real chain on a paid account, so there are no defaults anywhere in LeaseServerDeps.
 
 import type { StoredAccount } from "../accounts.ts"
-import type { ErrorBody, LeaseReason, LeaseRequest, LeaseResponse, RateLimitReport } from "../cloud/protocol.ts"
+import type { ErrorBody, LeaseReason, LeaseRequest, LeaseResponse, RateLimitReport, UsageSnapshotView } from "../cloud/protocol.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
+import { dashboardHtml } from "./dashboardHtml.ts"
+import type { UsageSnapshot } from "./scheduler.ts"
+import { buildUsageView } from "./usageView.ts"
 
 export type LeaseServerDeps = {
   scheduler: {
     pickAccount(input: { accounts: StoredAccount[]; exclude?: string }): StoredAccount | undefined
     reportRateLimit(accountId: string, resetsAt?: number): void
+    // The two READ-ONLY halves of the dashboard's payload. Required, not optional: a master serving
+    // leases without a usage view would answer the dashboard route with an empty page and look like
+    // a pool with no accounts.
+    getUsageSnapshot(): UsageSnapshot
+    isCoolingDown(accountId: string): boolean
   }
   refresher: { getFreshAccess(accountId: string): Promise<{ access: string; expiresAt: number }> }
   registry: { verify(authorizationHeader: string | null | undefined): string | undefined }
@@ -36,8 +44,17 @@ type RouteHandler = (req: Request) => Promise<Response>
 // KEY resolved to — it never has to (and never can) look for identity in the payload.
 type AuthedHandler = (req: Request, workerId: string) => Promise<Response>
 
-function json(status: number, body: ErrorBody | LeaseResponse | { ok: true }): Response {
+function json(status: number, body: ErrorBody | LeaseResponse | UsageSnapshotView | { ok: true }): Response {
   return Response.json(body, { status })
+}
+
+// `nosniff` because this is the ONE route answering with a document rather than JSON, and `no-store`
+// so an operator who upgrades the plugin is not left staring at the previous version's shell.
+function html(body: string): Response {
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" },
+  })
 }
 
 // A table keyed by LeaseReason rather than an `||` chain: adding a reason to the protocol becomes
@@ -188,6 +205,29 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     return new Response(null, { status: 204 })
   }
 
+  // READ-ONLY, and deliberately behind the SAME pool key as the two POSTs. The payload names every
+  // account in the pool and how much of each subscription is left — precisely the reconnaissance a
+  // stolen key wants — so it may not be public. It carries no token of any kind (enforced by the
+  // view's type, see usageView.ts), so what the key gates here is the ROSTER, not a credential.
+  // Serving it costs the upstream API nothing: this reads the usage poller's existing snapshot and
+  // never issues a request of its own, so refreshing the page cannot provoke `/api/oauth/usage`.
+  async function handleUsage(_req: Request, workerId: string): Promise<Response> {
+    const view = buildUsageView({
+      accounts: await deps.loadAccounts(),
+      snapshot: deps.scheduler.getUsageSnapshot(),
+      // Wrapped rather than passed by reference: the scheduler is an injected object here, and a
+      // detached method would break on any implementation that is not closure-based.
+      isCoolingDown: (accountId) => deps.scheduler.isCoolingDown(accountId),
+    })
+    log.debug("master:usage-served", { workerId, accounts: view.accounts.length, stale: view.stale })
+    return json(200, view)
+  }
+
+  // The STRING is built once (the shell is a constant), but each request gets a FRESH Response: a
+  // Response body is a single-use stream, so sharing one object would serve the first browser and
+  // then fail every reload after it.
+  const dashboardShell = dashboardHtml(CLOUD_ROUTES.usage)
+
   const routes: Record<Route, RouteHandler> = {
     // UNAUTHENTICATED BY DESIGN, and the only route that is. A worker probes this BEFORE it
     // trusts a master URL — possibly before it has been issued a pool key at all — and an ops
@@ -199,6 +239,11 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // "public" by forgetting to opt in.
     [CLOUD_ROUTES.lease]: (req) => authed(req, handleLease),
     [CLOUD_ROUTES.ratelimit]: (req) => authed(req, handleRateLimit),
+    [CLOUD_ROUTES.usage]: (req) => authed(req, handleUsage),
+    // The SECOND unauthenticated route, and the reason it is allowed to be one is the same as
+    // health's: it discloses nothing. The document is inert — no account, no number, no key — and
+    // the data it goes on to fetch is gated above. See the header on dashboardHtml.ts.
+    [CLOUD_ROUTES.dashboard]: async () => html(dashboardShell),
   }
 
   // A table lookup, not an if/else chain over paths: the chain's fallthrough silently answers an
