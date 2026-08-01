@@ -2,6 +2,14 @@
 
 存储模型、并发纪律、以及"为什么这么写"。模式相关的部分见 [local-mode.md](local-mode.md) 与 [cloud-mode.md](cloud-mode.md)。
 
+## 它在整个链路里的位置
+
+本插件**不接管**任何 auth provider:`anthropic` 条目仍由 [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth) 负责 OAuth 登录与请求注入,`openai` 条目仍由 OpenCode **自带的 codex 插件**负责登录与 token 刷新。插件只在工具层做"账号档案 + 切换 + 用量展示",因此与两者**共存**——装它不需要移除 ex-machina,也不需要改动 codex 那一侧的任何配置。
+
+这条边界不是客气,而是下面所有并发纪律的前提:槽位的刷新权归 provider 插件,插件自己只在**不与它们争抢**的时机动手(见「后台保活」与「并发与一致性」)。cloud 模式把 anthropic 侧的刷新权整个收到 master 上,靠的也是同一条边界——worker 手里根本没有可用的 refresh token,ex-machina 想抢也无从抢起。
+
+> 本仓是 [`Daiwenxi798673133/claude-accounts-usage`](https://github.com/Daiwenxi798673133/claude-accounts-usage) 的 fork,在其之上新增了 cloud 模式(账号池)。上游的单机功能全部保留且行为不变。
+
 ## 存储与收录
 
 - 账号档案保存在 `~/.config/opencode/claude-accounts.json`(权限 `0600`),每个账号含 OAuth `refresh` / `access` / `expires`、邮箱 `label`,以及来自 Anthropic profile 的账号 `uuid`。
@@ -25,6 +33,20 @@ cloud-master 模式下这个循环被替换成"刷新**全部**账号"——mast
 - **跨实例安全**:所有 token 的读改写都持有一把跨进程文件锁(`claude-accounts-usage.lock`,位于 auth.json 同目录),因此同时开多个 OpenCode 实例(TUI / `opencode serve`)也不会互相抢刷同一张一次性 refresh token 或覆盖彼此的轮换结果;极端争用下操作最多等锁 30 秒后诚实报错。锁文件名不可更改,原因见 [cloud-mode.md](cloud-mode.md#为什么内部标识符仍然叫-claude-accounts-usage)。
 - 每次写 `auth.json` 都是"读整个文件 → 只改自己那一个 provider 的条目 → 整体原子写回",其他 provider 的条目原样保留。写入前会**紧邻原子写再重读一次**,把与另一个写入者互相覆盖的窗口压到毫秒级。
 - 写 `auth.json` 的 anthropic 条目只有**唯一一个入口**。它支持两种写法:写入完整 token(含真实 refresh),或写入一份**租约**(access + expires + 哨兵 refresh)。加一种新写法会是编译错误,直到有人显式决定它怎么序列化。
+
+## 日志与排查
+
+插件日志写入 OpenCode 内建日志文件,每条都带 `claude-accounts-usage` 标记(包名改了但内部标识符刻意保留,[原因见此](cloud-mode.md#为什么内部标识符仍然叫-claude-accounts-usage)):
+
+```bash
+grep "claude-accounts-usage" ~/.local/share/opencode/log/opencode.log
+```
+
+想看更详细的 debug 级日志(比如限流检测的原始样本):启动 opencode 时加上 `OPENCODE_LOG_LEVEL=DEBUG`(或 `--log-level DEBUG`),并设环境变量 `CLAUDE_AUTOSWITCH_DEBUG=1`。两者配合才会输出 debug 级别的诊断信息。
+
+cloud 模式下 master 与 worker 各写各的日志,而且**只有 master 那一侧看得到选号与刷新**:worker 的日志里只有租约与撞限,查"为什么给我这个号"要去 master 上 grep。master 侧的每条租约日志都带一个 `workerId`,那是 worker 自己声明的标签(见 [cloud-mode.md](cloud-mode.md#workerid-只是一个日志标签)),用来把日志行归到机器上。
+
+提 issue 时:把相关日志行 grep 出来,贴到 <https://github.com/Daiwenxi798673133/claude-accounts-pool/issues>,并附上复现步骤。日志已对 token 做脱敏处理,但仍建议你粘贴前自查一遍,确认没有夹带敏感信息。
 
 ## 开发
 
