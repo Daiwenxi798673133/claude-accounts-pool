@@ -196,14 +196,14 @@ export function installCloudMaster(
       category: "Claude",
       slash: { name: "reg" },
       onSelect: () => {
-        const worker = registry.register()
-        // PRIVACY: `worker.poolKey` is a live bearer credential for this pool and reaches ONLY this
+        const worker = registry.register("tui")
+        // PRIVACY: `worker.key` is a live bearer credential for this pool and reaches ONLY this
         // toast — never a log line, never a file we write. registry.register already logged the
         // workerId, which is the entire diagnostic value; the key is deliberately unrecoverable
         // from anywhere on disk, so a log here would be the only copy an attacker needs.
         api.ui.toast({
           variant: "success",
-          message: `已注册 worker「${worker.workerId}」。pool key 仅显示这一次,请立即复制到该机器的 tui.json:${worker.poolKey}`,
+          message: `已注册 worker「${worker.workerId}」。pool key 仅显示这一次,请立即复制到该机器的 tui.json:${worker.key}`,
           duration: POOL_KEY_TOAST_MS,
         })
       },
