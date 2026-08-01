@@ -30,6 +30,7 @@ export type DashboardConfig = {
   throttleMs: number
   authorizeRoute: string
   addRoute: string
+  registerRoute: string
 }
 
 export function dashboardHtml(config: DashboardConfig): string {
@@ -303,6 +304,7 @@ export function dashboardHtml(config: DashboardConfig): string {
   var REFRESH_URL = "${config.refreshRoute}";
   var AUTHORIZE_URL = "${config.authorizeRoute}";
   var ADD_URL = "${config.addRoute}";
+  var REGISTER_URL = "${config.registerRoute}";
   var THROTTLE_MS = ${String(config.throttleMs)};
   var RELOAD_MS = 5000;
   var TICK_MS = 1000;
