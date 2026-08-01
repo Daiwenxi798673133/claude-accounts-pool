@@ -42,18 +42,16 @@ test("valid cloud-master config parses", () => {
   expect(badHost.reason).toContain("hostname")
 })
 
-test("cloud-worker requires masterUrl poolKey workerId", () => {
+test("cloud-worker requires masterUrl workerId", () => {
   expect(
     parseMode({
       mode: "cloud-worker",
       masterUrl: "http://10.0.0.2:8787",
-      poolKey: "secret",
       workerId: "laptop-1",
     }),
   ).toEqual({
     mode: "cloud-worker",
     masterUrl: "http://10.0.0.2:8787",
-    poolKey: "secret",
     workerId: "laptop-1",
   })
 
@@ -62,8 +60,6 @@ test("cloud-worker requires masterUrl poolKey workerId", () => {
     { patch: { masterUrl: "   " }, field: "masterUrl" },
     { patch: { masterUrl: "ftp://10.0.0.2" }, field: "masterUrl" },
     { patch: { masterUrl: "not a url" }, field: "masterUrl" },
-    { patch: { poolKey: "" }, field: "poolKey" },
-    { patch: { poolKey: 42 }, field: "poolKey" },
     { patch: { workerId: undefined }, field: "workerId" },
     { patch: { workerId: "  " }, field: "workerId" },
   ]
@@ -71,7 +67,6 @@ test("cloud-worker requires masterUrl poolKey workerId", () => {
     const got = parseMode({
       mode: "cloud-worker",
       masterUrl: "https://master.example",
-      poolKey: "secret",
       workerId: "laptop-1",
       ...patch,
     })
@@ -80,11 +75,11 @@ test("cloud-worker requires masterUrl poolKey workerId", () => {
     expect(got.reason).toContain(field)
   }
 
-  // All three missing at once names all three, so one restart fixes the whole config.
+  // Both missing at once names both, so one restart fixes the whole config.
   const none = parseMode({ mode: "cloud-worker" })
   expect(none.mode).toBe("invalid")
   if (none.mode !== "invalid") throw new Error("unreachable")
-  for (const field of ["masterUrl", "poolKey", "workerId"]) expect(none.reason).toContain(field)
+  for (const field of ["masterUrl", "workerId"]) expect(none.reason).toContain(field)
 })
 
 test("unknown mode yields invalid with reason", () => {

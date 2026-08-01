@@ -12,7 +12,6 @@ import { LEASE_BACKOFF_BASE_MS, LEASE_BACKOFF_CAP_MS, NETWORK_TIMEOUT_MS } from 
 import { log, redactBody, redactHeaders } from "../logger.ts"
 
 export type LeaseFailure =
-  | { kind: "auth" } // 401 — pool key rejected
   | { kind: "no-account" } // 503 — master has no account available
   | { kind: "refused"; refused: LeaseRefusal } // 409 — we NAMED an account the master will not serve
   | { kind: "unreachable"; detail: string } // network / retries exhausted
@@ -26,7 +25,6 @@ export type LeaseClientDeps = {
   fetchImpl: typeof fetch
   sleep: (ms: number) => Promise<void>
   masterUrl: string
-  poolKey: string
   workerId: string
 }
 
@@ -107,7 +105,7 @@ export function createLeaseClient(deps: LeaseClientDeps): {
   function requestInit(payload: LeaseRequest | RateLimitReport): RequestInit {
     return {
       method: "POST",
-      headers: { Authorization: `Bearer ${deps.poolKey}`, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       // Bounded so a black-holed connection cannot park the worker's renewal loop forever;
       // an abort surfaces as a transport fault and is retried like any other.
@@ -124,13 +122,8 @@ export function createLeaseClient(deps: LeaseClientDeps): {
       return RETRY(errorMessage(error))
     }
 
-    // 401 and 503 are ANSWERS, not symptoms: the pool key will not become valid by waiting,
-    // and a master that says "no account" has already consulted its full roster. Retrying
-    // either would burn the caller's recovery window on a verdict we already have.
-    if (res.status === 401) {
-      log.error("lease:auth-rejected", { status: res.status })
-      return DONE({ ok: false, failure: { kind: "auth" } })
-    }
+    // 503 is an ANSWER, not a symptom: a master that says "no account" has already consulted its
+    // full roster, so retrying would burn the caller's recovery window on a verdict we already have.
     if (res.status === 503) {
       log.warn("lease:no-account", { status: res.status })
       return DONE({ ok: false, failure: { kind: "no-account" } })

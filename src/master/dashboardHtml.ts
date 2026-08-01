@@ -30,7 +30,6 @@ export type DashboardConfig = {
   throttleMs: number
   authorizeRoute: string
   addRoute: string
-  registerRoute: string
 }
 
 export function dashboardHtml(config: DashboardConfig): string {
@@ -81,17 +80,13 @@ export function dashboardHtml(config: DashboardConfig): string {
   #meta { margin: 0; font-size: 15px; color: var(--text-2); }
   #meta.stale { color: var(--accent); font-weight: 600; }
   .actions { display: flex; align-items: center; gap: 12px; }
-  /* The two quiet siblings of #refresh, sharing ONE rule because they are the same statement of
-     rank: onboarding a machine and onboarding an account are both rare and both
-     destructive-adjacent, so neither may compete with the button an operator presses every visit.
-     #refresh stays the only accent-filled button on the page. */
-  #claim, #add { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
+  /* The quiet sibling of #refresh, and that is a statement of rank: onboarding an account is rare
+     and destructive-adjacent, so it may not compete with the button an operator presses every
+     visit. #refresh stays the only accent-filled button on the page. */
+  #add { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
          border: 1px solid var(--divider); border-radius: 999px; background: var(--card-bg);
          color: #3D3929; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
-  #claim:hover, #add:hover { background: #F0EEE6; border-color: #D3CFC3; }
-  /* The design tints the key glyph accent while leaving the label at text colour. A CSS declaration
-     rather than a stroke attribute, so the palette stays in the custom properties above. */
-  #claim svg { stroke: var(--accent); }
+  #add:hover { background: #F0EEE6; border-color: #D3CFC3; }
   #refresh { display: flex; align-items: center; gap: 8px; padding: 7px 14px; font: 500 13px/normal var(--sans);
              border: 1px solid var(--accent); border-radius: 999px; background: var(--accent);
              color: var(--card-bg); cursor: pointer; transition: background 120ms ease; }
@@ -204,14 +199,11 @@ export function dashboardHtml(config: DashboardConfig): string {
   .rule { height: 1px; background: var(--card-border); }
   .field { display: flex; flex-direction: column; gap: 8px; }
   .field label { font-size: 13px; font-weight: 500; color: #3D3929; }
-  #code, #wlabel { width: 100%; padding: 10px 13px; font-family: var(--mono); font-size: 13px;
+  #code { width: 100%; padding: 10px 13px; font-family: var(--mono); font-size: 13px;
           color: var(--text); background: #FFFFFF; border: 1px solid var(--divider);
           border-radius: 10px; outline: none;
           transition: border-color 120ms ease, box-shadow 120ms ease; }
-  #code:focus, #wlabel:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(193,95,60,0.12); }
-  /* The machine's name is the one thing typed in this flow, so it gets more room than a pasted
-     code does — and it is the string the operator will read back off a terminal. */
-  #wlabel { padding: 12px 14px; font-size: 15px; }
+  #code:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(193,95,60,0.12); }
   .hint { font-size: 12.5px; color: var(--text-3); line-height: 1.5; }
   .row { display: flex; align-items: center; gap: 10px; }
   /* Only ever filled from a status-code lookup, never from a response body, so a hostile upstream
@@ -225,61 +217,6 @@ export function dashboardHtml(config: DashboardConfig): string {
           width: 26px; height: 26px; border-radius: 50%; background: var(--accent);
           color: var(--card-bg); }
   #donetext { font-size: 14px; color: #3D3929; }
-
-  /* ── 领取 key stages, sharing the dialog above ────────────────────────────────────────────────
-     Every colour below resolves to a :root custom property already declared at the top of this
-     sheet, or to an rgba() of the accent — the same idiom #code:focus already uses. The design this
-     copies ships its own near-identical hex palette; a second set of literals would be two sources
-     of truth for one theme. */
-  /* The 480px shell fits a pasted code. It does NOT fit a 95-column bash command, and wrapping that
-     command mid-flag is what makes a copy-paste block unreadable. Applied per FLOW, not globally,
-     so the 添加账号 dialog keeps the width it was designed at. */
-  #dialog.wide { max-width: 680px; }
-  #d-key { gap: 22px; }
-  .row.end { justify-content: flex-end; }
-  .mono { font-family: var(--mono); }
-  .keyrow { display: flex; align-items: stretch; gap: 10px; }
-  /* nowrap + overflow-x, never wrapping: a 43-character secret broken across two lines invites a
-     partial selection, and a partial pool key fails with an indistinguishable 401. */
-  #poolkey { flex: 1; min-width: 0; display: flex; align-items: center; padding: 0 14px;
-             height: 42px; border: 1px solid var(--divider); border-radius: 10px;
-             background: #FFFFFF; font-family: var(--mono); font-size: 14px; color: var(--text);
-             overflow-x: auto; white-space: nowrap; }
-  #copykey { flex: 0 0 auto; align-self: stretch; border-radius: 10px; }
-  .cmdblock { display: flex; flex-direction: column; gap: 10px; }
-  .cmdcap { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
-  .linkish { padding: 0; border: none; background: none; font: 13px/normal var(--sans);
-             color: var(--accent); cursor: pointer; }
-  .linkish:hover { text-decoration: underline; }
-  .codebox { border: 1px solid var(--card-border); border-radius: 12px; background: #FFFFFF;
-             overflow: hidden; }
-  .codehead { display: flex; align-items: center; justify-content: space-between; gap: 12px;
-              padding: 8px 10px 8px 16px; border-bottom: 1px solid var(--card-border);
-              background: var(--page-bg); }
-  .codehead .mono { font-size: 12px; color: var(--text-3); }
-  .pill.tiny { align-self: auto; padding: 5px 14px; font-size: 12.5px; border-radius: 8px; }
-  /* pre-wrap, not pre: the block must stay copyable as ONE command, so its newlines are real and
-     its overlong first line has to fold rather than scroll out of sight. */
-  .codebox pre { margin: 0; padding: 16px 18px; font-family: var(--mono); font-size: 12.5px;
-                 line-height: 1.8; color: #3D3929; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .detail { display: flex; flex-direction: column; gap: 16px; padding: 20px;
-            border: 1px solid var(--card-border); border-radius: 12px; background: var(--chip-bg); }
-  /* Needed for the same reason .stage[hidden] is: the display above outranks the UA's [hidden]. */
-  .detail[hidden] { display: none; }
-  .dfile { display: flex; flex-direction: column; gap: 8px; }
-  .dfile code { font-family: var(--mono); font-size: 12.5px; color: #3D3929; }
-  .dfile pre { margin: 0; padding: 14px 16px; border: 1px solid var(--card-border);
-               border-radius: 10px; background: #FFFFFF; font-family: var(--mono); font-size: 12px;
-               line-height: 1.75; color: #3D3929; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .warns { display: flex; flex-direction: column; gap: 12px; padding: 18px 20px;
-           border: 1px solid rgba(193,95,60,0.28); border-radius: 12px;
-           background: rgba(193,95,60,0.05); }
-  .warn { display: flex; gap: 12px; font-size: 13.5px; line-height: 1.6; color: #3D3929; }
-  .warn .wn { flex: 0 0 auto; font-family: var(--mono); color: var(--accent); }
-  .warn code { font-family: var(--mono); }
-  /* Same rule as #derr, and the same reason: filled ONLY from a status-code lookup. */
-  #cerr { font-size: 13px; color: var(--accent); font-weight: 600; line-height: 1.5; }
-  #cerr[hidden] { display: none; }
 
   @media (max-width: 640px) {
     body { padding: 32px 20px 56px; }
@@ -297,10 +234,6 @@ export function dashboardHtml(config: DashboardConfig): string {
       <p id="meta">加载中…</p>
     </div>
     <div class="actions">
-      <button id="claim" type="button">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8.5" cy="15.5" r="4"></circle><path d="M11.4 12.6 20.5 3.5"></path><path d="M16.8 7.2l2.6 2.6"></path></svg>
-        <span>领取 key</span>
-      </button>
       <button id="add" type="button">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 3.2v9.6"></path><path d="M3.2 8h9.6"></path></svg>
         <span>添加账号</span>
@@ -312,7 +245,7 @@ export function dashboardHtml(config: DashboardConfig): string {
     </div>
   </header>
   <div id="rows"></div>
-  <footer>本页不展示任何 token 明文。「领取 key」只向 registry 新签发一把 worker key（库里只存 SHA-256 摘要），「添加账号」只向池中新增账号，都不会切号或删号。</footer>
+  <footer>本页不展示任何 token 明文。「添加账号」只向池中新增账号，不会切号或删号。</footer>
 </div>
 <div id="veil" hidden>
   <div id="dialog" role="dialog" aria-modal="true" aria-labelledby="dtitle">
@@ -356,64 +289,6 @@ export function dashboardHtml(config: DashboardConfig): string {
         <button id="close2" class="pill" type="button">关闭</button>
       </div>
     </div>
-    <div id="d-claim" class="stage" hidden>
-      <div class="field">
-        <label class="cap" for="wlabel">WORKER 标签</label>
-        <input id="wlabel" type="text" spellcheck="false" autocomplete="off" placeholder="vince-laptop">
-        <span class="hint mono">a-z 0-9 - · 建议用主机名</span>
-      </div>
-      <p id="cerr" hidden></p>
-      <div class="row end">
-        <button id="ccancel" class="pill" type="button">取消</button>
-        <button id="issue" class="pill primary" type="button" disabled>
-          <span class="spin" aria-hidden="true"></span>
-          <span id="issuelabel">签发 key</span>
-        </button>
-      </div>
-    </div>
-    <div id="d-key" class="stage" hidden>
-      <div class="urlbox">
-        <span class="cap">pool key · 43 字符</span>
-        <div class="keyrow">
-          <code id="poolkey"></code>
-          <button id="copykey" class="pill" type="button"><span id="copykeylabel">复制 key</span></button>
-        </div>
-      </div>
-      <div class="cmdblock">
-        <div class="cmdcap">
-          <span class="cap">一键配置命令</span>
-          <button id="expand" class="linkish" type="button">展开查看命令改了什么</button>
-        </div>
-        <div class="codebox">
-          <div class="codehead">
-            <span class="mono">bash</span>
-            <button id="copycmd" class="pill primary tiny" type="button"><span id="copycmdlabel">复制命令</span></button>
-          </div>
-          <pre id="cmd"></pre>
-        </div>
-        <span class="hint">需要 bun。dist/ 不入库，所以要本机 clone + build。脚本幂等，重复执行会替换旧条目而不是追加。</span>
-      </div>
-      <div id="detail" class="detail" hidden>
-        <span class="hint">脚本只做幂等 merge，改动这两个文件：</span>
-        <div class="dfile">
-          <code>~/.config/opencode/opencode.json</code>
-          <pre id="occonf"></pre>
-        </div>
-        <div class="dfile">
-          <code>~/.config/opencode/tui.json</code>
-          <pre id="tuiconf"></pre>
-        </div>
-        <div class="row end"><button id="collapse" class="linkish" type="button">收起</button></div>
-      </div>
-      <div class="warns">
-        <div class="warn"><span class="wn">1</span><span>改完配置要<b>完全退出并重新打开 OpenCode</b>，热重载不生效。</span></div>
-        <div class="warn"><span class="wn">2</span><span><b>不要在这台机器上登录 Claude</b>（别执行 <code>opencode auth login</code> 选 Anthropic）。worker 永不持有 refresh token，装 ex-machina 只为请求注入。池外多一个刷新者会当场击毙所有在外租约。</span></div>
-        <div class="warn"><span class="wn">3</span><span><b>key 明文只出现这一次</b>，库里只存 SHA-256。关掉弹窗就找不回来了，找不回来就重新领一把。</span></div>
-      </div>
-      <div class="row end">
-        <button id="keydone" class="pill primary" type="button">我已复制，关闭</button>
-      </div>
-    </div>
   </div>
 </div>
 <script>
@@ -423,7 +298,6 @@ export function dashboardHtml(config: DashboardConfig): string {
   var REFRESH_URL = "${config.refreshRoute}";
   var AUTHORIZE_URL = "${config.authorizeRoute}";
   var ADD_URL = "${config.addRoute}";
-  var REGISTER_URL = "${config.registerRoute}";
   var THROTTLE_MS = ${String(config.throttleMs)};
   var RELOAD_MS = 5000;
   var TICK_MS = 1000;
@@ -686,19 +560,12 @@ export function dashboardHtml(config: DashboardConfig): string {
   // that drives it is the server's: a 400 is recoverable and keeps the pasted value on screen, while
   // 410 and 502 mean this PKCE session is spent and only a new link can help.
   var veil = document.getElementById("veil");
-  var dialog = document.getElementById("dialog");
-  var dtitle = document.getElementById("dtitle");
   var dsub = document.getElementById("dsub");
-  // ONE map, two flows. Both are launched from the same toolbar so they can never be open at once,
-  // which is what lets them share this shell — and with it a single Escape handler, a single
-  // backdrop handler and a single close path, instead of two of each that drift apart.
   var stages = {
     loading: document.getElementById("d-loading"),
     ready: document.getElementById("d-ready"),
     done: document.getElementById("d-done"),
-    fatal: document.getElementById("d-fatal"),
-    claim: document.getElementById("d-claim"),
-    key: document.getElementById("d-key")
+    fatal: document.getElementById("d-fatal")
   };
   var authAnchor = document.getElementById("authurl");
   var codeInput = document.getElementById("code");
@@ -709,27 +576,12 @@ export function dashboardHtml(config: DashboardConfig): string {
   var errorLine = document.getElementById("derr");
   var doneText = document.getElementById("donetext");
   var fatalMessage = document.getElementById("fatalmsg");
-  var labelInput = document.getElementById("wlabel");
-  var issueButton = document.getElementById("issue");
-  var issueLabel = document.getElementById("issuelabel");
-  var claimError = document.getElementById("cerr");
-  var keyText = document.getElementById("poolkey");
-  var cmdBlock = document.getElementById("cmd");
-  var detailPanel = document.getElementById("detail");
-  var expandLink = document.getElementById("expand");
-  var ocConfig = document.getElementById("occonf");
-  var tuiConfig = document.getElementById("tuiconf");
 
   var SUBTITLES = {
     loading: "正在准备 OAuth 授权，请稍候。",
     ready: "打开链接完成登录授权，然后把返回的 code 粘贴回来。",
     done: "添加成功。",
-    fatal: "本次授权没有完成。",
-    claim: "给这台机器起一个标签。它同时是 registry 里的 label 和 tui.json 里的 workerId，只填一次。",
-    // The only DYNAMIC subtitle — it names the label the server accepted — so showStage cannot own
-    // it. Blank here rather than absent so the lookup below still finds a value, and overwritten by
-    // showKey() immediately after the stage is shown.
-    key: ""
+    fatal: "本次授权没有完成。"
   };
   // Keyed by STATUS, never by the response body: the body's error field is a machine-readable reason
   // for the log, and echoing a server string into the DOM is the habit this page exists without.
@@ -741,20 +593,11 @@ export function dashboardHtml(config: DashboardConfig): string {
   };
   // 410 and 502 are terminal for the session; everything else leaves the operator on the form.
   var FATAL_STATUS = { 410: true, 502: true };
-  // Keyed by STATUS for the same reason ADD_ERRORS is, and each string says what to DO next, which
-  // is the one thing the three statuses genuinely differ on: 400 means fix the label, 429 means
-  // wait, and 409 means waiting will not help — a key has to be retired or expire first.
-  var CLAIM_ERRORS = {
-    400: "这个标签没有被接受：只能用 a-z、0-9、- 和 _，最多 32 个字符。",
-    409: "registry 已满（32 把在用的 key）。等下去没有用——要先让一把旧 key 过期或被清掉，才能再签发。",
-    429: "签发太频繁，请稍候再试。"
-  };
 
   var addStage = "loading";
   var pendingId = "";
   var submitting = false;
   var closeTimer = 0;
-  var issuing = false;
 
   function showStage(name) {
     addStage = name;
@@ -780,15 +623,6 @@ export function dashboardHtml(config: DashboardConfig): string {
     veil.hidden = true;
     pendingId = "";
     submitting = false;
-    issuing = false;
-    // The plaintext pool key does not outlive the dialog that showed it. It is unrecoverable by
-    // design — the registry keeps only a SHA-256 digest — so leaving it parked in the DOM of a tab
-    // the operator believes they have closed is the one way this page could keep a live credential
-    // sitting around for whoever opens devtools next.
-    keyText.textContent = "";
-    cmdBlock.textContent = "";
-    ocConfig.textContent = "";
-    tuiConfig.textContent = "";
   }
 
   // Asks for a fresh PKCE session every time the dialog opens. Deliberately NOT cached across opens:
@@ -797,10 +631,6 @@ export function dashboardHtml(config: DashboardConfig): string {
   function beginAdd() {
     clearTimeout(closeTimer);
     veil.hidden = false;
-    // Both written on entry rather than left to the markup, because the shell is shared now: the
-    // other flow retitles the dialog and widens it, and whichever opens second has to undo that.
-    dialog.className = "";
-    dtitle.textContent = "添加 anthropic 账号";
     pendingId = "";
     submitting = false;
     codeInput.value = "";
@@ -851,13 +681,9 @@ export function dashboardHtml(config: DashboardConfig): string {
     return ok;
   }
 
-  // One descriptor per copy button: which label to flash, the word to put back, which node to
-  // select when the copy could not be performed, and its OWN restore timer. The timer has to be
-  // per-button rather than one shared variable, because the issued-key stage shows two of these at
-  // once — pressing the second would otherwise cancel the first's restore and strand it on 已复制.
+  // The copy button's descriptor: which label to flash, the word to put back, which node to select
+  // when the copy could not be performed, and the timer that restores the label.
   var URL_COPY = { label: copyLabel, idle: "复制链接", select: authAnchor, timer: 0 };
-  var KEY_COPY = { label: document.getElementById("copykeylabel"), idle: "复制 key", select: keyText, timer: 0 };
-  var CMD_COPY = { label: document.getElementById("copycmdlabel"), idle: "复制命令", select: cmdBlock, timer: 0 };
 
   function flashCopied(target, ok) {
     // On failure the source node is selected instead, so the operator always has a way out: the
@@ -940,163 +766,10 @@ export function dashboardHtml(config: DashboardConfig): string {
       });
   }
 
-  // ── 领取 key ──────────────────────────────────────────────────────────────────────────────────
-  // Two stages over the one register route: name the machine, then read the credential back once.
-  // There is no third stage on purpose — the route either mints a key or refuses with a status, and
-  // every refusal leaves the operator on the form with something they can act on.
-
-  // The client-side half of the server's /^[a-z0-9_-]{1,32}$/, run on INPUT rather than on submit.
-  // That placement is the whole design: the server stamps its 10-second window BEFORE it parses the
-  // body, so a rejected label still burns the window — type a bad name, press again, and the second
-  // press earns a 429 rather than a second chance. Making an invalid label unsubmittable is what
-  // keeps that from being reachable. The dash sits LAST in the class so it is a literal character
-  // and not the 9-through-underscore RANGE it would be in the middle.
-  function sanitizeLabel(raw) {
-    return raw.replace(/[^A-Za-z0-9_-]/g, "").toLowerCase().slice(0, 32);
-  }
-
-  function buildCommand(key, label) {
-    // --master comes from location.origin, NEVER from a configured hostname. The master's bind
-    // address is routinely 127.0.0.1 while the operator reached this box by its tailnet name, so a
-    // plumbed-through value would print a command that cannot work; the origin is by construction
-    // the URL that just answered. Each line but the last ends in a bash line-continuation so the
-    // block pastes as ONE command — in this document's source that backslash is written twice
-    // because the page is emitted from a TS template literal, and the emitted string holds one.
-    return [
-      "git clone --depth 1 https://github.com/Daiwenxi798673133/claude-accounts-pool.git ~/.claude-accounts-pool \\\\",
-      "  && cd ~/.claude-accounts-pool && bun install && bun run build \\\\",
-      "  && bun run scripts/configure-worker.ts \\\\",
-      "       --master " + location.origin + " \\\\",
-      "       --key " + key + " \\\\",
-      "       --worker " + label
-    ].join("\\n");
-  }
-
-  // JSON.stringify rather than a hand-assembled block: this panel's entire claim is "here is what
-  // the file will look like", and a stringify cannot emit the invalid JSON that concatenating a key
-  // and a label into a literal can.
-  function writeConfigs(key, label) {
-    ocConfig.textContent = JSON.stringify({
-      "$schema": "https://opencode.ai/config.json",
-      plugin: ["@ex-machina/opencode-anthropic-auth"]
-    }, null, 2);
-    tuiConfig.textContent = JSON.stringify({
-      "$schema": "https://opencode.ai/tui.json",
-      plugin: [["~/.claude-accounts-pool/dist/tui.js", {
-        mode: "cloud-worker",
-        masterUrl: location.origin,
-        poolKey: key,
-        workerId: label
-      }]]
-    }, null, 2);
-  }
-
-  function setDetail(open) {
-    detailPanel.hidden = !open;
-    // The link and the panel are one control in two states, so the link leaves while the panel is
-    // up — the way back is 收起 at the bottom of the panel itself.
-    expandLink.hidden = open;
-  }
-
-  function setClaimError(text) {
-    claimError.textContent = text;
-    claimError.hidden = !text;
-  }
-
-  function syncIssue() {
-    issueButton.disabled = issuing || labelInput.value.length === 0;
-    issueButton.className = issuing ? "pill primary busy" : "pill primary";
-    issueLabel.textContent = issuing ? "签发中…" : "签发 key";
-  }
-
-  function beginClaim() {
-    clearTimeout(closeTimer);
-    veil.hidden = false;
-    dialog.className = "wide";
-    dtitle.textContent = "领取 worker key";
-    issuing = false;
-    labelInput.value = "";
-    setClaimError("");
-    showStage("claim");
-    syncIssue();
-    labelInput.focus();
-  }
-
-  // textContent throughout, including for the label — which arrived from an input field and is the
-  // one value on this stage that did not originate in this codebase.
-  function showKey(payload) {
-    dtitle.textContent = "key 已签发";
-    keyText.textContent = payload.poolKey;
-    cmdBlock.textContent = buildCommand(payload.poolKey, payload.label);
-    writeConfigs(payload.poolKey, payload.label);
-    KEY_COPY.label.textContent = KEY_COPY.idle;
-    CMD_COPY.label.textContent = CMD_COPY.idle;
-    setDetail(false);
-    showStage("key");
-    // Written after showStage, which blanks it: this is the one subtitle SUBTITLES cannot hold.
-    dsub.textContent = "worker " + payload.label + " · 明文只出现这一次";
-  }
-
-  function issueKey() {
-    if (issuing) return;
-    var label = labelInput.value;
-    if (!label) return;
-    issuing = true;
-    setClaimError("");
-    syncIssue();
-    fetch(REGISTER_URL, {
-      method: "POST",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label: label })
-    })
-      .then(function (res) {
-        if (res.ok) return res.json();
-        // The 429 body is the only one read, and only for its number, exactly as the add flow does
-        // it. The fallback matches the server's own window, so erring here still names a real wait.
-        if (res.status === 429) {
-          return res.json().catch(function () { return null; }).then(function (body) {
-            var wait = body && typeof body.retryAfterMs === "number" && body.retryAfterMs > 0 ? body.retryAfterMs : 10000;
-            throw { status: 429, waitMs: wait };
-          });
-        }
-        throw { status: res.status };
-      })
-      .then(showKey)
-      .catch(function (failure) {
-        var status = failure && failure.status;
-        if (status === 429) {
-          setClaimError(CLAIM_ERRORS[429] + "（约 " + Math.ceil(failure.waitMs / 1000) + " 秒）");
-          return;
-        }
-        setClaimError(status && owns.call(CLAIM_ERRORS, status) ? CLAIM_ERRORS[status] : "签发失败：" + (failure && failure.message ? failure.message : "网络错误"));
-      })
-      .then(function () {
-        issuing = false;
-        syncIssue();
-      });
-  }
-
   document.getElementById("add").addEventListener("click", beginAdd);
   document.getElementById("cancel").addEventListener("click", closeDialog);
   document.getElementById("close2").addEventListener("click", closeDialog);
   document.getElementById("retry").addEventListener("click", beginAdd);
-  document.getElementById("claim").addEventListener("click", beginClaim);
-  document.getElementById("ccancel").addEventListener("click", closeDialog);
-  document.getElementById("keydone").addEventListener("click", closeDialog);
-  document.getElementById("collapse").addEventListener("click", function () { setDetail(false); });
-  document.getElementById("copykey").addEventListener("click", function () { copyText(keyText.textContent, KEY_COPY); });
-  document.getElementById("copycmd").addEventListener("click", function () { copyText(cmdBlock.textContent, CMD_COPY); });
-  expandLink.addEventListener("click", function () { setDetail(true); });
-  issueButton.addEventListener("click", issueKey);
-  labelInput.addEventListener("input", function () {
-    labelInput.value = sanitizeLabel(labelInput.value);
-    setClaimError("");
-    syncIssue();
-  });
-  labelInput.addEventListener("keydown", function (event) {
-    if (event.key === "Enter") issueKey();
-  });
   copyButton.addEventListener("click", function () { copyText(authAnchor.textContent, URL_COPY); });
   submitButton.addEventListener("click", submitCode);
   codeInput.addEventListener("input", function () {

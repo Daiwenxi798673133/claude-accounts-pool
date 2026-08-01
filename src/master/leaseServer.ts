@@ -1,7 +1,16 @@
 // The master's HTTP face: the ONLY door through which a worker machine can obtain an Anthropic
-// access token. It owns no policy of its own — scheduling, refreshing and key verification are
-// injected — so what is actually implemented here is the WIRE CONTRACT: which route answers
-// which status, and in what order the checks run.
+// access token. It owns no policy of its own — scheduling and refreshing are injected — so what is
+// actually implemented here is the WIRE CONTRACT: which route answers which status, and in what
+// order the checks run.
+//
+// THERE IS NO APPLICATION-LAYER CREDENTIAL ON THIS SERVER. Every route below is reachable by anyone
+// who can reach the port, so THE BIND ADDRESS IS THE ENTIRE ACCESS CONTROL: the operator points
+// `hostname` at a private interface (a Tailscale address, a VPN, loopback) and the network decides
+// who may lease. A bearer token in front of `lease` would be theatre unless the route that issues it
+// is itself gated — and gating that route is the same problem again, one layer up.
+//
+// SO: never add a route here on the assumption that something upstream authenticates the caller, and
+// never widen the bind address to reach one more machine. Nothing else is standing behind it.
 //
 // Everything below is dependency-injected for one reason: the real refresher POSTs a live,
 // one-time-use refresh token at Anthropic. A default-constructed collaborator in a test would
@@ -21,15 +30,12 @@ import type {
   RateLimitReport,
   ThrottledBody,
   UsageSnapshotView,
-  WorkerRegisterRequest,
-  WorkerRegisterResponse,
 } from "../cloud/protocol.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
-import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS, REGISTER_MAX_LIVE_KEYS, REGISTER_MIN_INTERVAL_MS } from "../constants.ts"
+import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
 import type { AccountOnboard } from "./accountOnboard.ts"
 import { dashboardHtml } from "./dashboardHtml.ts"
-import type { PoolKeySummary, RegisteredWorker } from "./registry.ts"
 import type { PreferredInput, PreferredPick, UsageSnapshot } from "./scheduler.ts"
 import { buildUsageView } from "./usageView.ts"
 
@@ -47,16 +53,6 @@ export type LeaseServerDeps = {
     isCoolingDown(accountId: string): boolean
   }
   refresher: { getFreshAccess(accountId: string): Promise<{ access: string; expiresAt: number }> }
-  registry: {
-    verify(authorizationHeader: string | null | undefined): string | undefined
-    // Self-service minting, for the KEYLESS registration route. Returns the plaintext key exactly
-    // once — the registry keeps only its digest — so its value may travel no further than the one
-    // response body that route writes.
-    register(label: string): RegisteredWorker
-    // Read-only, and consulted for one thing: the REGISTER_MAX_LIVE_KEYS ceiling, which is the bound
-    // that keeps an anonymous mint loop from growing the kv without limit.
-    list(): PoolKeySummary[]
-  }
   loadAccounts: () => Promise<StoredAccount[]>
   // Runs ONE usage sweep and resolves when the snapshot has been handed to the scheduler — the usage
   // poller's own tickOnce. Injected as a bare thunk so this server never learns what a poller is, and
@@ -79,9 +75,6 @@ export type LeaseServerDeps = {
 
 type Route = (typeof CLOUD_ROUTES)[keyof typeof CLOUD_ROUTES]
 type RouteHandler = (req: Request) => Promise<Response>
-// Auth happens before the body is touched, so an authenticated handler is handed the workerId the
-// KEY resolved to — it never has to (and never can) look for identity in the payload.
-type AuthedHandler = (req: Request, workerId: string) => Promise<Response>
 
 function json(
   status: number,
@@ -93,7 +86,6 @@ function json(
     | LeaseRefusedBody
     | AuthorizeStartResponse
     | AccountAddResponse
-    | WorkerRegisterResponse
     | { ok: true },
 ): Response {
   return Response.json(body, { status })
@@ -129,10 +121,7 @@ async function readJson(req: Request): Promise<unknown> {
 function parseLeaseRequest(raw: unknown): LeaseRequest | undefined {
   if (typeof raw !== "object" || raw === null) return undefined
   const { workerId, reason, currentAccountId, preferredAccountIdPrefix } = raw as Record<string, unknown>
-  // `workerId` is validated to keep the wire contract honest (a client omitting it is
-  // mismatched, and failing loudly at the boundary beats accepting a half-formed request) and is
-  // then DELIBERATELY never read again: see handleLease.
-  if (typeof workerId !== "string") return undefined
+  if (!isWorkerLabel(workerId)) return undefined
   // Strict, because this field decides whether an account is excluded from the pick. An unknown
   // reason silently defaulting to `prelease` would re-issue the spent account to a worker that
   // just hit its limit — the one outcome the ratelimit path exists to prevent.
@@ -175,7 +164,7 @@ function parseHeaderMap(value: unknown): Record<string, string> {
 function parseRateLimitReport(raw: unknown): RateLimitReport | undefined {
   if (typeof raw !== "object" || raw === null) return undefined
   const { workerId, accountId, headers, resetsAt } = raw as Record<string, unknown>
-  if (typeof workerId !== "string") return undefined
+  if (!isWorkerLabel(workerId)) return undefined
   // The ONE field the cooldown cannot be applied without.
   if (typeof accountId !== "string" || accountId.length === 0) return undefined
   return {
@@ -204,26 +193,16 @@ function parseAccountAddRequest(raw: unknown): AccountAddRequest | undefined {
   return { pendingId, code: trimmed }
 }
 
-// EXACTLY THE IMAGE OF THE BROWSER'S OWN SANITISER, which strips [^A-Za-z0-9-_], lowercases, and caps
-// the field at 32 characters. Deliberately not one character wider and not one narrower: matching it
-// means nothing the dashboard can produce is refused by the server (a page whose valid input earns a
-// 400 is a page that looks broken), while everything it CANNOT produce is refused — and that second
-// half is the point, because this route is keyless, the label is persisted, and it is rendered back
-// on the UNAUTHENTICATED usage page. Arbitrary text here would be an anonymous write into a surface
-// the operator reads. The `{1,32}` lower bound also makes an empty label malformed without a separate
-// check: a machine with no name is a request that named nothing.
-const WORKER_LABEL_PATTERN = /^[a-z0-9_-]{1,32}$/
+// `workerId` is a SELF-DECLARED label — nothing authenticates it, so it names the machine only as
+// well as that machine cares to be named honestly. It is narrowed here because it is the one field
+// on this wire that reaches the LOG FILE: a control character would forge a line break and let a
+// caller write arbitrary fake entries into the operator's log, and an unbounded string would let one
+// request fill the disk. The character class is deliberately wider than a hostname's (case is kept)
+// so an existing worker's configured id is not refused by a narrowing it never agreed to.
+const WORKER_LABEL_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
 
-function parseWorkerRegisterRequest(raw: unknown): WorkerRegisterRequest | undefined {
-  if (typeof raw !== "object" || raw === null) return undefined
-  const { label } = raw as Record<string, unknown>
-  if (typeof label !== "string") return undefined
-  // Trimmed for the same reason a pasted code is: surrounding whitespace is an artefact of how the
-  // operator moved the value, not part of the machine's name. Tested AFTER the trim, so "  laptop  "
-  // registers as `laptop` and an all-whitespace field is an empty one.
-  const trimmed = label.trim()
-  if (!WORKER_LABEL_PATTERN.test(trimmed)) return undefined
-  return { label: trimmed }
+function isWorkerLabel(value: unknown): value is string {
+  return typeof value === "string" && WORKER_LABEL_PATTERN.test(value)
 }
 
 // One forced sweep per this window, server-wide. NOT per caller: what it protects is the master's
@@ -238,32 +217,18 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
   // Seeded at 0, not at startup: the first press after a master boots is the one most worth serving —
   // the scheduled poller has not swept yet, so the dashboard is empty until it does.
   let lastForcedSweepAt = 0
-  // Same seeding, same reason: the registration right after a master boots is usually the operator
-  // onboarding their own machine, and making them wait out a window for it would be pure ceremony.
-  let lastRegisterAt = 0
 
   function badRequest(detail: string): Response {
     return json(400, { error: detail })
   }
 
-  async function authed(req: Request, next: AuthedHandler): Promise<Response> {
-    const workerId = deps.registry.verify(req.headers.get("authorization"))
-    if (workerId === undefined) {
-      // Never log the presented credential — not even a prefix — and never distinguish "absent"
-      // from "wrong" in the response: one uniform refusal keeps this network-reachable endpoint
-      // from becoming an oracle that confirms a guessed key.
-      log.warn("master:lease-denied", { path: new URL(req.url).pathname })
-      return json(401, { error: "invalid pool key" })
-    }
-    return next(req, workerId)
-  }
-
-  async function handleLease(req: Request, workerId: string): Promise<Response> {
+  async function handleLease(req: Request): Promise<Response> {
     // Parsed BEFORE the roster is loaded: a malformed body is the caller's fault and must cost
     // the master nothing. A parse fault is answered 400 and never allowed to escape as a 500,
     // which the worker client would treat as a transient fault and retry verbatim, forever.
     const request = parseLeaseRequest(await readJson(req))
     if (!request) return badRequest("malformed lease request")
+    const { workerId } = request
     const accounts = await deps.loadAccounts()
     // A NAMED account short-circuits selection completely. `reason` still says why the worker is
     // asking, but it no longer influences WHICH account is served — the operator pressed a row.
@@ -324,18 +289,16 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       log.warn("master:lease-horizon-spent", { workerId, accountId: account.id, expiresAt })
       return json(503, { error: "no account available" })
     }
-    // IDENTITY COMES FROM THE KEY. `request.workerId` is a client-supplied string that anyone
-    // holding any valid key could forge, so the authenticated `workerId` is what gets logged and
-    // the body's copy is never consulted for anything.
     // PRIVACY: `fresh.access` is a live credential and must NEVER reach the log file; the account
     // id and the expiry carry the entire diagnostic value anyway.
     log.info("master:lease-served", { workerId, accountId: account.id, expiresAt })
     return json(200, { accountId: account.id, access: fresh.access, expiresAt })
   }
 
-  async function handleRateLimit(req: Request, workerId: string): Promise<Response> {
+  async function handleRateLimit(req: Request): Promise<Response> {
     const report = parseRateLimitReport(await readJson(req))
     if (!report) return badRequest("malformed ratelimit report")
+    const { workerId } = report
     deps.scheduler.reportRateLimit(report.accountId, report.resetsAt)
     // Header KEYS only, via redactHeaders: the worker forwards the limit response's headers
     // verbatim, and echoing values into a shared log file is how a credential-bearing header
@@ -450,54 +413,6 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     return json(410, { error: outcome.reason })
   }
 
-  // Self-service pool-key minting — see the decision recorded on CLOUD_ROUTES.workerRegister. This is
-  // the only KEYLESS route on this server that hands back a CREDENTIAL, so the checks below run
-  // cheapest-refusal-first: the two bounds that stand in for the key are settled before the body is
-  // even read, which is what makes a flood cost this master a method compare and a subtraction.
-  async function handleWorkerRegister(req: Request): Promise<Response> {
-    // POST-only for the same reason the other two write routes are, and most load-bearing here: a
-    // link unfurler speculatively fetching a pasted dashboard URL must not be able to mint a working
-    // pool key and leave it in a preview cache.
-    if (req.method !== "POST") return json(405, { error: "use POST" })
-    const elapsed = now() - lastRegisterAt
-    if (elapsed < REGISTER_MIN_INTERVAL_MS) {
-      const retryAfterMs = REGISTER_MIN_INTERVAL_MS - elapsed
-      log.debug("master:worker-register-throttled", { retryAfterMs })
-      // The same two-channel shape as the other throttles: Retry-After in whole seconds for anything
-      // speaking plain HTTP, the exact millisecond figure in the body for the page's own countdown.
-      return new Response(JSON.stringify({ error: "register throttled", retryAfterMs } satisfies ThrottledBody), {
-        status: 429,
-        headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(retryAfterMs / 1000)) },
-      })
-    }
-    // Stamped BEFORE the work, exactly as the sweep throttle is: minting reads and rewrites the kv, so
-    // stamping afterwards would let a double-clicked button slip a second registration through the
-    // window that was supposed to refuse it.
-    lastRegisterAt = now()
-    const request = parseWorkerRegisterRequest(await readJson(req))
-    if (!request) return badRequest("malformed worker register request")
-    const live = deps.registry.list().length
-    if (live >= REGISTER_MAX_LIVE_KEYS) {
-      // 409, NOT 429, and the difference is what the caller should do next. A 429 promises that
-      // waiting makes this exact request succeed; here it does not — an operator has to retire a key,
-      // or an unused one has to reach the end of its 7-day window on its own. Collapsing this into
-      // the throttle above would put a browser into a retry loop against a wall.
-      log.warn("master:worker-register-full", { live })
-      return json(409, { error: "registry full" })
-    }
-    const registered = deps.registry.register(request.label)
-    // PRIVACY: `registered.key` is the plaintext pool key, and the response below is the ONLY place it
-    // is ever written. The log gets the worker id and the label — the whole diagnostic value — and
-    // never the credential, which the registry itself cannot recover once this call returns.
-    log.info("master:worker-registered", { workerId: registered.workerId, label: request.label })
-    return json(200, {
-      workerId: registered.workerId,
-      poolKey: registered.key,
-      label: request.label,
-      expiresAt: registered.expiresAt,
-    })
-  }
-
   // The STRING is built once (the shell is a constant), but each request gets a FRESH Response: a
   // Response body is a single-use stream, so sharing one object would serve the first browser and
   // then fail every reload after it.
@@ -507,36 +422,27 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     throttleMs: USAGE_REFRESH_MIN_INTERVAL_MS,
     authorizeRoute: CLOUD_ROUTES.accountAuthorize,
     addRoute: CLOUD_ROUTES.accountAdd,
-    registerRoute: CLOUD_ROUTES.workerRegister,
   })
 
   const routes: Record<Route, RouteHandler> = {
-    // UNAUTHENTICATED BY DESIGN, and the only route that is. A worker probes this BEFORE it
-    // trusts a master URL — possibly before it has been issued a pool key at all — and an ops
-    // liveness check calls it forever. The price of that is that it may leak NOTHING: no account
-    // ids, no worker roster, no pool counts. A fixed `{ ok: true }` is the whole payload.
+    // A worker probes this BEFORE it trusts a master URL, and an ops liveness check calls it forever.
+    // The price of that is that it may leak NOTHING: no account ids, no worker roster, no pool
+    // counts. A fixed `{ ok: true }` is the whole payload.
     [CLOUD_ROUTES.health]: async () => json(200, { ok: true }),
-    // Auth is declared per-route in this table rather than hidden in a middleware condition, so
-    // "which routes require a key" is readable in one place and a new route cannot inherit
-    // "public" by forgetting to opt in.
-    [CLOUD_ROUTES.lease]: (req) => authed(req, handleLease),
-    [CLOUD_ROUTES.ratelimit]: (req) => authed(req, handleRateLimit),
-    // The dashboard pair, both keyless. Note what is NOT relaxed by that: `lease` and `ratelimit`
-    // above still go through `authed`, because those two mint credentials and move pool state. This
-    // table is the one place that contrast is visible, so keep it that way.
+    // THE TWO ROUTES THAT MOVE POOL STATE, and the reason the bind address matters. `lease` hands
+    // back a live Anthropic access token; `ratelimit` can cool an account out of selection for
+    // everyone. Neither is gated by anything in this process — see the header of this file.
+    [CLOUD_ROUTES.lease]: (req) => handleLease(req),
+    [CLOUD_ROUTES.ratelimit]: (req) => handleRateLimit(req),
     [CLOUD_ROUTES.usage]: () => handleUsage(),
     [CLOUD_ROUTES.dashboard]: async () => html(dashboardShell),
     [CLOUD_ROUTES.usageRefresh]: (req) => handleUsageRefresh(req),
-    // The onboarding pair, keyless like the rest of the dashboard. Unlike every other keyless route
-    // here these two WRITE — the second one adds a record to the account library — so what stands in
-    // for a key is the bounded session store and the throttle inside accountOnboard. That is the whole
-    // of the defence, and this table is where a reviewer should notice it.
+    // The onboarding pair WRITES — the second one adds a record to the account library — so the
+    // bounded session store and the throttle inside accountOnboard are what keep an unattended
+    // caller from filling memory or provoking unbounded upstream traffic. That is the whole of the
+    // defence, and this table is where a reviewer should notice it.
     [CLOUD_ROUTES.accountAuthorize]: (req) => handleAccountAuthorize(req),
     [CLOUD_ROUTES.accountAdd]: (req) => handleAccountAdd(req),
-    // Keyless like the onboarding pair beside it, and the only keyless route that hands out a
-    // CREDENTIAL: what replaces the key is REGISTER_MIN_INTERVAL_MS on the rate, REGISTER_MAX_LIVE_KEYS
-    // on the registry's size, and a 7-day expiry that retires a minted key nobody ever uses.
-    [CLOUD_ROUTES.workerRegister]: (req) => handleWorkerRegister(req),
   }
 
   // A table lookup, not an if/else chain over paths: the chain's fallthrough silently answers an

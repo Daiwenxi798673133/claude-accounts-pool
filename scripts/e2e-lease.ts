@@ -1,4 +1,4 @@
-// E2E — 云模式租借链路的端到端验收证据(S5 鉴权三连 + S1 worker 写盘)。
+// E2E — 云模式租借链路的端到端验收证据(S5 无凭据放行三连 + S1 worker 写盘)。
 //
 // 这不是单元测试,是【验收证据】:每一条断言都必须来自真实进程、真实端口、真实 curl、真实文件。
 //   · master 跑在独立子进程里,用的是真的 startLeaseServer(port=0,只绑 127.0.0.1)。
@@ -20,8 +20,9 @@ import { CLOUD_ROUTES } from "../src/cloud/protocol.ts"
 import { SENTINEL_REFRESH } from "../src/constants.ts"
 import { redactBody } from "../src/logger.ts"
 
-const POOL_KEY = "e2e-pool-key-0123456789"
-const WRONG_KEY = "wrong-key"
+// 一个杂散的 Authorization 头。master 不再有任何鉴权,所以它必须被【忽略】而不是被拒绝 ——
+// 这条断言存在的意义是钉住"忽略",否则某天有人补回一个 401 分支也不会有测试发现。
+const STRAY_AUTHORIZATION = "Bearer whatever-nobody-checks-this"
 const WORKER_ID = "e2e-worker-1"
 const ACCOUNT_ID = "e2e-account-a"
 // 前缀而非完整 token:master 桩把它拼上 accountId 返回,读输出的人一眼就知道这不是真凭据。
@@ -119,13 +120,6 @@ const controller = new AbortController()
 const server = startLeaseServer({
   scheduler: { pickAccount: ({ accounts, exclude }) => accounts.find((a) => a.id !== exclude), reportRateLimit: () => {} },
   refresher: { getFreshAccess: async (accountId) => ({ access: process.env.E2E_FAKE_ACCESS_PREFIX + accountId, expiresAt: Date.now() + ttl }) },
-  // register/list 只是补齐依赖形状:这条 e2e 验的是 worker 用一把「已经发好的」key 走完租约,
-  // 自助注册路由不在它的断言范围内,所以这里给最小实现而不是真的发 key。
-  registry: {
-    verify: (header) => (header === "Bearer " + process.env.E2E_POOL_KEY ? process.env.E2E_WORKER_ID : undefined),
-    register: () => ({ workerId: process.env.E2E_WORKER_ID, key: process.env.E2E_POOL_KEY, expiresAt: Date.now() + 7 * 24 * 3600_000 }),
-    list: () => [],
-  },
   loadAccounts: async () => [{ id, label: id + "@e2e.invalid", refresh: "e2e-master-only-refresh" }],
   hostname: "127.0.0.1",
   port: 0,
@@ -143,7 +137,7 @@ const { getAuthJsonPath, readAuthAnthropic, writeAuthAnthropic } = await import(
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 250)))
 const client = createLeaseClient({
   fetchImpl: fetch, sleep,
-  masterUrl: process.env.E2E_MASTER_URL, poolKey: process.env.E2E_POOL_KEY, workerId: process.env.E2E_WORKER_ID,
+  masterUrl: process.env.E2E_MASTER_URL, workerId: process.env.E2E_WORKER_ID,
 })
 const keeper = installLeaseKeeper({
   client, sleep,
@@ -173,9 +167,9 @@ async function waitForHealth(base: string, bodyPath: string): Promise<CurlResult
   )
 }
 
-function leaseArgs(base: string, authorization?: string): string[] {
-  const auth = authorization === undefined ? [] : ["-H", `Authorization: ${authorization}`]
-  const body = JSON.stringify({ workerId: WORKER_ID, reason: "prelease" })
+function leaseArgs(base: string, options: { authorization?: string; workerId?: string } = {}): string[] {
+  const auth = options.authorization === undefined ? [] : ["-H", `Authorization: ${options.authorization}`]
+  const body = JSON.stringify({ workerId: options.workerId ?? WORKER_ID, reason: "prelease" })
   return ["-X", "POST", "-H", "Content-Type: application/json", ...auth, "-d", body, `${base}${CLOUD_ROUTES.lease}`]
 }
 
@@ -189,17 +183,17 @@ function reportCurl(title: string, result: CurlResult): void {
 async function runCurlTrio(base: string, bodyPath: string): Promise<void> {
   console.log(`\n[2/3] S5 证据:三次真实 curl POST ${CLOUD_ROUTES.lease}`)
 
-  const anonymous = await curl(leaseArgs(base), bodyPath)
-  reportCurl("① 不带 Authorization 头", anonymous)
-  checkEqual("无凭据必须被拒", "401", String(anonymous.status))
+  const granted = await curl(leaseArgs(base), bodyPath)
+  reportCurl("① 不带 Authorization 头", granted)
+  checkEqual("无凭据必须放行(池子不再有应用层凭据)", "200", String(granted.status))
 
-  const wrong = await curl(leaseArgs(base, `Bearer ${WRONG_KEY}`), bodyPath)
-  reportCurl(`② Authorization: Bearer ${WRONG_KEY}`, wrong)
-  checkEqual("错误 pool key 必须被拒", "401", String(wrong.status))
+  const stray = await curl(leaseArgs(base, { authorization: STRAY_AUTHORIZATION }), bodyPath)
+  reportCurl(`② Authorization: ${STRAY_AUTHORIZATION}`, stray)
+  checkEqual("杂散 Authorization 头必须被忽略而非拒绝", "200", String(stray.status))
 
-  const granted = await curl(leaseArgs(base, `Bearer ${POOL_KEY}`), bodyPath)
-  reportCurl("③ Authorization: Bearer <已注册的 pool key>", granted)
-  checkEqual("合法 pool key 必须放行", "200", String(granted.status))
+  const malformed = await curl(leaseArgs(base, { workerId: "bad id/../with spaces" }), bodyPath)
+  reportCurl("③ workerId 含非法字符(日志注入面)", malformed)
+  checkEqual("畸形 workerId 必须 400", "400", String(malformed.status))
 
   const lease = asRecord(parseJson(granted.body))
   const [accountId, access, expiresAt] = [lease?.["accountId"], lease?.["access"], lease?.["expiresAt"]]
@@ -218,7 +212,7 @@ async function runWorkerChild(base: string, home: string, data: string): Promise
       HOME: home,
       XDG_DATA_HOME: data,
       E2E_CLIENT_MODULE: src("worker", "leaseClient.ts"), E2E_KEEPER_MODULE: src("worker", "leaseKeeper.ts"),
-      E2E_ACCOUNTS_MODULE: src("accounts.ts"), E2E_MASTER_URL: base, E2E_POOL_KEY: POOL_KEY, E2E_WORKER_ID: WORKER_ID,
+      E2E_ACCOUNTS_MODULE: src("accounts.ts"), E2E_MASTER_URL: base, E2E_WORKER_ID: WORKER_ID,
     },
     stdout: "pipe",
     stderr: "pipe",
@@ -273,7 +267,7 @@ async function main(): Promise<number> {
     master = Bun.spawn(["bun", "-e", MASTER_SCRIPT], {
       env: {
         ...process.env,
-        E2E_SERVER_MODULE: src("master", "leaseServer.ts"), E2E_POOL_KEY: POOL_KEY, E2E_WORKER_ID: WORKER_ID,
+        E2E_SERVER_MODULE: src("master", "leaseServer.ts"), E2E_WORKER_ID: WORKER_ID,
         E2E_ACCOUNT_ID: ACCOUNT_ID, E2E_FAKE_ACCESS_PREFIX: FAKE_ACCESS_PREFIX, E2E_LEASE_TTL_MS: String(LEASE_TTL_MS),
       },
       stdout: "pipe",

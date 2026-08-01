@@ -3,6 +3,7 @@
 > 状态：**待验证（Gate-0 未跑，禁止动产品代码）**
 > 关联：Issue #1 · [pool-feasibility.md](../research/pool-feasibility.md) · [options-analysis.md](../research/options-analysis.md)
 > 决策日期：2026-07-30
+> 后记（2026-08-01）：本 ADR 中的 pool key 鉴权其后被移除，master 改为无应用层鉴权、以绑定地址为唯一边界；本文按原样保留为当时的决策记录，现状见 [cloud-mode.md](../cloud-mode.md#为什么整台-master-都不做鉴权)。
 
 ---
 

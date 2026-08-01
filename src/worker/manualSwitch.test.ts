@@ -101,7 +101,7 @@ test("a transport failure is reported in switch wording and writes nothing", asy
 })
 
 test("an already-expired lease is refused rather than written", async () => {
-  const { manual, written, toasts } = harness({ ok: false, failure: { kind: "auth" } })
+  const { manual, written, toasts } = harness({ ok: false, failure: { kind: "bad-response", detail: "schema-invalid body" } })
   expect((await manual.switchTo({ prefix: "a", label: "a@example.test" })).ok).toBe(false)
   expect(written).toEqual([])
   expect(toasts).toHaveLength(1)

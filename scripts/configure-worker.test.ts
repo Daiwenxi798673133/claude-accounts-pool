@@ -18,9 +18,8 @@ const REPO_ROOT = dirname(import.meta.dir)
 const EXPECTED_PLUGIN_PATH = join(REPO_ROOT, "dist", "tui.js")
 
 const MASTER = "http://10.0.0.5:8787"
-const KEY = "test-pool-key-not-a-real-one"
 const LABEL = "laptop-1"
-const ARGS = ["--master", MASTER, "--key", KEY, "--worker", LABEL]
+const ARGS = ["--master", MASTER, "--worker", LABEL]
 
 // Byte-exact replica of the verified real machine: .jsonc (not .json), a version-pinned
 // ex-machina entry, and an unrelated mcp block that must survive untouched.
@@ -108,10 +107,7 @@ function backups(home: string): string[] {
   return readdirSync(join(home, "opencode")).filter((name) => name.includes(".bak-"))
 }
 
-const expectedEntry = [
-  EXPECTED_PLUGIN_PATH,
-  { mode: "cloud-worker", masterUrl: MASTER, poolKey: KEY, workerId: LABEL },
-]
+const expectedEntry = [EXPECTED_PLUGIN_PATH, { mode: "cloud-worker", masterUrl: MASTER, workerId: LABEL }]
 
 test("the real machine survives: pins, duplicates and unrelated blocks come out verbatim", async () => {
   const home = sandbox({ "opencode.jsonc": REAL_OPENCODE_JSONC, "tui.json": REAL_TUI_JSON })
@@ -308,27 +304,30 @@ test("the generated options are accepted by the real parser in src/mode.ts", asy
   if (!isJsonObject(options)) throw new Error("expected an options object")
 
   const parsed = parseMode(options)
-  expect(parsed).toEqual({ mode: "cloud-worker", masterUrl: MASTER, poolKey: KEY, workerId: LABEL })
+  expect(parsed).toEqual({ mode: "cloud-worker", masterUrl: MASTER, workerId: LABEL })
 })
 
 test("missing or empty required flags print usage and exit non-zero", async () => {
   const home = sandbox({})
 
-  const missing = await runCli(home, ["--master", MASTER, "--key", KEY])
-  const empty = await runCli(home, ["--master", MASTER, "--key", "", "--worker", LABEL])
+  const missingMaster = await runCli(home, ["--worker", LABEL])
+  const missingWorker = await runCli(home, ["--master", MASTER])
 
-  for (const run of [missing, empty]) {
-    expect(run.code).not.toBe(0)
-    expect(run.stderr).toContain("--worker")
-    expect(run.stderr).toContain("Usage")
-  }
+  expect(missingMaster.code).not.toBe(0)
+  expect(missingMaster.stderr).toContain("--master")
+  expect(missingMaster.stderr).toContain("Usage")
+
+  expect(missingWorker.code).not.toBe(0)
+  expect(missingWorker.stderr).toContain("--worker")
+  expect(missingWorker.stderr).toContain("Usage")
+
   expect(existsSync(join(home, "opencode", "tui.json"))).toBe(false)
 })
 
 test("a --master that is not an http(s) URL is rejected", async () => {
   const home = sandbox({})
 
-  const run = await runCli(home, ["--master", "ftp://10.0.0.5", "--key", KEY, "--worker", LABEL])
+  const run = await runCli(home, ["--master", "ftp://10.0.0.5", "--worker", LABEL])
 
   expect(run.code).not.toBe(0)
   expect(run.stderr).toContain("--master")

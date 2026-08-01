@@ -107,7 +107,6 @@ test(`refuses stale writes and never calls TOKEN_${"URL"} when master unreachabl
     fetchImpl,
     sleep: async () => {},
     masterUrl: MASTER,
-    poolKey: "pool-key-abcdef",
     workerId: "worker-01",
   })
   const h = harness({ client, auth: { access: "expired-leased-access", expires: NOW - 1 } })
