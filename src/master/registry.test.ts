@@ -253,3 +253,24 @@ test("register keeps numbering above the highest id ever issued even when a prun
   expect(minted.expiresAt).toBe(now + POOLKEY_TTL_MS)
   expect(Object.keys(persistedMap(store))).toEqual(["worker-8"])
 })
+
+// The other half of that guarantee, pinned because it is the SURPRISING half: the id survives a
+// prune only for as long as the record does. Once a verify() has already carried the highest entry
+// out of the map, a later register() sees a lower ceiling and hands that number out again. Safe —
+// the pruned digest is gone, so nothing that could still authenticate is overwritten — but it means
+// `worker-N` is a slot, not a durable audit identity, and a reader who assumes otherwise is wrong.
+test("an id IS handed out again once an earlier verify pruned the record that held it", () => {
+  const { kv, store } = createKvStub()
+  let now = 1_700_000_000_000
+  const registry = createRegistry({ kv, now: () => now })
+  const first = registry.register("laptop-a")
+  expect(first.workerId).toBe("worker-1")
+
+  // Past its expiry, and NOT renewed in between: verify refuses it and prunes it in that same call.
+  now += POOLKEY_TTL_MS
+  expect(registry.verify(`Bearer ${first.key}`)).toBeUndefined()
+  expect(persistedMap(store)).toEqual({})
+
+  expect(registry.register("laptop-b").workerId).toBe("worker-1")
+  expect(persistedMap(store)["worker-1"]?.label).toBe("laptop-b")
+})

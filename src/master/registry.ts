@@ -71,12 +71,17 @@ function digestsMatch(a: string, b: string): boolean {
 // live worker's digest, silently killing that worker's key with no error raised anywhere.
 // Ids that do not match the minted shape are ignored rather than trusted as counters.
 //
-// EXPIRY DOES NOT WEAKEN THIS, for two reasons. Because numbering is `highest + 1`, the gap an
-// expiring key leaves behind is never refilled — the id is retired, not recycled — so register()
-// must be handed the map as it looked BEFORE its own prune, or a prune could lower the next id
-// back onto an id already handed out. And because verify() refuses an expired key BEFORE the
-// prune that removes it, an entry that is gone from the map was already unusable: the harm this
-// invariant exists to prevent — silently overwriting a LIVE worker's digest — stays impossible.
+// EXPIRY NARROWS WHAT THIS PROMISES, and the narrower thing is what must be written down.
+// WITHIN one register() the numbering still reads the map as it looked BEFORE that call's own
+// prune, so a prune can never lower the next id onto an id still sitting in the map. ACROSS calls
+// it is different: once verify() has pruned the highest-numbered record, the next register() sees
+// a lower ceiling and hands that number out again. That is deliberate and safe, but it means the
+// id is NOT a durable name, and conflating the two is how someone builds on the wrong guarantee:
+//   - SAFE, because a pruned record is one verify() had already refused; its digest is gone from
+//     the map, so re-minting its number overwrites nothing that could still authenticate. The harm
+//     this invariant exists to prevent — silently killing a LIVE worker's key — stays impossible.
+//   - NOT A DURABLE NAME, so never read `worker-N` as a stable audit identity across time. The
+//     record's `label` is what says WHICH machine; the number only says which slot it holds now.
 function nextWorkerNumber(records: Record<string, PoolKeyRecord>): number {
   let highest = 0
   for (const workerId of Object.keys(records)) {
