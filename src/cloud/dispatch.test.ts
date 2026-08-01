@@ -95,7 +95,7 @@ test("local config leaves bootstrap selection on the local path", () => {
 
 test("invalid config installs nothing and toasts", () => {
   const { api, toasts, disposers } = harness()
-  const reason = `cloud-worker needs "poolKey" (non-empty string)`
+  const reason = `cloud-worker needs "workerId" (non-empty string)`
 
   expect(dispatchMode(api, { mode: "invalid", reason })).toBe("handled")
 
@@ -116,7 +116,6 @@ test("worker config selects worker install, master config selects master install
   const workerConfig: WorkerConfig = {
     mode: "cloud-worker",
     masterUrl: "http://10.0.0.2:8787",
-    poolKey: "pool-key-worker-1",
     workerId: "worker-1",
   }
 

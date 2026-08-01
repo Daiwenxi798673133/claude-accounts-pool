@@ -1,41 +1,23 @@
 import { expect, test } from "bun:test"
-import { randomBytes } from "node:crypto"
 import type { StoredAccount } from "../accounts.ts"
-import {
-  LEASE_RENEW_BUFFER_MS,
-  MASTER_MIN_REMAINING_MS,
-  ONBOARD_ADD_MIN_INTERVAL_MS,
-  POOLKEY_TTL_MS,
-  REGISTER_MAX_LIVE_KEYS,
-  REGISTER_MIN_INTERVAL_MS,
-} from "../constants.ts"
+import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS, ONBOARD_ADD_MIN_INTERVAL_MS } from "../constants.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
-import type {
-  LeaseRequest,
-  LeaseResponse,
-  RateLimitReport,
-  ThrottledBody,
-  UsageSnapshotView,
-  WorkerRegisterRequest,
-  WorkerRegisterResponse,
-} from "../cloud/protocol.ts"
+import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
 import { createAccountOnboard } from "./accountOnboard.ts"
 import { startLeaseServer, USAGE_REFRESH_MIN_INTERVAL_MS } from "./leaseServer.ts"
-import type { PoolKeySummary } from "./registry.ts"
 import type { UsageSnapshot } from "./scheduler.ts"
 
 // A REAL Bun.serve on an EPHEMERAL port, driven by REAL fetch. The deliverable here is HTTP
-// behaviour (status codes, auth gating, empty-body 204), and a handler invoked directly as a
-// function would prove none of it — Bun, not our code, decides how a 204 or a dead socket looks
+// behaviour (status codes, boundary refusals, empty-body 204), and a handler invoked directly as
+// a function would prove none of it — Bun, not our code, decides how a 204 or a dead socket looks
 // on the wire. Port 0 (never a literal) so two checkouts running `bun test` at once cannot
 // collide; the assigned port is read back off the server object.
 //
-// The three collaborators are hand-built stubs, NOT the real modules: the real refresher would
-// POST a live refresh token at Anthropic, and the real registry/scheduler drag a kv store in.
+// The two collaborators are hand-built stubs, NOT the real modules: the real refresher would
+// POST a live refresh token at Anthropic, and the real scheduler drags a kv store in.
 // The scheduler stub is a small honest FAKE (a cooled-id set + a filter) rather than a mock
 // returning canned answers, because test 5's whole claim is that a report CHANGES the next pick.
 
-const POOL_KEY = "pool-key-under-test"
 const WORKER_ID = "worker-1"
 // The horizon a worker RECEIVES — deliberately still named EXPIRES_AT, because that is what lands
 // in its auth.json and what the cases below assert. Since INV-CLOUD-4 the account's own expiry is a
@@ -66,10 +48,6 @@ type Harness = {
   // Every code string the onboarding exchange was handed. Empty means the route refused BEFORE
   // reaching out, which is the distinction the throttle and the session-lifecycle cases turn on.
   exchanged: string[]
-  // The fake registry's ACTUAL contents. Every registration case turns on what the registry holds
-  // afterwards — "the ceiling held", "nothing was minted" — and a mock returning canned answers
-  // could show neither.
-  minted: PoolKeySummary[]
 }
 
 function startHarness(options?: {
@@ -83,8 +61,6 @@ function startHarness(options?: {
   goodCode?: string
   onboardProfile?: { uuid: string; email: string }
   profileThrows?: boolean
-  // Pool keys already live when the server starts, for the capacity ceiling.
-  liveKeys?: number
 }): Harness {
   const accounts = options?.accounts ?? [account("acct-a"), account("acct-b")]
   const accountExpiresAt = options?.accountExpiresAt ?? ACCOUNT_EXPIRES_AT
@@ -102,12 +78,6 @@ function startHarness(options?: {
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
   const preferred: Harness["preferred"] = []
-  const minted: PoolKeySummary[] = Array.from({ length: options?.liveKeys ?? 0 }, (_slot, index) => ({
-    workerId: `worker-${index + 1}`,
-    label: `existing-${index + 1}`,
-    issuedAt: nowMs,
-    expiresAt: nowMs + POOLKEY_TTL_MS,
-  }))
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
 
@@ -173,23 +143,6 @@ function startHarness(options?: {
         return { access: `sk-ant-oat01-${accountId}`, expiresAt: accountExpiresAt }
       },
     },
-    registry: {
-      verify: (header) => (header === `Bearer ${POOL_KEY}` ? WORKER_ID : undefined),
-      // Mints the same 32-random-bytes-base64url shape the real registry does, because the only
-      // promise this route makes the operator is that the plaintext it hands back is a USABLE key —
-      // a fake answering "fake-key" could not show the wire carrying one.
-      register: (label) => {
-        const summary: PoolKeySummary = {
-          workerId: `worker-${minted.length + 1}`,
-          label,
-          issuedAt: clock(),
-          expiresAt: clock() + POOLKEY_TTL_MS,
-        }
-        minted.push(summary)
-        return { workerId: summary.workerId, key: randomBytes(32).toString("base64url"), expiresAt: summary.expiresAt }
-      },
-      list: () => minted,
-    },
     loadAccounts: async () => accounts,
     // Stands in for the usage poller's tickOnce. It ADVANCES THE SNAPSHOT INSTANT, because that is
     // the real thing a completed sweep changes — a fake that only counted calls could not tell the
@@ -220,7 +173,6 @@ function startHarness(options?: {
       nowMs += ms
     },
     exchanged,
-    minted,
   }
 }
 
@@ -237,24 +189,25 @@ function post(base: string, route: string, body: unknown, authorization?: string
 
 const PRELEASE: LeaseRequest = { workerId: WORKER_ID, reason: "prelease" }
 
-test("lease without pool key returns 401", async () => {
-  // Given: a running master and a worker that forgot (or never had) a pool key
+test("lease is served to a caller that presents no credential at all", async () => {
+  // Given: a running master and a worker carrying nothing but its own request
   const harness = startHarness()
   try {
     // When
     const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
 
-    // Then: refused before anything is decided — the roster was never consulted and no token
-    // was minted, so an unauthenticated caller learns nothing about the pool's existence.
-    expect(res.status).toBe(401)
-    expect(await res.json()).toEqual({ error: expect.any(String) })
-    expect(harness.picks).toEqual([])
-    expect(harness.refreshed).toEqual([])
+    // Then: the roster IS consulted and a live token IS minted for a caller that proved nothing.
+    // That is the design and not a lapse — reaching the port is the whole of the entitlement, so
+    // this case is the one that fails the day someone reintroduces an application-layer gate
+    // without also deciding how a worker would ever get past it.
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ accountId: "acct-a", access: "sk-ant-oat01-acct-a", expiresAt: EXPIRES_AT })
+    expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"] }])
+    expect(harness.refreshed).toEqual(["acct-a"])
 
-    // And: the SAME missing credential answers 200 on health. That contrast is the point of the
-    // route being unauthenticated — it is a readiness probe a worker calls BEFORE it has been
-    // issued a key (and an ops liveness check calls forever), so it may not require one. It
-    // therefore also may not leak: no account ids, no worker list, no counts.
+    // And: the same caller gets 200 on health, which may not leak in exchange — it is a readiness
+    // probe a worker calls BEFORE it trusts a master URL (and an ops liveness check calls forever),
+    // so it must say nothing: no account ids, no worker list, no counts.
     const health = await fetch(`${harness.base}${CLOUD_ROUTES.health}`)
     expect(health.status).toBe(200)
     expect(await health.json()).toEqual({ ok: true })
@@ -263,47 +216,142 @@ test("lease without pool key returns 401", async () => {
   }
 })
 
-test("lease with wrong key returns 401", async () => {
-  // Given: a revoked/typo'd key that the registry does not recognise
+test("a malformed lease body is refused 400 before anything is picked or minted", async () => {
   const harness = startHarness()
   try {
-    // When
-    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE, "Bearer not-the-pool-key")
+    // Given/When: well-formed JSON carrying a `reason` the protocol does not define
+    const res = await post(harness.base, CLOUD_ROUTES.lease, { workerId: WORKER_ID, reason: "whenever" })
 
-    // Then: identical treatment to no key at all — the response must not become an oracle that
-    // distinguishes "absent" from "wrong" for someone probing the endpoint.
-    expect(res.status).toBe(401)
+    // Then: 400. An unknown reason is refused rather than defaulted, because `prelease` and
+    // `ratelimit` differ in whether the named account is EXCLUDED from the pick — silently
+    // defaulting would re-issue a spent account to the worker that just hit its limit.
+    expect(res.status).toBe(400)
     expect(await res.json()).toEqual({ error: expect.any(String) })
+
+    // AND THE ORDERING, which is what this case exists for: the parse runs FIRST. A malformed
+    // request is the caller's fault and must cost the master nothing — no pick, no mint — or a
+    // caller sending garbage in a loop drives real work on every one of them.
     expect(harness.picks).toEqual([])
-
-    // AUTH IS CHECKED BEFORE THE BODY IS PARSED. Garbage under a bad key must still answer 401,
-    // never 400: a 400 here would confirm the key was accepted and turn body-shape errors into a
-    // key-guessing oracle. (Asserted inside this case because the six cases are fixed; the two
-    // statuses below are one ordering invariant, not two behaviours.)
-    const garbageUnauthed = await post(harness.base, CLOUD_ROUTES.lease, "{not json", "Bearer not-the-pool-key")
-    expect(garbageUnauthed.status).toBe(401)
-
-    // Past auth, the same garbage is a 400 — a body we cannot parse is the CALLER's fault and
-    // must never surface as a 500, which the worker client would retry as a transient fault.
-    const garbageAuthed = await post(harness.base, CLOUD_ROUTES.lease, "{not json", `Bearer ${POOL_KEY}`)
-    expect(garbageAuthed.status).toBe(400)
-    expect(await garbageAuthed.json()).toEqual({ error: expect.any(String) })
     expect(harness.refreshed).toEqual([])
   } finally {
     harness.stop()
   }
 })
 
-test("lease with valid key returns 200 with accountId access expiresAt", async () => {
+test("no Authorization header is required, and a stray one is ignored rather than refused", async () => {
+  // Given: two callers that differ ONLY in whether they present a bearer credential
+  const harness = startHarness()
+  try {
+    // When
+    const bare = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
+    const stray = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE, "Bearer left-over-from-an-older-tui-json")
+
+    // Then: BOTH served, and served identically. This server evaluates no application-layer
+    // credential, so a header the caller happens to send is not a claim it can accept or reject —
+    // a worker still sending one from an older config must not be locked out, and a stranger
+    // inventing one must not be let in. The bind address is the whole of the access control.
+    expect(bare.status).toBe(200)
+    expect(stray.status).toBe(200)
+    expect(await bare.json()).toEqual(await stray.json())
+    // And both really reached the pool: two leases were served, not two cheap refusals.
+    expect(harness.refreshed).toEqual(["acct-a", "acct-a"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a ratelimit report is accepted with no credential and really cools the account", async () => {
+  // Given: a worker on its recovery path, presenting nothing
+  const harness = startHarness()
+  try {
+    // When
+    const res = await post(harness.base, CLOUD_ROUTES.ratelimit, {
+      workerId: WORKER_ID,
+      accountId: "acct-a",
+      headers: {},
+      resetsAt: 1_787_903_707_000,
+    } satisfies RateLimitReport)
+
+    // Then: 204 with no body, and the cooldown actually applied. A refusal here would be worse than
+    // it looks: the report is how a spent account leaves selection, so a route that turned it away
+    // would leave the worker re-leasing the very account that just hit its limit.
+    expect(res.status).toBe(204)
+    expect(await res.text()).toBe("")
+    expect(harness.reports).toEqual([{ accountId: "acct-a", resetsAt: 1_787_903_707_000 }])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("bytes that are not JSON are a 400 on both credential routes, never a 500", async () => {
+  const harness = startHarness()
+  try {
+    // When: a body that no parser can read reaches each of the two routes that move pool state
+    const lease = await post(harness.base, CLOUD_ROUTES.lease, "{not json")
+    const ratelimit = await post(harness.base, CLOUD_ROUTES.ratelimit, "{not json")
+
+    // Then: 400 on both. A 500 is the failure to avoid, not a cosmetic difference — the worker's
+    // client treats a 5xx as a transient fault and retries the identical bytes forever, so an
+    // unhandled parse throw would turn one malformed request into a permanent retry loop.
+    expect(lease.status).toBe(400)
+    expect(ratelimit.status).toBe(400)
+    expect(await lease.json()).toEqual({ error: expect.any(String) })
+    expect(await ratelimit.json()).toEqual({ error: expect.any(String) })
+
+    // And neither cost the master anything: no token minted, no account cooled.
+    expect(harness.refreshed).toEqual([])
+    expect(harness.reports).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a workerId outside the label pattern is refused on both credential routes", async () => {
+  const harness = startHarness()
+  try {
+    // Given: the one field on this wire that reaches the LOG FILE, carrying exactly what a log
+    // injection needs — path traversal, spaces, and (below) a forged line break.
+    const forged = "bad id/../with spaces"
+
+    // When
+    const lease = await post(harness.base, CLOUD_ROUTES.lease, { workerId: forged, reason: "prelease" } satisfies LeaseRequest)
+    const ratelimit = await post(harness.base, CLOUD_ROUTES.ratelimit, {
+      workerId: forged,
+      accountId: "acct-a",
+      headers: {},
+    } satisfies RateLimitReport)
+
+    // Then: refused at the boundary, before the label can be written anywhere. Nothing
+    // authenticates this string, so the narrowing is the only thing standing between an anonymous
+    // caller and arbitrary lines in the operator's log.
+    expect(lease.status).toBe(400)
+    expect(ratelimit.status).toBe(400)
+    expect(harness.refreshed).toEqual([])
+    expect(harness.reports).toEqual([])
+
+    // And a newline is refused for the same reason, which is the shape that actually forges a
+    // second log entry rather than merely dirtying one.
+    const injected = await post(harness.base, CLOUD_ROUTES.lease, { workerId: "ok\nmaster:lease-served", reason: "prelease" } satisfies LeaseRequest)
+    expect(injected.status).toBe(400)
+
+    // And the value on the other side of the rule is ACCEPTED, so the pattern is proven to be a
+    // rule rather than a blanket refusal of every workerId.
+    const allowed = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
+    expect(allowed.status).toBe(200)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("lease returns 200 with accountId access expiresAt", async () => {
   // Given: a pool with two healthy accounts
   const harness = startHarness()
   try {
-    // When: a worker renews the account it already holds, and LIES about who it is in the body
+    // When: a worker renews the account it already holds, under a name nothing corroborates
     const res = await post(
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: "worker-impersonated", reason: "prelease", currentAccountId: "acct-a" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
 
     // Then: exactly the three fields the worker writes into its auth.json, freshly minted for
@@ -320,8 +368,8 @@ test("lease with valid key returns 200 with accountId access expiresAt", async (
     // here and rotate the pool on every routine renewal.
     expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"] }])
 
-    // The spoofed workerId changed nothing: identity comes from the KEY, and the body is a
-    // client-supplied string anyone holding a key could forge.
+    // The workerId changed nothing about WHICH account was served: it is a self-declared label
+    // that reaches the log file and nothing else, so selection must never come to depend on it.
     expect(lease.accountId).toBe("acct-a")
   } finally {
     harness.stop()
@@ -338,7 +386,6 @@ test("lease naming an account serves THAT account and never consults ranked sele
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-b" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
 
     // Then: acct-b, minted through the very same path a scheduled lease uses
@@ -364,7 +411,6 @@ test("lease naming an unservable account is refused 409 with the reason, never s
       harness.base,
       CLOUD_ROUTES.ratelimit,
       { workerId: WORKER_ID, accountId: "acct-b", headers: {} } satisfies RateLimitReport,
-      `Bearer ${POOL_KEY}`,
     )
 
     // When / Then: each refusal names ITS OWN reason. The reason is the whole message the operator
@@ -374,7 +420,6 @@ test("lease naming an unservable account is refused 409 with the reason, never s
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-b" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
     expect(cooling.status).toBe(409)
     expect(await cooling.json()).toEqual({ error: expect.any(String), refused: "cooling" })
@@ -383,7 +428,6 @@ test("lease naming an unservable account is refused 409 with the reason, never s
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-c" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
     expect(reauth.status).toBe(409)
     expect(await reauth.json()).toEqual({ error: expect.any(String), refused: "needs-reauth" })
@@ -392,7 +436,6 @@ test("lease naming an unservable account is refused 409 with the reason, never s
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-z" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
     expect(gone.status).toBe(409)
     expect(await gone.json()).toEqual({ error: expect.any(String), refused: "unknown" })
@@ -401,7 +444,6 @@ test("lease naming an unservable account is refused 409 with the reason, never s
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
     expect(ambiguous.status).toBe(409)
     expect(await ambiguous.json()).toEqual({ error: expect.any(String), refused: "ambiguous" })
@@ -426,7 +468,6 @@ test("lease with an empty preferred prefix is malformed, not a match-anything wi
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "" },
-      `Bearer ${POOL_KEY}`,
     )
 
     // Then: 400 at the boundary. An empty prefix matches every account, so it would resolve to
@@ -451,7 +492,6 @@ test("a named account is still refused when its horizon is already spent", async
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-a" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
 
     // Then: the same 503 the scheduled path answers. The horizon check is NOT a selection rule the
@@ -470,12 +510,12 @@ test("lease returns 503 when scheduler has no available account", async () => {
   const harness = startHarness({ cooled: ["acct-a", "acct-b"] })
   try {
     // When
-    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE, `Bearer ${POOL_KEY}`)
+    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
 
-    // Then: 503, kept DISTINCT from the 401 above. Both are refusals, but the worker client acts
-    // on them differently — a 401 means "your key will never work, stop", a 503 means "come back
-    // later, the pool is momentarily spent". Collapsing them would either strand a healthy worker
-    // or make it hammer a master that rejected it.
+    // Then: 503, kept DISTINCT from the 400 and the 409 above. All three refuse, but the worker
+    // client acts on them differently — a 400 and a 409 mean "this exact request can never
+    // succeed, stop", a 503 means "come back later, the pool is momentarily spent". Collapsing
+    // them would either strand a healthy worker or make it hammer a master with a dead request.
     expect(res.status).toBe(503)
     expect(await res.json()).toEqual({ error: expect.any(String) })
     // No token was minted for an account that cannot serve.
@@ -489,7 +529,7 @@ test("ratelimit report cools the account and next lease picks another", async ()
   const harness = startHarness()
   try {
     // Given: a worker holding acct-a
-    const first = (await (await post(harness.base, CLOUD_ROUTES.lease, PRELEASE, `Bearer ${POOL_KEY}`)).json()) as LeaseResponse
+    const first = (await (await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)).json()) as LeaseResponse
     expect(first.accountId).toBe("acct-a")
 
     // When: acct-a hits its subscription limit and the worker reports it
@@ -499,7 +539,7 @@ test("ratelimit report cools the account and next lease picks another", async ()
       headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": "1787903707" },
       resetsAt: 1_787_903_707_000,
     }
-    const ack = await post(harness.base, CLOUD_ROUTES.ratelimit, report, `Bearer ${POOL_KEY}`)
+    const ack = await post(harness.base, CLOUD_ROUTES.ratelimit, report)
 
     // Then: 204 with NO body — the worker's client only reads `res.ok`, and a body here would be
     // state the master does not owe a best-effort telemetry call.
@@ -514,7 +554,6 @@ test("ratelimit report cools the account and next lease picks another", async ()
       harness.base,
       CLOUD_ROUTES.lease,
       { workerId: WORKER_ID, reason: "ratelimit", currentAccountId: "acct-a" } satisfies LeaseRequest,
-      `Bearer ${POOL_KEY}`,
     )
     expect(second.status).toBe(200)
     expect(((await second.json()) as LeaseResponse).accountId).toBe("acct-b")
@@ -572,7 +611,7 @@ function dashboardHarness(stale: boolean): Harness {
   })
 }
 
-test("usage is public, and that did not open the credential routes", async () => {
+test("one anonymous caller reaches the read route and the two that move pool state alike", async () => {
   const harness = dashboardHarness(false)
   try {
     // Given: an anonymous caller with no Authorization header whatsoever. When: it asks for the
@@ -584,21 +623,21 @@ test("usage is public, and that did not open the credential routes", async () =>
     expect(anonymous.status).toBe(200)
     expect(await anonymous.text()).not.toContain("sk-ant-")
 
-    // AND THE WHOLE POINT OF THIS CASE: the very same anonymous caller is still refused by the two
-    // routes that mint credentials and move pool state. A keyless dashboard must never become the
-    // reason a keyless lease works — that would turn a monitoring convenience into an open
-    // credential dispenser.
+    // AND THE WHOLE POINT OF THIS CASE: the very same anonymous caller also gets a live token out
+    // of `lease` and cools an account through `ratelimit`. The read route is not a narrower
+    // exception carved into an otherwise gated port — the port has ONE tier, and this is what
+    // "the bind address is the entire access control" costs when it is written down as a test.
     const lease = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
     const ratelimit = await post(harness.base, CLOUD_ROUTES.ratelimit, {
       workerId: WORKER_ID,
       accountId: "acct-live",
       headers: {},
     } satisfies RateLimitReport)
-    expect(lease.status).toBe(401)
-    expect(ratelimit.status).toBe(401)
-    // Nothing was minted and no pool state moved, which is the consequence the statuses stand for.
-    expect(harness.refreshed).toEqual([])
-    expect(harness.reports).toEqual([])
+    expect(lease.status).toBe(200)
+    expect(ratelimit.status).toBe(204)
+    // A token really was minted and pool state really moved, which is what those statuses stand for.
+    expect(harness.refreshed).toEqual(["acct-live"])
+    expect(harness.reports).toEqual([{ accountId: "acct-live" }])
   } finally {
     harness.stop()
   }
@@ -767,9 +806,9 @@ test("dashboard serves a data-free HTML page, repeatedly", async () => {
     // When: a browser navigates to the dashboard.
     const res = await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)
 
-    // Then: the document itself embeds NO pool data and NO key — it fetches the JSON route at
-    // runtime. That is what lets one string be built at startup and shared by every viewer, and it
-    // keeps the page out of the "leaks on disclosure" class entirely.
+    // Then: the document itself embeds NO pool data — it fetches the JSON route at runtime. That
+    // is what lets one string be built at startup and shared by every viewer, and it keeps the page
+    // out of the "leaks on disclosure" class entirely.
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("text/html")
     const body = await res.text()
@@ -782,7 +821,6 @@ test("dashboard serves a data-free HTML page, repeatedly", async () => {
     expect(body).not.toContain("example.test")
     expect(body).not.toContain("sk-ant-")
     expect(body).not.toContain("acct-")
-    expect(body).not.toContain(POOL_KEY)
 
     // A SECOND request must work too. A Response body is a single-use stream, so a handler that
     // hoisted one shared Response out of the closure would serve the first browser and then fail
@@ -807,7 +845,7 @@ test("lease horizon never outlives the master refresh point", async () => {
   const harness = startHarness({ accountExpiresAt })
   try {
     // When
-    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE, `Bearer ${POOL_KEY}`)
+    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
 
     // Then: the advertised instant is the master's own refresh point, NOT the account's expiry.
     // Refreshing REVOKES the access token it replaces (measured: old access 200 → refresh → the
@@ -835,7 +873,7 @@ test("lease is refused when the horizon would already be in the past", async () 
   const harness = startHarness({ accountExpiresAt: Date.now() + 60_000 })
   try {
     // When
-    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE, `Bearer ${POOL_KEY}`)
+    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
 
     // Then: 503 rather than a dead-on-arrival credential. A worker writes the horizon into
     // auth.json, where the local provider refreshes on `expires < Date.now()` with ZERO buffer
@@ -861,12 +899,12 @@ test("lease is refused when the horizon would already be in the past", async () 
 test("both onboarding routes are keyless, and refuse a GET", async () => {
   const harness = startHarness()
   try {
-    // Given/When: no Authorization header at all — the same omission that earns a 401 on lease
+    // Given/When: no Authorization header at all
     const authorize = await post(harness.base, CLOUD_ROUTES.accountAuthorize, {})
 
-    // Then: served. That contrast with the 401 above is the deliberate design of this port: the
-    // dashboard and everything reachable from it is open, while minting a credential FOR A WORKER
-    // is not.
+    // Then: served, like every other route on this port. What makes these two worth their own
+    // cases is not the absence of a credential but that they WRITE while keyless — so the bounds
+    // inside accountOnboard, not a gate out here, are the whole of the defence.
     expect(authorize.status).toBe(200)
 
     // And: neither route answers a GET. `accountAdd` reaches platform.claude.com, so a speculatively
@@ -1128,206 +1166,9 @@ test("the dashboard page carries the onboarding routes and still leaks nothing",
     expect(body).toContain("添加账号")
 
     // And the page is still a shell: adding a credential-handling flow to it must not have put a
-    // credential, an account or a key into the document.
+    // credential or an account into the document.
     expect(body).not.toContain("verifier-under-test")
-    expect(body).not.toContain(POOL_KEY)
     expect(body).not.toContain("example.test")
-  } finally {
-    harness.stop()
-  }
-})
-
-// ── 注册 worker (self-service pool keys) ────────────────────────────────────────────────────────
-// The first KEYLESS route on this server that hands out a CREDENTIAL, so what the cases below pin
-// down is mostly the three bounds standing in for the key: the rate floor, the live-key ceiling, and
-// a label narrow enough that nothing arbitrary reaches the unauthenticated page that renders it.
-
-test("register mints a pool key and hands the plaintext back exactly once", async () => {
-  // Given: a master no machine has registered against yet
-  const harness = startHarness()
-  try {
-    // When: the dashboard posts the machine's name, with NO credential of any kind — the whole point
-    // of the route is that a machine holding no key can obtain its first one
-    const res = await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "vince-laptop" } satisfies WorkerRegisterRequest)
-
-    // Then
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as WorkerRegisterResponse
-    // EXACTLY these four fields, asserted as a set rather than field by field: this is the one
-    // response on this wire carrying a live credential, so an EXTRA field is the failure to catch —
-    // a digest, an issuedAt, or a second copy of the key going somewhere nobody looked.
-    expect(Object.keys(body).sort()).toEqual(["expiresAt", "label", "poolKey", "workerId"])
-    // The id is the REGISTRY's (`worker-N`), never the caller's: a client-chosen id could land on a
-    // live worker's entry and overwrite its digest.
-    expect(body.workerId).toBe("worker-1")
-    expect(body.label).toBe("vince-laptop")
-    // 32 random bytes base64url — the real registry's shape. A truncated or placeholder key pastes
-    // into a tui.json just fine and then fails at the first lease, hours later and far from here.
-    expect(body.poolKey.length).toBe(43)
-    // The key is LEASED, not permanent, so the page has to be able to say when it lapses.
-    expect(body.expiresAt).toBeGreaterThan(Date.now())
-
-    // And the registry really grew — the response is the registry's answer, not the route's own.
-    expect(harness.minted.map((key) => key.label)).toEqual(["vince-laptop"])
-  } finally {
-    harness.stop()
-  }
-})
-
-test("a GET can never mint a pool key", async () => {
-  const harness = startHarness()
-  try {
-    // When: the route is fetched the way a browser, a link scanner or a chat-app unfurler
-    // speculatively fetches any URL it sees
-    const res = await fetch(`${harness.base}${CLOUD_ROUTES.workerRegister}`)
-
-    // Then: 405 rather than 404, so the fault reads as "wrong method" instead of "this master is too
-    // old to have the button". And the assertion that matters: pasting the dashboard's link into a
-    // chat window left no working pool key in an unfurler's cache.
-    expect(res.status).toBe(405)
-    expect(harness.minted).toEqual([])
-  } finally {
-    harness.stop()
-  }
-})
-
-test("a label the dashboard could never produce is refused before anything is minted", async () => {
-  const harness = startHarness()
-  try {
-    // Given: every shape a hand-rolled curl can send that the browser's own sanitiser — strip
-    // [^A-Za-z0-9-_], lowercase, cap 32 — never would
-    const refused: unknown[] = [
-      { nope: true },
-      {},
-      { label: 42 },
-      { label: "" },
-      { label: "   " },
-      { label: "my laptop" },
-      { label: "Vince" },
-      // The reason the rule exists at all: this label is stored and then rendered back on an
-      // UNAUTHENTICATED page, so arbitrary text here is an anonymous write into a surface the
-      // operator reads.
-      { label: "<img src=x onerror=alert(1)>" },
-      { label: "x".repeat(33) },
-      "{not json",
-    ]
-
-    // When / Then
-    for (const body of refused) {
-      // The rate floor sits AHEAD of the parse and is stamped even by a call it goes on to refuse, so
-      // the clock is stepped between attempts. Without this the second answer would be a 429 and the
-      // case would be asserting the wrong guard entirely.
-      harness.advance(REGISTER_MIN_INTERVAL_MS)
-      const res = await post(harness.base, CLOUD_ROUTES.workerRegister, body)
-      expect(res.status).toBe(400)
-    }
-
-    // AND THE LOAD-BEARING ASSERTION: not one key was minted. A 400 returned AFTER register() would
-    // leave an unreachable entry squatting one of the REGISTER_MAX_LIVE_KEYS slots for a full week.
-    expect(harness.minted).toEqual([])
-
-    // And the value on the other side of each rule is ACCEPTED, so the pattern is proven to be a rule
-    // rather than a blanket refusal — including the trim, since whitespace is an artefact of how the
-    // name was moved rather than part of it.
-    harness.advance(REGISTER_MIN_INTERVAL_MS)
-    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "  vince_laptop-2  " })).status).toBe(200)
-    harness.advance(REGISTER_MIN_INTERVAL_MS)
-    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "x".repeat(32) })).status).toBe(200)
-    expect(harness.minted.map((key) => key.label)).toEqual(["vince_laptop-2", "x".repeat(32)])
-  } finally {
-    harness.stop()
-  }
-})
-
-test("registration is throttled server-wide and says how long to wait", async () => {
-  const harness = startHarness()
-  try {
-    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "first" })).status).toBe(200)
-
-    // A second press inside the window is REFUSED, and on a keyless route that floor is not
-    // politeness: minting reads and rewrites the kv, so without it a caller could turn the button
-    // into an unbounded write loop against the master's store.
-    const throttled = await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "second" })
-    expect(throttled.status).toBe(429)
-    const body = (await throttled.json()) as ThrottledBody
-    expect(body.retryAfterMs).toBeGreaterThan(0)
-    expect(body.retryAfterMs).toBeLessThanOrEqual(REGISTER_MIN_INTERVAL_MS)
-    // The header for anything speaking plain HTTP, in whole seconds; the body's exact ms is what the
-    // page counts down. Both, because a disabled button with no stated reason is the thing to avoid.
-    expect(throttled.headers.get("retry-after")).toBe(String(Math.ceil(body.retryAfterMs / 1000)))
-    // NOTHING was minted by the refused call — that, not the status code, is the property protected.
-    expect(harness.minted).toHaveLength(1)
-
-    // One millisecond short of the window: still refused. Exactly at it: allowed. Both asserted so
-    // that neither a `<` / `<=` slip nor a throttle that never lifts can pass.
-    harness.advance(REGISTER_MIN_INTERVAL_MS - 1)
-    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "third" })).status).toBe(429)
-    harness.advance(1)
-    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "fourth" })).status).toBe(200)
-    expect(harness.minted.map((key) => key.label)).toEqual(["first", "fourth"])
-  } finally {
-    harness.stop()
-  }
-})
-
-test("a registry already at its ceiling answers 409, never 429", async () => {
-  // Given: every slot REGISTER_MAX_LIVE_KEYS allows is occupied by a live key
-  const harness = startHarness({ liveKeys: REGISTER_MAX_LIVE_KEYS })
-  try {
-    // When: one more machine registers — a well-formed request, and the first since boot, so neither
-    // the parser nor the rate floor can be what refuses it
-    const res = await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "one-too-many" })
-
-    // Then: 409, and the split from the 429 above is the caller's next move. A 429 tells the page
-    // "wait and this exact request succeeds", which is false here — waiting helps only once an
-    // operator retires a key or an unused one reaches the end of its 7-day window. Collapsing the two
-    // would put a browser into a retry loop against a wall.
-    expect(res.status).toBe(409)
-    expect(await res.json()).toEqual({ error: "registry full" })
-    // And the ceiling HELD: the refusal landed before register(), so the kv did not grow past it.
-    expect(harness.minted).toHaveLength(REGISTER_MAX_LIVE_KEYS)
-  } finally {
-    harness.stop()
-  }
-})
-
-test("the dashboard page carries the register route", async () => {
-  const harness = startHarness()
-  try {
-    const body = await (await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)).text()
-
-    // Injected from the same frozen table the server dispatches on, exactly as the other four route
-    // injections are, so a renamed route cannot leave a silently dead button behind.
-    expect(body).toContain(CLOUD_ROUTES.workerRegister)
-    // And the page is still a shell: a route that MINTS a key must not have put one in the document.
-    expect(body).not.toContain(POOL_KEY)
-  } finally {
-    harness.stop()
-  }
-})
-
-test("a keyless mint route did not make the credential routes keyless", async () => {
-  const harness = startHarness()
-  try {
-    // Given: an anonymous caller that has just minted itself a pool key through the open route
-    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "anon" })).status).toBe(200)
-
-    // When: the very same caller, still presenting NO Authorization header, asks for a lease and
-    // reports a limit
-    const lease = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
-    const ratelimit = await post(harness.base, CLOUD_ROUTES.ratelimit, {
-      workerId: WORKER_ID,
-      accountId: "acct-a",
-      headers: {},
-    } satisfies RateLimitReport)
-
-    // Then: both still refused. A keyless route that hands out the key these two demand makes that
-    // demand the pool's ONLY remaining gate, so it has to survive being made easy to satisfy.
-    expect(lease.status).toBe(401)
-    expect(ratelimit.status).toBe(401)
-    // Nothing was minted and no pool state moved, which is the consequence those statuses stand for.
-    expect(harness.refreshed).toEqual([])
-    expect(harness.reports).toEqual([])
   } finally {
     harness.stop()
   }

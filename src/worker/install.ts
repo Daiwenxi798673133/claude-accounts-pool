@@ -81,7 +81,6 @@ export function installCloudWorker(
     fetchImpl: fetch,
     sleep,
     masterUrl: cfg.masterUrl,
-    poolKey: cfg.poolKey,
     workerId: cfg.workerId,
   })
 

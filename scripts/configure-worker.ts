@@ -1,8 +1,7 @@
 #!/usr/bin/env bun
 // Configures THIS machine as a cloud-worker of the Claude account pool.
 //
-// It runs on a colleague's laptop that already has a working OpenCode setup, as the last
-// step of the one-liner the dashboard hands out after minting a pool key. Destroying that
+// It runs on a colleague's laptop that already has a working OpenCode setup. Destroying that
 // setup is the only failure that matters here, so the whole script is arranged around it:
 // nothing is rewritten, reordered or deduped, every write is preceded by a backup and a
 // printed diff, and anything the script does not fully understand is a refusal with the
@@ -31,19 +30,18 @@ import {
 const EXIT_USAGE = 2
 const EXIT_REFUSED = 1
 
-const USAGE = `Usage: bun run scripts/configure-worker.ts --master <url> --key <poolKey> --worker <label> [--dry-run]
+const USAGE = `Usage: bun run scripts/configure-worker.ts --master <url> --worker <label> [--dry-run]
 
 Merges this machine into the Claude account pool as a cloud-worker, editing the OpenCode
 config under $XDG_CONFIG_HOME/opencode (default ~/.config/opencode). Existing plugin
 entries are left exactly as they are; re-running changes nothing.
 
   --master <url>    http(s) URL of the master, e.g. http://10.0.0.5:8787
-  --key <poolKey>   the pool key the master issued for this machine
   --worker <label>  a label for this machine, written as workerId
   --dry-run         print the diff and write nothing`
 
-type WorkerArgs = { masterUrl: string; poolKey: string; workerId: string; dryRun: boolean }
-type Flags = { master?: string; key?: string; worker?: string; "dry-run"?: boolean }
+type WorkerArgs = { masterUrl: string; workerId: string; dryRun: boolean }
+type Flags = { master?: string; worker?: string; "dry-run"?: boolean }
 type ArgsResult = { ok: true; args: WorkerArgs } | { ok: false; reason: string }
 type LoadResult = { ok: true; config: JsonObject } | { ok: false; reason: string }
 type ConfigSpec = { base: string; schema: string; merge: (config: JsonObject) => MergeOutcome }
@@ -62,20 +60,18 @@ function isHttpUrl(value: string): boolean {
 
 function validateFlags(values: Flags): ArgsResult {
   const masterUrl = (values.master ?? "").trim()
-  const poolKey = (values.key ?? "").trim()
   const workerId = (values.worker ?? "").trim()
   // Report every missing flag at once: the operator is pasting a command they were handed,
-  // and discovering the three requirements one run at a time is its own bug report.
+  // and discovering the requirements one run at a time is its own bug report.
   const missing = [
     masterUrl.length === 0 ? "--master" : undefined,
-    poolKey.length === 0 ? "--key" : undefined,
     workerId.length === 0 ? "--worker" : undefined,
   ].filter((flag) => flag !== undefined)
   if (missing.length > 0) return { ok: false, reason: `missing or empty: ${missing.join(", ")}` }
   if (!isHttpUrl(masterUrl)) {
     return { ok: false, reason: `--master must be an http(s) URL, got ${JSON.stringify(masterUrl)}` }
   }
-  return { ok: true, args: { masterUrl, poolKey, workerId, dryRun: values["dry-run"] === true } }
+  return { ok: true, args: { masterUrl, workerId, dryRun: values["dry-run"] === true } }
 }
 
 function parseCliArgs(argv: string[]): ArgsResult {
@@ -84,7 +80,6 @@ function parseCliArgs(argv: string[]): ArgsResult {
       args: argv,
       options: {
         master: { type: "string" },
-        key: { type: "string" },
         worker: { type: "string" },
         "dry-run": { type: "boolean", default: false },
       },
@@ -162,11 +157,11 @@ async function main(argv: string[]): Promise<number> {
     process.stderr.write(`${parsed.reason}\n\n${USAGE}\n`)
     return EXIT_USAGE
   }
-  const { masterUrl, poolKey, workerId, dryRun } = parsed.args
+  const { masterUrl, workerId, dryRun } = parsed.args
   const dir = opencodeConfigDir()
   // The field names are the ones src/mode.ts parses; anything else parses as `invalid`
   // and the plugin then installs nothing at all.
-  const entry: TuiEntry = [builtPluginPath(), { mode: "cloud-worker", masterUrl, poolKey, workerId }]
+  const entry: TuiEntry = [builtPluginPath(), { mode: "cloud-worker", masterUrl, workerId }]
 
   const plans: FilePlan[] = []
   const refusals: string[] = []

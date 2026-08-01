@@ -47,7 +47,6 @@ export type SwitchStrategyDeps = {
 // COMPILE error until someone decides what the user is told, rather than silently degrading to a
 // generic message for a fault whose remedy is different.
 const FAILURE_MESSAGE: Record<LeaseFailure["kind"], string> = {
-  auth: "云端账号池拒绝了本机的 pool key，无法切号，请检查 tui.json 配置",
   "no-account": "云端账号池暂无可用账号，已停在当前账号，请稍后重试",
   unreachable: "连不上云端账号池，无法切号，请检查网络或 master 服务",
   "bad-response": "云端账号池返回了无法识别的响应，未切号",

@@ -41,7 +41,6 @@ export type ManualSwitch = {
 // Worded for THIS path, deliberately not shared with switchStrategy's table: there the sentence ends
 // "已停在当前账号" because a spent account is still in use, here it ends "未切号" because nothing moved.
 const FAILURE_MESSAGE: Record<Exclude<LeaseFailure["kind"], "refused">, string> = {
-  auth: "云端账号池拒绝了本机的 pool key，无法切号，请检查 tui.json 配置",
   "no-account": "云端账号池没有可租借的账号，未切号",
   unreachable: "连不上云端账号池，未切号，请检查网络或 master 服务",
   "bad-response": "云端账号池返回了无法识别的响应，未切号",

@@ -193,36 +193,3 @@ export const ONBOARD_MAX_ATTEMPTS = 3
 // the token endpoint that gets this master's IP blocked and takes every account's refresh with it.
 // Sized for a human pressing a button, not for a script.
 export const ONBOARD_ADD_MIN_INTERVAL_MS = 3_000
-
-// ── Worker pool keys (self-service registration) ─────────────────────────────────────────────────
-// A pool key is a bearer credential for the lease endpoint, and it used to live forever: a key
-// pasted into a laptop's tui.json a year ago still opens the pool today, and there is no revocation
-// entry point anywhere. The bounds below turn that permanent credential into a LEASED one — a key
-// stays valid only while the machine holding it keeps using it — and cap what a self-service
-// registration route can do to the registry.
-
-// Validity window of a pool key, slid forward by every successful verify. A week is long enough
-// that a laptop left closed over a holiday still works on return, short enough that a machine which
-// stopped calling home stops being a live credential without anyone having to notice.
-export const POOLKEY_TTL_MS = 7 * 24 * 3_600_000
-
-// Floor between two PERSISTED slides of the same key. This is DEFENSIVE, not a fix for a measured
-// write storm, and the difference is worth recording so nobody later removes it believing it was
-// cargo: a worker checks its lease every LEASE_CHECK_INTERVAL_MS but only calls out when the lease
-// is inside LEASE_RENEW_BUFFER_MS of expiring, so the natural cadence is a handful of verifies per
-// worker per day, which would be perfectly affordable to persist unconditionally. What the floor
-// buys is DECOUPLING — the credential check on the lease path stops implying a disk write, so a
-// worker stuck in a retry loop, a fleet that grew, or a future shortening of the renewal buffer
-// cannot quietly turn authentication into I/O. The price is bounded and small: the stored expiry
-// trails the true one by at most an hour, ~0.6% of the window above.
-export const POOLKEY_SLIDE_MIN_INTERVAL_MS = 3_600_000
-
-// Server-wide floor between two self-service registrations. Minting is the one pool operation that
-// GROWS persistent state, so without a rate floor a caller could turn the route into an unbounded
-// write loop against the kv. Sized for a human pasting a key into a config, not for a script.
-export const REGISTER_MIN_INTERVAL_MS = 10_000
-
-// Hard ceiling on simultaneously-live keys, which is what makes the registry's size a CONSTANT
-// rather than something a caller picks. Well above any realistic fleet so it never blocks an
-// operator; expired keys are pruned, so the ceiling counts machines in use, not machines ever seen.
-export const REGISTER_MAX_LIVE_KEYS = 32

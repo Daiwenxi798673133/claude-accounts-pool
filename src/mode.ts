@@ -3,7 +3,7 @@ import type { PluginOptions } from "@opencode-ai/plugin"
 export type ModeConfig =
   | { mode: "local" }
   | { mode: "cloud-master"; hostname: string; port: number }
-  | { mode: "cloud-worker"; masterUrl: string; poolKey: string; workerId: string }
+  | { mode: "cloud-worker"; masterUrl: string; workerId: string }
   | { mode: "invalid"; reason: string }
 
 // Everything a user may WRITE in tui.json. `invalid` is a parse RESULT, never an input,
@@ -55,16 +55,14 @@ function parseCloudMaster(options: PluginOptions): ModeConfig {
 
 function parseCloudWorker(options: PluginOptions): ModeConfig {
   const masterUrl = readNonEmptyString(options, "masterUrl")
-  const poolKey = readNonEmptyString(options, "poolKey")
   const workerId = readNonEmptyString(options, "workerId")
-  if (masterUrl !== undefined && isHttpUrl(masterUrl) && poolKey !== undefined && workerId !== undefined) {
-    return { mode: "cloud-worker", masterUrl, poolKey, workerId }
+  if (masterUrl !== undefined && isHttpUrl(masterUrl) && workerId !== undefined) {
+    return { mode: "cloud-worker", masterUrl, workerId }
   }
   // Every offending field at once, not just the first: a worker restart is expensive enough
-  // that discovering the three requirements one round-trip at a time is its own bug report.
+  // that discovering the requirements one round-trip at a time is its own bug report.
   const bad: string[] = []
   if (masterUrl === undefined || !isHttpUrl(masterUrl)) bad.push(`"masterUrl" (non-empty http(s) URL)`)
-  if (poolKey === undefined) bad.push(`"poolKey" (non-empty string)`)
   if (workerId === undefined) bad.push(`"workerId" (non-empty string)`)
   return { mode: "invalid", reason: `cloud-worker needs ${bad.join(", ")}` }
 }

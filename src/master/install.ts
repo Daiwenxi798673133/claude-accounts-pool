@@ -25,19 +25,8 @@ import { createAccountOnboard, type OnboardProfile } from "./accountOnboard.ts"
 import { installMasterKeeper, makeOnboardingCapture } from "./keeper.ts"
 import { startLeaseServer } from "./leaseServer.ts"
 import { createRefresher, type MasterToken } from "./refresher.ts"
-import { createRegistry } from "./registry.ts"
 import { createScheduler } from "./scheduler.ts"
 import { installUsagePoller } from "./usagePoller.ts"
-
-// Command-value namespace, matching tui.tsx's local `ID`. Restated rather than imported: tui.tsx
-// is the plugin ENTRY and importing it from here would make the composition root depend on its own
-// caller — and on the whole Solid dialog graph that entry pulls in.
-const ID = "claude-accounts-usage"
-
-// A pool key is displayed exactly ONCE and is unrecoverable afterwards (the registry stores only a
-// SHA-256 digest), so the toast carrying it must outlive a glance. Every other toast in this plugin
-// takes the default duration; this one cannot.
-const POOL_KEY_TOAST_MS = 120_000
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -94,10 +83,8 @@ export function installCloudMaster(
   api: TuiPluginApi,
   cfg: Extract<ModeConfig, { mode: "cloud-master" }>,
 ): { dispose: () => void } {
-  // Both keyed stores live in api.kv (tui.json), so pool-key digests and cooldown deadlines both
-  // survive a restart — a master that forgot its cooldowns would re-lease accounts that are still
-  // spent, and one that forgot its digests would lock out every worker.
-  const registry = createRegistry({ kv: api.kv })
+  // Cooldown deadlines live in api.kv so they survive a restart: a master that forgot its cooldowns
+  // would re-lease accounts that are still spent.
   const scheduler = createScheduler({ kv: api.kv })
 
   const refresher = createRefresher({
@@ -145,7 +132,6 @@ export function installCloudMaster(
   const server = startLeaseServer({
     scheduler,
     refresher,
-    registry,
     loadAccounts: roster,
     accountOnboard,
     // The dashboard's refresh button reuses the poller's OWN sweep rather than fetching usage itself,
@@ -159,7 +145,6 @@ export function installCloudMaster(
     signal: api.lifecycle.signal,
   })
 
-  let unregisterCommand: (() => void) | undefined
   let disposed = false
 
   // TWO PATHS TO THE SAME TEARDOWN, deliberately. The per-piece lifecycle registrations below are
@@ -169,7 +154,6 @@ export function installCloudMaster(
   const dispose = (): void => {
     if (disposed) return
     disposed = true
-    unregisterCommand?.()
     usagePoller.dispose()
     keeper.dispose()
     server.stop()
@@ -179,37 +163,9 @@ export function installCloudMaster(
   api.lifecycle.onDispose(keeper.dispose)
   api.lifecycle.onDispose(usagePoller.dispose)
 
-  const command = api.command
-  if (!command) {
-    // Same refusal tui.tsx makes, and it stops HERE rather than aborting the install: a master
-    // whose palette cannot mint new keys still serves every worker already holding one, so tearing
-    // the pool down over a missing UI surface would be the worse outcome.
-    log.error("master:no-command-api")
-    api.ui.toast({ variant: "error", message: "当前 OpenCode 不支持命令注册 API,请更新 OpenCode" })
-    return { dispose }
-  }
-
-  unregisterCommand = command.register(() => [
-    {
-      title: "Claude: 注册云端 worker(生成 pool key)",
-      value: `${ID}.reg`,
-      category: "Claude",
-      slash: { name: "reg" },
-      onSelect: () => {
-        const worker = registry.register("tui")
-        // PRIVACY: `worker.key` is a live bearer credential for this pool and reaches ONLY this
-        // toast — never a log line, never a file we write. registry.register already logged the
-        // workerId, which is the entire diagnostic value; the key is deliberately unrecoverable
-        // from anywhere on disk, so a log here would be the only copy an attacker needs.
-        api.ui.toast({
-          variant: "success",
-          message: `已注册 worker「${worker.workerId}」。pool key 仅显示这一次,请立即复制到该机器的 tui.json:${worker.key}`,
-          duration: POOL_KEY_TOAST_MS,
-        })
-      },
-    },
-  ])
-
-  log.info("master:installed", { hostname: cfg.hostname, port: server.port, workers: registry.list().length })
+  // A master registers NO commands: it runs no inference, so it has no /usage and no /stats, and
+  // there is no longer a credential for a palette entry to mint. Everything an operator needs is on
+  // the web dashboard this server already serves.
+  log.info("master:installed", { hostname: cfg.hostname, port: server.port })
   return { dispose }
 }
