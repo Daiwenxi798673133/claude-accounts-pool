@@ -108,7 +108,12 @@ export function installMasterKeeper(deps: MasterKeeperDeps): { dispose: () => vo
         // would brand that healthy account needs-reauth. Read through providerOf, never
         // `provider === "anthropic"`: every record written before multi-provider support lacks
         // the field and a hand-rolled comparison silently drops it.
-        accounts = (await deps.loadAccounts()).filter((account) => providerOf(account) === "anthropic")
+        // A flagged account is skipped rather than warmed: its chain is known dead, and this sweep
+        // visits every account every five minutes, so trying anyway would be a guaranteed-400 drip
+        // at the token endpoint — from the single egress IP the entire pool depends on.
+        accounts = (await deps.loadAccounts()).filter(
+          (account) => providerOf(account) === "anthropic" && !account.needsReauth,
+        )
       } catch (error) {
         log.warn("master-keeper:load-fail", { error: errorMessage(error) })
         return
@@ -138,9 +143,9 @@ export function installMasterKeeper(deps: MasterKeeperDeps): { dispose: () => vo
     }
   }
 
-  // One look per KEEPALIVE_TICK_MS (5 min) against the refresher's MASTER_MIN_REMAINING_MS floor
-  // (10 min), so every token gets at least two chances to be warmed before it drops below the
-  // amount the master is willing to lease out.
+  // One look per KEEPALIVE_TICK_MS (5 min) against the refresher's MASTER_REFRESH_THRESHOLD_MS
+  // (4 h), so a chain that fails to rotate gets dozens of further attempts before its access token
+  // is anywhere near spent — the margin that was missing when the trigger was a 10-minute window.
   const interval = setInterval(() => void tickOnce(), KEEPALIVE_TICK_MS)
   // The warm loop must never be the reason the process stays alive; the master's HTTP server owns
   // that decision.

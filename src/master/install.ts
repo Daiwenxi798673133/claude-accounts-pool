@@ -36,7 +36,7 @@ import { createAccountOnboard, type OnboardProfile } from "./accountOnboard.ts"
 import { createAccountRemove } from "./accountRemove.ts"
 import { installMasterKeeper, makeOnboardingCapture } from "./keeper.ts"
 import { startLeaseServer } from "./leaseServer.ts"
-import { createRefresher, type MasterToken } from "./refresher.ts"
+import { createRefresher, type MasterToken, type RefreshRevokedOutcome } from "./refresher.ts"
 import { createScheduler } from "./scheduler.ts"
 import { installUsagePoller } from "./usagePoller.ts"
 
@@ -59,6 +59,36 @@ async function persistToken(accountId: string, token: MasterToken): Promise<void
     // atomically with the token, so a re-logged-in account is not left permanently skipped.
     applyToken(record, { kind: "full", token })
     await saveAccounts(file)
+  })
+}
+
+// What happens to an account whose refresh POST came back `invalid_grant`, and the ONLY writer of
+// `needsReauth` on this master. Under the same lock as persistToken, because both are
+// read-modify-writes of the same record.
+//
+// THE ADOPT BRANCH IS NOT AN OPTIMISATION. This master is supposed to be the sole refresher, but the
+// one failure it cannot rule out is that it is NOT — a stale login on another box, a second master.
+// In that case our POST merely lost the rotation race and the account is perfectly healthy, so
+// branding it needs-reauth would take a live account out of the pool on the strength of someone
+// else's success. A record already flagged is never adopted: that would erase another writer's
+// verdict on a chain that really is dead.
+async function onRefreshRevoked(accountId: string, deadRefresh: string): Promise<RefreshRevokedOutcome> {
+  return withAuthLock(async () => {
+    const file = await loadAccounts()
+    const record = file.accounts.find((account) => account.id === accountId)
+    if (!record) {
+      log.warn("master:revoked-unknown-account", { accountId })
+      return {}
+    }
+    if (record.needsReauth) return {}
+    if (record.refresh !== deadRefresh) {
+      log.info("master:adopt-foreign-rotation", { accountId, label: record.label })
+      return { adopted: { access: record.access, expires: record.expires } }
+    }
+    record.needsReauth = true
+    await saveAccounts(file)
+    log.warn("master:account-needs-reauth", { accountId, label: record.label })
+    return {}
   })
 }
 
@@ -105,6 +135,7 @@ export function installCloudMaster(
     fetchImpl: fetch,
     loadAccount: async (accountId) => (await roster()).find((account) => account.id === accountId),
     persist: persistToken,
+    onRefreshRevoked,
   })
 
   const usagePoller = installUsagePoller({

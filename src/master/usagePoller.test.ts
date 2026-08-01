@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
 import type { UsageResponse } from "../usage.ts"
 import type { UsageSnapshotEntry } from "./scheduler.ts"
-import { installUsagePoller, USAGE_POLL_429_COOLDOWN_MS, USAGE_POLL_SPACING_MS } from "./usagePoller.ts"
+import { installUsagePoller, USAGE_POLL_429_COOLDOWN_MS, USAGE_POLL_INITIAL_DELAY_MS, USAGE_POLL_SPACING_MS } from "./usagePoller.ts"
 
 // Zero network: `fetchUsageFor` is injected and has NO default, so a test that forgot to supply it
 // is a compile error rather than a live request at `/api/oauth/usage` — an endpoint with known
@@ -114,6 +114,55 @@ test("applies per-account 429 cooldown and skips cooled accounts", async () => {
   expect(attempts).toEqual(["a", "b", "b", "a", "b"])
 
   poller.dispose()
+})
+
+// ---- ACCEPTANCE CRITERION (issue #37): the dashboard must not be blind after a restart ---------
+test("sweeps shortly after install instead of one whole interval later", async () => {
+  const fetched: string[] = []
+  const poller = installUsagePoller({
+    loadAccounts: async () => [account("a")],
+    fetchUsageFor: async (target: StoredAccount) => {
+      fetched.push(target.id)
+      return usage(7)
+    },
+    scheduler: { setUsageCache: () => {} },
+    sleep: async () => {},
+    now: () => NOW,
+  })
+
+  try {
+    // A bare setInterval left the first sweep MASTER_USAGE_POLL_INTERVAL_MS away, so every restart
+    // spent five minutes serving a dashboard reading 本轮无数据 for every account.
+    expect(USAGE_POLL_INITIAL_DELAY_MS).toBeLessThan(10_000)
+    await new Promise((resolve) => setTimeout(resolve, USAGE_POLL_INITIAL_DELAY_MS + 50))
+    expect(fetched).toEqual(["a"])
+  } finally {
+    poller.dispose()
+  }
+})
+
+test("never polls an account whose chain is known dead", async () => {
+  const fetched: string[] = []
+  const accounts = [account("a"), account("dead", { needsReauth: true })]
+
+  const poller = installUsagePoller({
+    loadAccounts: async () => accounts,
+    fetchUsageFor: async (target: StoredAccount) => {
+      fetched.push(target.id)
+      return usage(11)
+    },
+    scheduler: { setUsageCache: () => {} },
+    sleep: async () => {},
+    now: () => NOW,
+  })
+
+  await poller.tickOnce()
+  poller.dispose()
+
+  // Every fetch here goes through the refresher, so polling a dead chain buys a guaranteed refresh
+  // failure and no snapshot entry — while costing a POST at an endpoint that punishes this host's
+  // whole pool by IP. The dashboard states their case from the flag instead.
+  expect(fetched).toEqual(["a"])
 })
 
 test("feeds scheduler usage cache", async () => {

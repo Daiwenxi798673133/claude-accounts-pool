@@ -18,6 +18,11 @@ export type StoredAccount = {
   expires?: number
   excluded?: boolean
   needsReauth?: boolean
+  // When the CURRENT refresh tip entered this record. The only way to tell a chain that died of old
+  // age from one an outsider revoked: without it, "the tip was 8h old" and "the tip was 6 days old"
+  // are indistinguishable after the fact, and issue #37's investigation had to guess. Absent on
+  // every record written before this field existed, and on any chain never rotated since.
+  refreshMintedAt?: number
   // Absent ⇒ anthropic (read it through providerOf, never directly). Every record written
   // by a pre-multi-provider release lacks this field, and back-filling it on load would
   // rewrite a store that an older installed version still reads — hence a read-time
@@ -143,6 +148,11 @@ function resolveTokenWrite(write: TokenWrite | AuthToken): AuthToken {
 // account as permanently skipped.
 export function applyToken(record: StoredAccount, write: TokenWrite | AuthToken): StoredAccount {
   const token = resolveTokenWrite(write)
+  // Stamped ONLY on a real rotation, and that is what makes the age readable. Re-capturing an
+  // UNCHANGED tip (autoCapture runs on every keeper tick) must not restart the clock, or every
+  // chain would read as newly minted forever; and INV-CLOUD-1's sentinel is not a chain at all, so
+  // a worker's lease write must not claim to have minted one.
+  if (token.refresh !== SENTINEL_REFRESH && token.refresh !== record.refresh) record.refreshMintedAt = Date.now()
   record.refresh = token.refresh
   record.access = token.access
   record.expires = token.expires
