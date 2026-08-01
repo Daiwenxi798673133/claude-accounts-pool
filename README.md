@@ -15,7 +15,7 @@
 | `/usage` | `local` | 弹框显示账号用量,按 provider 分 `Claude` / `ChatGPT` 两页(`tab` / `←→` / `h l` 切页),并常驻一行「当前对话」显示本轮真实的 provider / model。两页都可 `↑↓` 选择、`enter` 切换(立即生效)、`m` 标记/取消"不自动切"、`d` 删除账号(再按一次 `d` 确认,当前账号不可删)、`esc` 关闭 |
 | `/usage` | `cloud-worker` | **另一个精简面板**:单一 Claude 平铺列表,没有 provider 页签,也没有 `m` / `d`——这两个操作都要改账号库,而账号库在 master 上。键位是 `↑↓ 选择 · enter 切号 · r 刷新 · esc 关闭`:`enter` 是**向 master 申请租用**指定账号,可能被拒(账号不存在 / 前缀有歧义 / 冷却中 / 需重新登录);`r` 让 master 立刻跑一轮采集;master 停止轮询时面板顶部会给出快照陈旧的警告 |
 | `/stats` | **仅本地** | 弹框显示本地 OpenCode 的用量统计仪表盘:总览 / 模型 / 提供方三个分页,含活跃热力图与 token 折线图,可切 All / 7天 / 30天 范围 |
-| `/reg` | `cloud-master` | 给一台 worker 签发 pool key,见下文「cloud 模式:运维」 |
+| `/reg` | `cloud-master` | 给一台 worker 签发 pool key,**兜底用**——常规路径是在看板上点「领取 key」自助领。见下文「cloud 模式:运维」 |
 
 `cloud-master` **只注册 `/reg`**——它既没有 `/usage` 也没有 `/stats`,master 端要看用量请打开 web 看板。
 
@@ -81,7 +81,7 @@ cd claude-accounts-pool && bun install && bun run build
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": [["/绝对路径/claude-accounts-pool/dist/tui.js", { "mode": "cloud-worker", "masterUrl": "http://10.0.0.5:8787", "poolKey": "<master 打印给你的那把 key>", "workerId": "laptop-1" }]]
+  "plugin": [["/绝对路径/claude-accounts-pool/dist/tui.js", { "mode": "cloud-worker", "masterUrl": "http://10.0.0.5:8787", "poolKey": "<签发给这台机器的那把 key>", "workerId": "laptop-1" }]]
 }
 ```
 
@@ -89,7 +89,7 @@ cd claude-accounts-pool && bun install && bun run build
 
 - `hostname` 省略时默认 **`127.0.0.1`**。这是**故意**的:这个端口对外发放的是活的 access token,想绑更宽的地址必须显式写出来。注意**写了但不是非空字符串**(空串、纯空白、数字)不会退回默认值,而是整份配置直接判为非法。
 - `port` 必须是 `1`–`65535` 的整数。
-- `cloud-worker` 三个字段 `masterUrl`(http/https)、`poolKey`、`workerId` **缺一不可**。其中 `workerId` 只是本机日志用的标签:master 认的身份只有 pool key,注册表会自己给每把 key 分配 `worker-N` 编号。
+- `cloud-worker` 三个字段 `masterUrl`(http/https)、`poolKey`、`workerId` **缺一不可**。其中 `workerId` 只是本机日志用的标签:master 认的身份只有 pool key,注册表会自己给每把 key 分配 `worker-N` 编号,另外记下你领 key 时填的那个 label(和这里的 `workerId` 是两个字段,下文那条一键命令只是把同一个字符串同时用作两者)。这份 `tui.json` 通常不用手写,见下文运维第 2 步。
 - 参数不合法时,插件**什么都不装**,只弹一个错误提示——宁可不工作,也不半配置地跑。
 
 ## cloud 模式:运维
@@ -97,9 +97,19 @@ cd claude-accounts-pool && bun install && bun run build
 1. **把 Claude 账号纳管进池子**,两条路任选:
    - **浏览器**(推荐):打开 master 的看板,点右上角「添加账号」,照着弹窗里的链接登录授权,再把授权页给出的 code 粘回来即可。
    - **命令行**:在 master 主机上照常 `opencode auth login`(经 ex-machina),master 的 keeper 会自动收录进账号库。
-2. **在 master 那个 OpenCode 会话里执行斜杠命令 `/reg`**,给每台 worker 签发 pool key——它是 TUI 里的命令,不是 shell 命令。**明文 key 只在 toast 里出现这一次、停留 120 秒**(库里只存 SHA-256 摘要),请立刻粘进那台 worker 的 `tui.json`。
-3. **每台 worker 一把独立的 key**,库里按 worker 分开存摘要。但要清楚:目前**没有吊销入口**,也没有查看已发 key 清单的入口——想停用某一把,只能手工编辑 OpenCode KV 里的 `claude-accounts-usage.master.poolkeys` 条目。
-4. **想看全池用量**:浏览器直接打开 `http://<master 的 hostname>:<port>/` 就是看板(JSON 接口是 `GET /v1/usage`,另有 `GET /v1/health` 返回 `{"ok":true}` 供探活),**免鉴权**。也就是说凡能连到这个端口的人都能看到池内账号与余量,**也能用上面那个「添加账号」按钮往池里加号**(但加不进来就拿不走——租借仍然要 pool key)。想收窄就收窄绑定地址——[取舍与理由见此](docs/cloud-mode.md#为什么这几条路由是裸的)。
+2. **给每台 worker 签发 pool key**,常规路径在看板上:点「领取 key」,填一个这台机器的 label,页面当场给出 key(**明文只显示这一次**,库里只存 SHA-256 摘要),连同一条能直接粘进那台 worker 终端的命令:
+
+   ```bash
+   git clone --depth 1 https://github.com/Daiwenxi798673133/claude-accounts-pool.git ~/.claude-accounts-pool \
+     && cd ~/.claude-accounts-pool && bun install && bun run build \
+     && bun run scripts/configure-worker.ts --master <MASTER_URL> --key <POOL_KEY> --worker <LABEL>
+   ```
+
+   这条命令幂等地把那台机器并进池子:装依赖、构建(**`bun` 是硬前置**——`dist/` 不入库,worker 必须本机构建),再合并 `~/.config/opencode/` 下的配置。它**只增不改**:别人的插件条目一个字节都不碰,语义没变的文件干脆不写,拿不准就拒绝并打出该手工粘贴的 JSON;写之前会打 diff、做备份,`--dry-run` 可以只看不写。完整的保证与四种拒写条件见 [docs/cloud-mode.md](docs/cloud-mode.md#一条命令把-worker-配好)。跑完**完全退出并重开** OpenCode。
+
+   **兜底路径**:看板不可达时,在 master 那个 OpenCode 会话里执行斜杠命令 `/reg`(TUI 里的命令,不是 shell 命令),**明文 key 在 toast 里停留 120 秒**。两条路签出的 key 完全等价。
+3. **每台 worker 一把独立的 key,有效期 7 天,而且每次成功租借都把到期时间滑到 7 天后。** 所以在用的 worker 不会掉线(放假一周合上笔记本回来也还在),而**领了没用上的 key 7 天后自己消失**——自助签发不会攒下一堆永久凭据。但要清楚:**活着的 key 仍然没有吊销入口**,也没有查看已发 key 清单的入口。想立刻停用某一把,只能手工编辑 OpenCode KV 里的 `claude-accounts-usage.master.poolkeys` 条目——它的值现在是 `{"worker-1": {"digest": "<sha256 摘要>", "label": "laptop-1", "issuedAt": <毫秒>, "expiresAt": <毫秒>}}`,旧版本留下的裸摘要会在升级后**首次用到注册表时自动迁移**(摘要逐字保留,**不会踢掉正在跑的 worker**)。
+4. **想看全池用量**:浏览器直接打开 `http://<master 的 hostname>:<port>/` 就是看板(JSON 接口是 `GET /v1/usage`,另有 `GET /v1/health` 返回 `{"ok":true}` 供探活),**免鉴权**。也就是说凡能连到这个端口的人都能看到池内账号与余量,**能用「添加账号」往池里加号**,而且——这一条要紧得多——**能用「领取 key」给自己签一把真能租借 access token 的 key**。想收窄,能收窄的只有绑定地址——[取舍与理由见此](docs/cloud-mode.md#为什么这几条路由是裸的)。
 5. **看板会自己跟上**:右上角的**刷新**按钮走 `POST /v1/usage/refresh`,让 master 立刻采集一轮;这条路由在服务端全局节流,**30 秒**一次,超频返回 429 并在按钮上显示倒计时。页面本身每 5 秒重拉一次 `/v1/usage`,切回标签页时也会立刻重拉,因此池外触发的采集(别人的浏览器,或 master 自己每 5 分钟的定时轮询)同样跟得上。账号卡片是自适应网格,每张卡显示邮箱、徽标(冷却中 / 需重新登录 / 不自动切 / 本轮无数据)、access token 剩余时间,以及各窗口的用量条与重置倒计时。
 6. **一条硬规矩:纳入池子的账号,在池外不能再有任何刷新者。** 旧机器上残留的登录、第二个 master,都算。Anthropic 的 refresh token 是一次性并且轮换的,而且(**实测**)一次刷新还会**立刻作废上一枚已签发的 access token**——池外的第二个刷新者不仅会打断 refresh 链,还会当场击毙所有在外的租约。
 
@@ -120,7 +130,7 @@ grep "claude-accounts-usage" ~/.local/share/opencode/log/opencode.log
 | 文档 | 内容 |
 |---|---|
 | [docs/local-mode.md](docs/local-mode.md) | 单机模式详解:账号管理流程、`/stats` 仪表盘、限流自动切号的完整机制、ChatGPT 多账号(含两个默认关闭的开关) |
-| [docs/cloud-mode.md](docs/cloud-mode.md) | 账号池详解:master/worker 职责划分、哨兵 refresh、租约视界与 401 恢复、pool key、只读用量看板与「添加账号」为什么是裸路由、内部标识符为何不改 |
+| [docs/cloud-mode.md](docs/cloud-mode.md) | 账号池详解:master/worker 职责划分、哨兵 refresh、租约视界与 401 恢复、pool key 的自助签发与 7 天滑动过期、一键配好 worker 的那条命令、用量看板与「添加账号」/「领取 key」为什么是裸路由、内部标识符为何不改 |
 | [docs/internals.md](docs/internals.md) | 两种模式共通的实现机制:存储模型、跨进程锁、原子写、provider 隔离、后台保活、开发命令 |
 | [docs/limitations.md](docs/limitations.md) | **已知限制**(采用前建议先读) |
 | [docs/design/cloud-mode-adr.md](docs/design/cloud-mode-adr.md) | cloud 模式的架构决策记录,含 Gate-0 实测证据与被推翻的先验假设 |
