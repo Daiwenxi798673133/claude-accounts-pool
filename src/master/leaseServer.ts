@@ -20,6 +20,10 @@ import type { StoredAccount } from "../accounts.ts"
 import type {
   AccountAddRequest,
   AccountAddResponse,
+  AccountDeleteRefusal,
+  AccountDeleteRefusedBody,
+  AccountDeleteRequest,
+  AccountDeleteResponse,
   AuthorizeStartResponse,
   ErrorBody,
   LeaseReason,
@@ -35,6 +39,7 @@ import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
 import type { AccountOnboard } from "./accountOnboard.ts"
+import type { AccountRemove } from "./accountRemove.ts"
 import { dashboardHtml } from "./dashboardHtml.ts"
 import type { PreferredInput, PreferredPick, UsageSnapshot } from "./scheduler.ts"
 import { buildUsageView } from "./usageView.ts"
@@ -61,6 +66,10 @@ export type LeaseServerDeps = {
   // The dashboard's "添加账号" flow. Owns the PKCE sessions, the exchange and the write into the
   // account library; this server owns only the mapping from its outcomes onto HTTP statuses.
   accountOnboard: AccountOnboard
+  // The dashboard's "删除账号" flow, and the mirror image of the field above: it owns prefix
+  // resolution, the label confirmation and the backup-before-delete ordering, and this server again
+  // owns only the statuses.
+  accountRemove: AccountRemove
   // Injected so a test can drive the refresh throttle deterministically. EVERY time read in this
   // module goes through it; a stray Date.now() would silently escape the injected clock.
   now?: () => number
@@ -86,6 +95,8 @@ function json(
     | LeaseRefusedBody
     | AuthorizeStartResponse
     | AccountAddResponse
+    | AccountDeleteRefusedBody
+    | AccountDeleteResponse
     | { ok: true },
 ): Response {
   return Response.json(body, { status })
@@ -191,6 +202,29 @@ function parseAccountAddRequest(raw: unknown): AccountAddRequest | undefined {
   const trimmed = code.trim()
   if (trimmed.length === 0) return undefined
   return { pendingId, code: trimmed }
+}
+
+// BOTH fields are required and BOTH must be non-empty, which is stricter than it looks: an empty
+// prefix would match every account (and so resolve to `ambiguous` on a real pool but succeed by luck
+// on a single-account one), and an empty label would turn the confirmation into a field the caller
+// can satisfy by omitting it. Only the surrounding whitespace of the label is forgiven — that is an
+// artefact of copying an address off the page, not something the operator meant.
+function parseAccountDeleteRequest(raw: unknown): AccountDeleteRequest | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined
+  const { idPrefix, label } = raw as Record<string, unknown>
+  if (typeof idPrefix !== "string" || idPrefix.length === 0) return undefined
+  if (typeof label !== "string") return undefined
+  const trimmed = label.trim()
+  if (trimmed.length === 0) return undefined
+  return { idPrefix, label: trimmed }
+}
+
+// English, like every other `error` string on this wire: the page branches on `refused` and renders
+// its own Chinese, so these exist for whoever is reading the route with curl.
+const DELETE_REFUSAL_DETAIL: Record<AccountDeleteRefusal, string> = {
+  unknown: "no such account in the pool",
+  ambiguous: "account prefix matches more than one account",
+  "label-mismatch": "confirmation does not match the account label",
 }
 
 // `workerId` is a SELF-DECLARED label — nothing authenticates it, so it names the machine only as
@@ -413,6 +447,26 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     return json(410, { error: outcome.reason })
   }
 
+  // THE ONE DESTRUCTIVE ROUTE ON THIS SERVER. POST-enforced like the two above it, and for a sharper
+  // reason: the others cost an upstream request or a pending session, this one costs an account.
+  //
+  // 409 for all three refusals, deliberately NOT 404 for `unknown`: they share one remedy shape (look
+  // at the page again and re-issue) and the page branches on `refused`, not on the status. A 404
+  // would additionally read as "this master is too old to have the route", which is the one thing
+  // that is not wrong here.
+  async function handleAccountDelete(req: Request): Promise<Response> {
+    if (req.method !== "POST") return json(405, { error: "use POST" })
+    const request = parseAccountDeleteRequest(await readJson(req))
+    if (!request) return badRequest("malformed account delete request")
+    const outcome = await deps.accountRemove.remove(request.idPrefix, request.label)
+    if (!outcome.ok) {
+      log.warn("master:account-delete-refused", { idPrefix: request.idPrefix, refused: outcome.refusal })
+      return json(409, { error: DELETE_REFUSAL_DETAIL[outcome.refusal], refused: outcome.refusal })
+    }
+    // The deletion itself is logged by accountRemove, which is where the record was still in hand.
+    return json(200, { idPrefix: outcome.idPrefix, label: outcome.label })
+  }
+
   // The STRING is built once (the shell is a constant), but each request gets a FRESH Response: a
   // Response body is a single-use stream, so sharing one object would serve the first browser and
   // then fail every reload after it.
@@ -422,6 +476,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     throttleMs: USAGE_REFRESH_MIN_INTERVAL_MS,
     authorizeRoute: CLOUD_ROUTES.accountAuthorize,
     addRoute: CLOUD_ROUTES.accountAdd,
+    deleteRoute: CLOUD_ROUTES.accountDelete,
   })
 
   const routes: Record<Route, RouteHandler> = {
@@ -443,6 +498,12 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // defence, and this table is where a reviewer should notice it.
     [CLOUD_ROUTES.accountAuthorize]: (req) => handleAccountAuthorize(req),
     [CLOUD_ROUTES.accountAdd]: (req) => handleAccountAdd(req),
+    // AND THE ONE THAT TAKES AN ACCOUNT OUT. Nothing in this process gates it either, so what stands
+    // between an anonymous caller and a deleted subscription is: the bind address, having to name the
+    // account's own label, and the copy accountRemove files before the write. A reviewer should
+    // notice all three here, and should not add a fourth in this table — the header of this file
+    // explains why an application-layer one would be theatre.
+    [CLOUD_ROUTES.accountDelete]: (req) => handleAccountDelete(req),
   }
 
   // A table lookup, not an if/else chain over paths: the chain's fallthrough silently answers an

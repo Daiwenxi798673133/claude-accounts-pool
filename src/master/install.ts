@@ -16,12 +16,24 @@ import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 // compatibility promise. It is also bundled at build time (scripts/build.ts inlines everything not
 // listed as external), so a published consumer never resolves this path at runtime.
 import { authorize, exchange } from "@ex-machina/opencode-anthropic-auth/dist/auth.js"
-import { applyToken, loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, type AuthToken, type StoredAccount } from "../accounts.ts"
+import {
+  applyToken,
+  backupRemovedAccount,
+  loadAccounts,
+  readAuthAnthropic,
+  removeAccount,
+  saveAccounts,
+  upsertAccount,
+  withAuthLock,
+  type AuthToken,
+  type StoredAccount,
+} from "../accounts.ts"
 import { log } from "../logger.ts"
 import type { ModeConfig } from "../mode.ts"
 import { fetchProfile } from "../profile.ts"
 import { autoCapture, fetchUsage } from "../usage.ts"
 import { createAccountOnboard, type OnboardProfile } from "./accountOnboard.ts"
+import { createAccountRemove } from "./accountRemove.ts"
 import { installMasterKeeper, makeOnboardingCapture } from "./keeper.ts"
 import { startLeaseServer } from "./leaseServer.ts"
 import { createRefresher, type MasterToken } from "./refresher.ts"
@@ -127,6 +139,20 @@ export function installCloudMaster(
     now: Date.now,
   })
 
+  // The dashboard's 删除账号 flow, wired against the account library's OWN removal path rather than a
+  // second load/modify/save: removeAccount already holds the cross-process auth lock for the whole
+  // read-modify-write and already clears every active pointer naming the id, and a copy of that
+  // here would be a copy that drifts. It also means the backup runs OUTSIDE that lock — the record
+  // was read a moment earlier and is passed by value, so the copy on disk is the record as it stood
+  // when the operator confirmed it, which is exactly the one they are asking to be able to restore.
+  const accountRemove = createAccountRemove({
+    loadAccounts: roster,
+    backup: async (account) => {
+      await backupRemovedAccount(account)
+    },
+    remove: removeAccount,
+  })
+
   // Started LAST of the four, so the port only opens once everything a lease answer depends on is
   // live: a worker that reached a half-composed master would be handed a 500 it retries forever.
   const server = startLeaseServer({
@@ -134,6 +160,7 @@ export function installCloudMaster(
     refresher,
     loadAccounts: roster,
     accountOnboard,
+    accountRemove,
     // The dashboard's refresh button reuses the poller's OWN sweep rather than fetching usage itself,
     // so a forced refresh inherits every protection the scheduled path already has: the re-entrancy
     // guard, the 500ms spacing between accounts, and the per-account 429 cooldown.

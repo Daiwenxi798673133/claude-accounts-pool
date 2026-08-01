@@ -84,6 +84,8 @@ git clone --depth 1 https://github.com/Daiwenxi798673133/claude-accounts-pool.gi
 
 **3. 想看全池用量**:浏览器打开 master 的看板。右上角的**刷新**按钮让 master 立刻采集一轮(服务端 30 秒节流一次),页面本身每 5 秒重拉一次,master 自己也每 5 分钟定时轮询。每张账号卡显示邮箱、徽标(冷却中 / 需重新登录 / 不自动切 / 本轮无数据)、access token 剩余时间,以及各窗口的用量条与重置倒计时。
 
+**4. 想把一个号移出池子**:同一个看板,点右上角「删除账号」,选中那一行,再把它的邮箱**完整输入一遍**确认。这是**不可撤销**的——账号记录里那份 refresh token 是唯一一份,Anthropic 不补发,删掉只能重新授权。master 会在删除前把这条记录单独备份到 `claude-accounts.json` 的同目录下(`claude-accounts.deleted-<时间戳>-<id前缀>.json`),后悔了从那里拷回来。
+
 ### 更多细节
 
 - [docs/local-mode.md](docs/local-mode.md) —— 单机模式详解:账号管理流程、`/usage` 面板键位、`/stats` 仪表盘、限流自动切号的完整机制、ChatGPT 多账号(含两个默认关闭的开关)
@@ -99,7 +101,7 @@ git clone --depth 1 https://github.com/Daiwenxi798673133/claude-accounts-pool.gi
 
 **1. master 的 HTTP 端口没有任何应用层鉴权,绑定地址就是全部的访问控制。**
 
-一条带鉴权的路由都没有:看板、`/v1/usage`、「添加账号」、`/v1/lease`、`/v1/ratelimit` 全都免鉴权。也就是说**凡能连到这个端口的人**都能看到池内账号(含邮箱)与余量、能往池里加号、**能直接租走一枚活的 access token**——能连到这个端口,基本等于能用这个池子。
+一条带鉴权的路由都没有:看板、`/v1/usage`、「添加账号」、「删除账号」、`/v1/lease`、`/v1/ratelimit` 全都免鉴权。也就是说**凡能连到这个端口的人**都能看到池内账号(含邮箱)与余量、能往池里加号、能把号删出池子(需要照着页面把该账号的邮箱一字不差地打出来)、**能直接租走一枚活的 access token**——能连到这个端口,基本等于能用这个池子。
 
 想收窄,**能收窄的只有绑定地址**。本项目的部署里绑的是 Tailscale 地址,访问控制实际上外包给了 tailnet 的成员资格;`hostname` 不写就默认 `127.0.0.1`。**在决定 `hostname` 写什么的那一刻,你就把这个池子的访问控制策略定完了**——取舍与理由见 [docs/cloud-mode.md](docs/cloud-mode.md#为什么整台-master-都不做鉴权)。
 
