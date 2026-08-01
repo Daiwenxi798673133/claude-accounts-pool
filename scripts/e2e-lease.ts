@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:f
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { CLOUD_ROUTES } from "../src/cloud/protocol.ts"
-import { SENTINEL_REFRESH } from "../src/constants.ts"
+import { MASTER_REFRESH_THRESHOLD_MS, SENTINEL_REFRESH } from "../src/constants.ts"
 import { redactBody } from "../src/logger.ts"
 
 // 一个杂散的 Authorization 头。master 不再有任何鉴权,所以它必须被【忽略】而不是被拒绝 ——
@@ -27,7 +27,10 @@ const WORKER_ID = "e2e-worker-1"
 const ACCOUNT_ID = "e2e-account-a"
 // 前缀而非完整 token:master 桩把它拼上 accountId 返回,读输出的人一眼就知道这不是真凭据。
 const FAKE_ACCESS_PREFIX = "e2e-fake-access-"
-const LEASE_TTL_MS = 3_600_000
+// master 桩报出的是【账号的 access token 到期时刻】,不是租约视界 —— serveLease 会按 INV-CLOUD-4
+// 减去 MASTER_REFRESH_THRESHOLD_MS 才发给 worker。所以这里必须比那个门槛更长,否则视界落到过去,
+// 整条链路会正确地以 503 结束,而这个脚本要验的是 200 那条路。
+const LEASE_TTL_MS = MASTER_REFRESH_THRESHOLD_MS + 3_600_000
 const BOOT_DEADLINE_MS = 15_000
 const HEALTH_DEADLINE_MS = 10_000
 const WORKER_DEADLINE_MS = 60_000

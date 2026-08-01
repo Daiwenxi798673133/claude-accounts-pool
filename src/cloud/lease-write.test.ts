@@ -84,6 +84,7 @@ await accounts.writeAuthAnthropic({ kind: "lease", access: "leased-access", expi
     recordAccess: record.access,
     recordExpires: record.expires,
     recordFlagged: "needsReauth" in record,
+    recordMinted: "refreshMintedAt" in record,
   }
 }
 
@@ -102,6 +103,13 @@ const bareJson = authText()
   accounts.applyToken(record, { kind: "full", token: { refresh: "new", access: "new-a", expires: fullExpires } })
   // The UNTAGGED AuthToken is the pre-change call shape and is still a live contract
   // (src/usage.test.ts drives applyToken with it); it must keep behaving as kind:"full".
+  // The SAME tip captured a second time (autoCapture re-reads auth.json every keeper tick): the
+  // chain did not rotate, so its age must keep running rather than restarting. Its own record, so
+  // the byte-shape assertions above keep observing exactly one write.
+  const recapture = { id: "r4", label: "R4", refresh: "old", access: "old-a", expires: 1 }
+  accounts.applyToken(recapture, { kind: "full", token: { refresh: "new", access: "new-a", expires: fullExpires } })
+  const mintedAfterRotation = recapture.refreshMintedAt
+  accounts.applyToken(recapture, { kind: "full", token: { refresh: "new", access: "new-a2", expires: fullExpires } })
   const legacy = { id: "r3", label: "R3", refresh: "old", access: "old-a", expires: 1, needsReauth: true }
   let legacyThrew = false
   try { accounts.applyToken(legacy, { refresh: "new", access: "new-a", expires: fullExpires }) } catch { legacyThrew = true }
@@ -117,6 +125,8 @@ const bareJson = authText()
     legacyRefresh: legacy.refresh,
     legacyAccess: legacy.access,
     legacyFlagged: "needsReauth" in legacy,
+    recordMinted: typeof mintedAfterRotation,
+    recordMintedStable: recapture.refreshMintedAt === mintedAfterRotation,
   }
 }
 
@@ -226,6 +236,7 @@ type LeaseRow = {
   recordAccess?: string
   recordExpires?: number
   recordFlagged: boolean
+  recordMinted: boolean
 }
 type FullRow = {
   expires: number
@@ -239,6 +250,8 @@ type FullRow = {
   legacyRefresh: string
   legacyAccess?: string
   legacyFlagged: boolean
+  recordMinted: string
+  recordMintedStable: boolean
 }
 type CaptureRow = {
   threw: boolean
@@ -304,6 +317,9 @@ test("applyToken lease write serializes sentinel refresh", () => {
   expect(r.lease.recordAccess).toBe("leased-access")
   expect(r.lease.recordExpires).toBe(r.lease.expires)
   expect(r.lease.recordFlagged).toBe(false)
+  // A lease carries no chain, so it MINTED no chain: stamping an age here would make a worker's
+  // record claim a refresh token it has never held.
+  expect(r.lease.recordMinted).toBe(false)
 })
 
 test("applyToken full write is byte-identical to previous shape", () => {
@@ -321,6 +337,10 @@ test("applyToken full write is byte-identical to previous shape", () => {
   expect(r.full.recordExpires).toBe(r.full.expires)
   expect(r.full.recordFlagged).toBe(false)
   expect(r.full.legacyThrew).toBe(false)
+  // The rotation is stamped, and a re-capture of the SAME tip does not restart the clock — without
+  // that, every chain would read as newly minted forever and the age would answer nothing.
+  expect(r.full.recordMinted).toBe("number")
+  expect(r.full.recordMintedStable).toBe(true)
   expect(r.full.legacyRefresh).toBe("new")
   expect(r.full.legacyAccess).toBe("new-a")
   expect(r.full.legacyFlagged).toBe(false)

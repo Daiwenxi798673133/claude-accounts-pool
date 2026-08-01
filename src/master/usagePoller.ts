@@ -29,6 +29,11 @@ export const USAGE_POLL_SPACING_MS = 500
 // changing the poll cadence cannot silently turn this back into an immediate retry.
 export const USAGE_POLL_429_COOLDOWN_MS = 2 * MASTER_USAGE_POLL_INTERVAL_MS
 
+// Same 2s as installTokenKeeper's first sweep, and for the same reason: long enough that the rest
+// of the composition root is wired, short enough that an operator opening the dashboard right after
+// a restart sees real numbers rather than an empty pool.
+export const USAGE_POLL_INITIAL_DELAY_MS = 2_000
+
 // src/usage.ts's fetchUsage throws `usage request failed (${res.status})` for every non-ok
 // response — a message, not a typed status, and that module is owned by a parallel change set so
 // this side cannot widen its error type. Matching the parenthesised status is therefore the only
@@ -84,8 +89,11 @@ export function installUsagePoller(deps: UsagePollerDeps): { dispose: () => void
         // vendor and produce a snapshot entry nothing can ever pick. Read through providerOf — a
         // hand-rolled `provider === "anthropic"` drops every pre-multi-provider record.
         // Cooled accounts are filtered out HERE, before the loop, so they cost no spacing either.
+        // So are needs-reauth ones: every fetch here goes through the refresher, so polling a dead
+        // chain buys a guaranteed refresh failure and no snapshot entry. The dashboard already
+        // states their case with its own badge, read straight off the flag.
         accounts = (await deps.loadAccounts()).filter(
-          (account) => providerOf(account) === "anthropic" && !isCooling(account.id),
+          (account) => providerOf(account) === "anthropic" && !account.needsReauth && !isCooling(account.id),
         )
       } catch (error) {
         log.warn("master-usage-poller:load-fail", { error: errorMessage(error) })
@@ -128,15 +136,22 @@ export function installUsagePoller(deps: UsagePollerDeps): { dispose: () => void
   }
 
   const interval = setInterval(() => void tickOnce(), MASTER_USAGE_POLL_INTERVAL_MS)
+  // A bare setInterval leaves the FIRST sweep one whole interval away, so a restarted master spent
+  // five minutes serving a dashboard that says "本轮无数据" for every account and ranking leases by
+  // nothing at all. Delayed rather than immediate, matching installTokenKeeper's own first sweep:
+  // the composition root is still wiring collaborators up at this point.
+  const initial = setTimeout(() => void tickOnce(), USAGE_POLL_INITIAL_DELAY_MS)
   // Ranking data must never be the reason the process stays alive; the master's HTTP server owns
   // that decision.
   interval.unref?.()
+  initial.unref?.()
   log.info("master-usage-poller:installed")
 
   return {
     dispose() {
       disposed = true
       clearInterval(interval)
+      clearTimeout(initial)
     },
     tickOnce,
   }

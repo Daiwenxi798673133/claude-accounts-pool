@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
-import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS, ONBOARD_ADD_MIN_INTERVAL_MS } from "../constants.ts"
+import { LEASE_RENEW_BUFFER_MS, MASTER_REFRESH_THRESHOLD_MS, ONBOARD_ADD_MIN_INTERVAL_MS } from "../constants.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
 import { createAccountOnboard } from "./accountOnboard.ts"
@@ -22,11 +22,11 @@ const WORKER_ID = "worker-1"
 // The horizon a worker RECEIVES — deliberately still named EXPIRES_AT, because that is what lands
 // in its auth.json and what the cases below assert. Since INV-CLOUD-4 the account's own expiry is a
 // DIFFERENT instant, so the fixture is expressed from the horizon BACKWARDS: what the refresher
-// reports sits MASTER_MIN_REMAINING_MS later than what the master is willing to advertise. That also
+// reports sits MASTER_REFRESH_THRESHOLD_MS later than what the master is willing to advertise. That also
 // makes the default fixture distinguishing — a server that echoed the account expiry would answer
 // ACCOUNT_EXPIRES_AT here and fail the 200 case below.
 const EXPIRES_AT = 1_900_000_000_000
-const ACCOUNT_EXPIRES_AT = EXPIRES_AT + MASTER_MIN_REMAINING_MS
+const ACCOUNT_EXPIRES_AT = EXPIRES_AT + MASTER_REFRESH_THRESHOLD_MS
 
 const account = (id: string): StoredAccount => ({ id, label: `${id}@example.test`, refresh: `refresh-${id}` })
 
@@ -61,6 +61,8 @@ function startHarness(options?: {
   goodCode?: string
   onboardProfile?: { uuid: string; email: string }
   profileThrows?: boolean
+  // A refresher that cannot mint — a revoked chain, or a 429 cooldown with nothing cached.
+  refreshThrows?: boolean
 }): Harness {
   const accounts = options?.accounts ?? [account("acct-a"), account("acct-b")]
   const accountExpiresAt = options?.accountExpiresAt ?? ACCOUNT_EXPIRES_AT
@@ -140,6 +142,7 @@ function startHarness(options?: {
     refresher: {
       async getFreshAccess(accountId) {
         refreshed.push(accountId)
+        if (options?.refreshThrows) throw new Error("master refresh token revoked (invalid_grant) for " + accountId)
         return { access: `sk-ant-oat01-${accountId}`, expiresAt: accountExpiresAt }
       },
     },
@@ -485,7 +488,7 @@ test("lease with an empty preferred prefix is malformed, not a match-anything wi
 test("a named account is still refused when its horizon is already spent", async () => {
   // Given: the refresher hands back a token so close to expiry that the INV-CLOUD-4 floor leaves less
   // than one worker check interval of usable life
-  const harness = startHarness({ accountExpiresAt: Date.now() + MASTER_MIN_REMAINING_MS + 1_000 })
+  const harness = startHarness({ accountExpiresAt: Date.now() + MASTER_REFRESH_THRESHOLD_MS + 1_000 })
   try {
     // When: the operator names it anyway
     const res = await post(
@@ -853,13 +856,14 @@ test("lease horizon never outlives the master refresh point", async () => {
     // eligible to refresh would be advertising a token the master itself is about to kill.
     expect(res.status).toBe(200)
     const lease = (await res.json()) as LeaseResponse
-    expect(lease.expiresAt).toBe(accountExpiresAt - MASTER_MIN_REMAINING_MS)
+    expect(lease.expiresAt).toBe(accountExpiresAt - MASTER_REFRESH_THRESHOLD_MS)
 
     // And the consequence that equality exists for: the worker renews at
     // `horizon - LEASE_RENEW_BUFFER_MS`, which must land a full buffer BEFORE the master rotates.
-    // The old behaviour inverted this — rotation at T-10min, renewal at T-5min — leaving a
-    // five-minute window in which the worker held a revoked token and believed it was fine.
-    const masterRotatesAt = accountExpiresAt - MASTER_MIN_REMAINING_MS
+    // Subtracting anything SMALLER than the refresher's own trigger inverts this — rotation first,
+    // renewal long after — leaving a window in which the worker holds a revoked token and believes
+    // it is fine.
+    const masterRotatesAt = accountExpiresAt - MASTER_REFRESH_THRESHOLD_MS
     const workerRenewsAt = lease.expiresAt - LEASE_RENEW_BUFFER_MS
     expect(masterRotatesAt - workerRenewsAt).toBeGreaterThanOrEqual(LEASE_RENEW_BUFFER_MS)
   } finally {
@@ -869,7 +873,7 @@ test("lease horizon never outlives the master refresh point", async () => {
 
 test("lease is refused when the horizon would already be in the past", async () => {
   // Given: an account expiring INSIDE the master's own refresh floor, so the INV-CLOUD-4 horizon
-  // (expiry − MASTER_MIN_REMAINING_MS) lies behind us and there is no usable lease to hand out.
+  // (expiry − MASTER_REFRESH_THRESHOLD_MS) lies behind us and there is no usable lease to hand out.
   const harness = startHarness({ accountExpiresAt: Date.now() + 60_000 })
   try {
     // When
@@ -886,6 +890,43 @@ test("lease is refused when the horizon would already be in the past", async () 
     // WAS minted. That is what separates this 503 from the spent-pool 503 above, where
     // `refreshed` stays empty.
     expect(harness.refreshed).toEqual(["acct-a"])
+  } finally {
+    harness.stop()
+  }
+})
+
+// ---- ACCEPTANCE CRITERION (issue #37): a bad account must never look like a bad master ---------
+test("a refresher that cannot mint answers 503, never 500", async () => {
+  // Given: the picked account's chain is dead, so minting throws out of the lease path
+  const harness = startHarness({ refreshThrows: true })
+  try {
+    // When
+    const res = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
+
+    // Then: 503 — "the pool has nothing right now". An escaping throw is answered 500, which the
+    // worker's client classifies as a transient SERVER fault and retries for ~10 minutes before
+    // reporting 连不上云端账号池 — accusing the network and the master while both are healthy.
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({ error: expect.any(String) })
+    expect(harness.refreshed).toEqual(["acct-a"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a named account whose chain is dead is refused with 503 rather than 500", async () => {
+  // The operator's own pick reaches serveLease by a different route, so it needs its own witness:
+  // the preference path used to be the shorter way to a 500.
+  const harness = startHarness({ refreshThrows: true })
+  try {
+    const res = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "prelease", preferredAccountIdPrefix: "acct-b" } satisfies LeaseRequest,
+    )
+
+    expect(res.status).toBe(503)
+    expect(harness.refreshed).toEqual(["acct-b"])
   } finally {
     harness.stop()
   }

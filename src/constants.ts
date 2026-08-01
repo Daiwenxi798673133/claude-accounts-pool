@@ -151,7 +151,44 @@ export const LEASE_BACKOFF_CAP_MS = 300_000
 // Floor on the remaining validity of an access token the master is willing to hand out. Below
 // this the master refreshes FIRST rather than leasing a soon-to-expire token — a worker that
 // receives one would immediately have to come back, and in the gap its requests fail.
+//
+// THIS IS NOT THE REFRESH TRIGGER — see MASTER_REFRESH_THRESHOLD_MS below. The two used to be the
+// same constant, and that conflation is what killed a refresh chain (issue #37): binding "when do
+// we refresh" to "how little validity is too little to lease" left an 8-hour token with a TEN
+// MINUTE refresh window, so a pool account nobody leased was touched once per 8h at the very last
+// moment. They are separate decisions and must stay separate constants.
+//
+// Where it is still enforced: the refresher refuses to hand back a cached token below this floor
+// while a 429 cooldown blocks it from minting a new one — the one path that can no longer "refresh
+// FIRST". Everywhere else the floor is enforced BY CONSTRUCTION and far more strictly, because a
+// served lease is bounded by MASTER_REFRESH_THRESHOLD_MS (4h) of remaining validity; see the
+// horizon arithmetic in leaseServer.serveLease and the relationship test that pins it there.
 export const MASTER_MIN_REMAINING_MS = 10 * 60_000
+
+// WHEN the master rotates a chain, i.e. the refresher's proactive trigger: refresh once an access
+// token is HALF SPENT (Anthropic issues 8h tokens, so ~4h remaining). Not a freshness floor — a
+// LIVENESS one. The single refresh POST rotates the access token AND the refresh token together,
+// so this interval is also how often each chain's refresh tip is exercised, and a pool account that
+// nobody leases has no other source of life: the old 10-minute window meant one attempt per 8h,
+// with no second chance if it failed.
+//
+// LOAD: 2 refreshes per account per 8h instead of 1. With the keeper's 5-minute tick and
+// MASTER_WARM_SPACING_MS between accounts, a pool of tens of accounts is still a handful of POSTs
+// per hour from this host's single egress IP.
+//
+// COUPLED TO THE LEASE HORIZON (INV-CLOUD-4). Anthropic revokes the previously issued access token
+// the instant a refresh succeeds, so the master's own rotation point — `expires - this` — is the
+// hard ceiling on any lease already in flight. leaseServer subtracts THIS constant, never
+// MASTER_MIN_REMAINING_MS: raising one without the other hands workers a lease that outlives the
+// rotation which revokes it, and they would sit on a dead token for hours without noticing.
+export const MASTER_REFRESH_THRESHOLD_MS = 4 * 60 * 60_000
+
+// Global pause on the master's refresh POSTs after the token endpoint answers 429. GLOBAL, not
+// per-account, and that is the whole point: the endpoint rate-limits by IP and the master is one
+// egress IP for the entire pool, so cooling a single account would let the same sweep walk into the
+// next 429 with every remaining account. Same window as the local-mode refresher's own 429
+// cooldown (src/usage.ts).
+export const MASTER_REFRESH_429_COOLDOWN_MS = 5 * 60_000
 
 // Spacing between accounts while the master warms the pool, matching the existing keeper's
 // inter-account spacing: the token endpoint rate-limits by IP, so refreshing the whole roster

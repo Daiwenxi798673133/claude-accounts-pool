@@ -32,7 +32,7 @@ import type {
   UsageSnapshotView,
 } from "../cloud/protocol.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
-import { LEASE_CHECK_INTERVAL_MS, MASTER_MIN_REMAINING_MS } from "../constants.ts"
+import { LEASE_CHECK_INTERVAL_MS, LEASE_RENEW_BUFFER_MS, MASTER_REFRESH_THRESHOLD_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
 import type { AccountOnboard } from "./accountOnboard.ts"
 import { dashboardHtml } from "./dashboardHtml.ts"
@@ -52,7 +52,7 @@ export type LeaseServerDeps = {
     getUsageSnapshot(): UsageSnapshot
     isCoolingDown(accountId: string): boolean
   }
-  refresher: { getFreshAccess(accountId: string): Promise<{ access: string; expiresAt: number }> }
+  refresher: { getFreshAccess(accountId: string, minHorizonMs?: number): Promise<{ access: string; expiresAt: number }> }
   loadAccounts: () => Promise<StoredAccount[]>
   // Runs ONE usage sweep and resolves when the snapshot has been handed to the scheduler — the usage
   // poller's own tickOnce. Injected as a bare thunk so this server never learns what a poller is, and
@@ -75,6 +75,10 @@ export type LeaseServerDeps = {
 
 type Route = (typeof CLOUD_ROUTES)[keyof typeof CLOUD_ROUTES]
 type RouteHandler = (req: Request) => Promise<Response>
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 function json(
   status: number,
@@ -267,18 +271,32 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
   // rather than duplicated because the arithmetic below is INV-CLOUD-4 — two copies of it would let
   // the named-account path drift into serving a lease that outlives the master's own refresh point.
   async function serveLease(workerId: string, account: StoredAccount): Promise<Response> {
-    const fresh = await deps.refresher.getFreshAccess(account.id)
+    let fresh: { access: string; expiresAt: number }
+    try {
+      // The refresher is TOLD how much horizon this lease needs rather than asked for whatever is
+      // cached: a token a second above the rotation threshold would otherwise become a lease the
+      // worker cannot hold for even one renewal cycle.
+      fresh = await deps.refresher.getFreshAccess(account.id, LEASE_RENEW_BUFFER_MS)
+    } catch (error) {
+      // 503, and the try/catch exists ONLY to make it so. An escaping throw is answered by Bun with
+      // a 500, which the worker's client classifies as a transient server fault and retries with
+      // backoff for ~10 minutes before giving up as "unreachable" — so ONE dead account used to
+      // surface on every worker as 连不上云端账号池, naming the network and the master as suspects
+      // when both were fine. 503 is the honest answer: the pool has nothing to give right now.
+      log.warn("master:lease-refresh-failed", { workerId, accountId: account.id, error: errorMessage(error) })
+      return json(503, { error: "no account available" })
+    }
     // INV-CLOUD-4 — A LEASE MAY NEVER OUTLIVE THE MASTER'S OWN REFRESH POINT. Anthropic REVOKES the previously
     // issued access token the instant a refresh succeeds — MEASURED against the live API, not inferred, and
     // contrary to ordinary OAuth 2.0 semantics: an access token answered 200 on /api/oauth/usage, the account was
     // then refreshed (the refresh tip rotated), the NEW access answered 200, and the SAME OLD access token
-    // answered 401. So the master's own rotation — due at `expires - MASTER_MIN_REMAINING_MS` — is what kills
-    // every lease already in flight, and serving the raw account expiry was the DEFECT: the master rotated at
-    // T-10min while the worker, which renews only at `expires - LEASE_RENEW_BUFFER_MS`, held a REVOKED token
-    // until T-5min. Subtracting the floor here (the refresher owns the account's real expiry; the horizon is
-    // this server's policy) moves the worker's renewal to T-15min, always a full LEASE_RENEW_BUFFER_MS ahead of
-    // the rotation that would revoke it.
-    const expiresAt = fresh.expiresAt - MASTER_MIN_REMAINING_MS
+    // answered 401. So the master's own rotation — due at `expires - MASTER_REFRESH_THRESHOLD_MS` — is what kills
+    // every lease already in flight, and serving the raw account expiry was the DEFECT: the master rotated while
+    // the worker, which renews only at `expires - LEASE_RENEW_BUFFER_MS`, held a REVOKED token for the rest of
+    // the window. THE SUBTRAHEND MUST BE THE REFRESHER'S OWN TRIGGER AND NOTHING ELSE — any smaller value
+    // advertises a horizon that reaches past the rotation which revokes it, and the worker, seeing an expiry
+    // still comfortably ahead, sits on a dead token until its own renewal finally falls due.
+    const expiresAt = fresh.expiresAt - MASTER_REFRESH_THRESHOLD_MS
     // DEAD ON ARRIVAL — refused, never served. Only reachable if the refresher handed back a token already
     // inside that floor, so this is defence in depth; but the worker writes `expiresAt` into auth.json, where
     // the local provider refreshes on `expires < Date.now()` with ZERO buffer and only INV-CLOUD-1's sentinel to

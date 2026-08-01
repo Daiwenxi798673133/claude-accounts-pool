@@ -147,7 +147,7 @@ research 对该变体的定性必须原样带入本 ADR：**「唯一能干净�
 **由此暴露的缺陷：缓冲区方向是反的。** master 在 `expires - MASTER_MIN_REMAINING_MS`（10min）刷新 → 所有在外租约当场死亡；而 worker 直到 `expiresAt - LEASE_RENEW_BUFFER_MS`（5min）才续租 ⇒ **中间 5 分钟 worker 手持死 token**。
 
 **修法（两层，均已实施）**：
-1. **INV-CLOUD-4**：master 下发 `expiresAt = accountExpires - MASTER_MIN_REMAINING_MS`（即 master 自己可刷新的时刻）。worker 的 5min 缓冲随即落在其之前 ⇒ 恒早于 master 轮换至少 5 分钟续租。租约视界若已过期则返回 503，绝不下发「到手即死」的 token。
+1. **INV-CLOUD-4**：master 下发 `expiresAt = accountExpires - MASTER_REFRESH_THRESHOLD_MS`（即 master 自己可刷新的时刻）。worker 的 5min 缓冲随即落在其之前 ⇒ 恒早于 master 轮换至少 5 分钟续租。租约视界若已过期则返回 503，绝不下发「到手即死」的 token。**减数必须恒等于 refresher 的触发门槛**：两者一旦脱钩，下发的视界就会越过那次轮换，worker 会抱着一枚已被作废的 token 直到自己的续租时刻才发现。
 2. **INV-CLOUD-5**：worker 把 **401 当作「租约被轮换」**而非额度问题——立刻以 `reason:"prelease"` 重新领租并续接，**不冷却该账号、不通知 master 排除它**。把 401 误route进限流路径会白白冷却一个健康账号、削减池子容量。
 
 **连带影响**：这条也解释了为什么「master 必须是唯一刷新者」比原先理解的更严格——任何一次池外刷新不仅会轮换 refresh 链，还会**当场击毙所有在外的 access 租约**。

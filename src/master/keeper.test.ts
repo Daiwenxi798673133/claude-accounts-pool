@@ -89,6 +89,29 @@ test("warm loop refreshes every account serially with spacing through refresher"
   ])
 })
 
+test("warm loop skips an account whose chain is already known dead", async () => {
+  const warmed: string[] = []
+  const keeper = installMasterKeeper({
+    refresher: {
+      getFreshAccess: async (accountId: string) => {
+        warmed.push(accountId)
+        return { access: `fresh-${accountId}`, expiresAt: NOW + 900_000 }
+      },
+    },
+    loadAccounts: async () => [account("a"), account("dead", { needsReauth: true })],
+    capture: async () => {},
+    sleep: async () => {},
+  })
+
+  await keeper.tickOnce()
+  keeper.dispose()
+
+  // This sweep visits every account every five minutes. Re-POSTing a chain already judged revoked
+  // would therefore be a permanent, guaranteed-400 drip at an endpoint that rate-limits by IP —
+  // and this host's single IP is what every account in the pool refreshes through.
+  expect(warmed).toEqual(["a"])
+})
+
 test("onboarding capture stores real refresh and refuses sentinel", async () => {
   // Onboarding: an admin runs `opencode auth login` on the master via the ex-machina PKCE flow,
   // which writes a REAL credential into the master's local auth.json. Capture absorbs it into the

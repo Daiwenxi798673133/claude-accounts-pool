@@ -1,5 +1,12 @@
 import type { StoredAccount } from "../accounts.ts"
-import { CLIENT_ID, MASTER_MIN_REMAINING_MS, NETWORK_TIMEOUT_MS, TOKEN_URL } from "../constants.ts"
+import {
+  CLIENT_ID,
+  MASTER_MIN_REMAINING_MS,
+  MASTER_REFRESH_429_COOLDOWN_MS,
+  MASTER_REFRESH_THRESHOLD_MS,
+  NETWORK_TIMEOUT_MS,
+  TOKEN_URL,
+} from "../constants.ts"
 import { log, redactBody, redactHeaders } from "../logger.ts"
 
 // The ONE refresher on the master, and the reason the cloud architecture is safe at all.
@@ -18,18 +25,32 @@ export type MasterToken = { access: string; refresh: string; expires: number }
 // satisfies this type unchanged, so narrowing costs production callers nothing.
 export type FetchLike = (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>
 
+// What the store made of a dead tip. `adopted` is the CROSS-PROCESS GUARD's answer: another writer
+// had already rotated this account, so the tip we POSTed merely lost a race and the account is
+// healthy — the record's current token comes back instead of a needs-reauth verdict.
+export type RefreshRevokedOutcome = { adopted?: { access?: string; expires?: number } }
+
 export type RefresherDeps = {
   // NO DEFAULT ON PURPOSE. A `= fetch` fallback would let a test that forgot to inject fire a
   // real POST at TOKEN_URL, consuming and rotating a live refresh token on a paid account.
   fetchImpl: FetchLike
   loadAccount: (accountId: string) => Promise<StoredAccount | undefined>
   persist: (accountId: string, token: MasterToken) => Promise<void>
+  // Called ONCE per lost chain, and injected for the same reason `persist` is: flagging is a
+  // read-modify-write that has to happen under the SAME cross-process auth lock as the token write,
+  // and that lock lives in the composition root. Owning it here would drag the account store and
+  // the lock into a module whose entire test surface is a fake fetch.
+  onRefreshRevoked: (accountId: string, deadRefresh: string) => Promise<RefreshRevokedOutcome>
   now?: () => number
 }
 
 export type FreshAccess = { access: string; expiresAt: number }
 
-export type Refresher = { getFreshAccess(accountId: string): Promise<FreshAccess> }
+// `minHorizonMs` is the caller's own floor on how much validity it needs BEYOND the master's next
+// rotation point. The warm loop and the usage poller need none (0); the lease server needs enough
+// that the lease it derives is holdable for a full renewal cycle. Without it a caller can be handed
+// a cached token that is a second away from the rotation threshold.
+export type Refresher = { getFreshAccess(accountId: string, minHorizonMs?: number): Promise<FreshAccess> }
 
 // 1 initial attempt + 2 retries, and ONLY for the two failure classes that leave the stored tip
 // unspent (5xx / transport). Fixed delay rather than exponential: the ceiling here is one keeper
@@ -97,6 +118,10 @@ export function createRefresher(deps: RefresherDeps): Refresher {
   // Keyed by ACCOUNT ID, not by refresh string (which is how usage.ts keys its map): the tip
   // rotates on every success, so a tip-keyed entry would dedupe nothing across a rotation.
   const inflight = new Map<string, Promise<FreshAccess>>()
+  // ONE deadline for the whole pool, not a per-account map like usage.ts's: that map keys by refresh
+  // token because it guards a SUBSCRIPTION on a personal machine, while what a 429 tells this
+  // process is that ITS IP is blocked — and every account in the pool leaves through that IP.
+  let blockedUntil = 0
 
   // WHY THIS DUPLICATES usage.ts's doRefreshToken — do NOT "helpfully" merge them:
   //  1. DEPENDENCY INJECTION. The single-flight guarantee is the deliverable, and it can only be
@@ -139,6 +164,10 @@ export function createRefresher(deps: RefresherDeps): Refresher {
         headerKeys: redactHeaders(headers),
         body: redactBody(body),
       })
+      if (res.status === 429) {
+        blockedUntil = now() + MASTER_REFRESH_429_COOLDOWN_MS
+        log.warn("master-refresher:refresh-cooldown", { accountId, until: blockedUntil })
+      }
       if (res.status === 400 && isInvalidGrant(body)) {
         log.warn("master-refresher:refresh-revoked", { accountId })
         throw new MasterRefreshRevokedError(accountId, refresh)
@@ -180,25 +209,81 @@ export function createRefresher(deps: RefresherDeps): Refresher {
     }
   }
 
-  async function resolve(accountId: string): Promise<FreshAccess> {
+  function leasableAccess(token: { access?: string; expires?: number }): FreshAccess | undefined {
+    if (!token.access || !token.expires) return undefined
+    return token.expires - now() > MASTER_MIN_REMAINING_MS ? { access: token.access, expiresAt: token.expires } : undefined
+  }
+
+  async function resolve(accountId: string, minHorizonMs: number): Promise<FreshAccess> {
     const account = await deps.loadAccount(accountId)
     if (!account) throw new Error(`unknown account ${accountId}`)
-    // STRICT `>` against the floor: a token sitting exactly on MASTER_MIN_REMAINING_MS is
-    // refreshed rather than leased, because a worker that receives it must immediately come back.
-    if (account.access && account.expires && account.expires - now() > MASTER_MIN_REMAINING_MS) {
+    // A chain already judged dead is never POSTed again. The warm loop walks EVERY account every
+    // five minutes, so without this a single dead account would drip a guaranteed-400 at the token
+    // endpoint forever — from the one egress IP the whole pool shares. Thrown, not returned as a
+    // stale access token: the scheduler already excludes flagged accounts, so reaching here at all
+    // means a race, and answering it with a credential nobody can renew only defers the failure.
+    if (account.needsReauth) {
+      log.debug("master-refresher:skip-needs-reauth", { accountId })
+      throw new MasterRefreshRevokedError(accountId, account.refresh)
+    }
+    // PROACTIVE, not last-ditch: rotate once the token is half spent, plus whatever headroom the
+    // caller asked for. STRICT `>` so a token sitting exactly on the threshold rotates.
+    if (account.access && account.expires && account.expires - now() > MASTER_REFRESH_THRESHOLD_MS + minHorizonMs) {
       return { access: account.access, expiresAt: account.expires }
     }
-    const fresh = await refreshWithRetry(accountId, account.refresh)
+    // 429 means this HOST is rate-limited, so the whole pool waits — see MASTER_REFRESH_429_COOLDOWN_MS.
+    // The cached token is still handed out while it clears the lease floor: refusing outright would
+    // take the pool down for five minutes over a token that is perfectly usable for hours.
+    if (now() < blockedUntil) {
+      const cached = leasableAccess(account)
+      log.warn("master-refresher:refresh-blocked-429", { accountId, served: cached !== undefined })
+      if (cached) return cached
+      throw new Error(`token refresh cooling down after 429 for ${accountId}`)
+    }
+    const previousMintedAt = account.refreshMintedAt
+    let fresh: MasterToken
+    try {
+      fresh = await refreshWithRetry(accountId, account.refresh)
+    } catch (error) {
+      if (!(error instanceof MasterRefreshRevokedError)) throw error
+      const { adopted } = await deps.onRefreshRevoked(accountId, error.refresh)
+      // Deliberately NOT re-POSTing the adopted tip in this same flight: the winner already rotated
+      // it, so a second POST would be the very double-refresh this whole module exists to prevent.
+      // An adopted token too close to expiry falls through to the throw, and the account is left
+      // UNFLAGGED — the next call refreshes the adopted tip normally.
+      const usable = adopted && leasableAccess(adopted)
+      if (usable) return usable
+      throw error
+    }
     // Persist BEFORE returning, never after: from the instant the POST succeeded the rotated tip
     // is the ONLY usable one, so a crash between handing out the access token and writing the tip
     // would leave the master holding a spent refresh — the exact permanent-strand failure.
     await deps.persist(accountId, fresh)
-    log.info("master-refresher:refreshed", { accountId, remainingMs: fresh.expires - now() })
+    const lifetimeMs = fresh.expires - now()
+    log.info("master-refresher:refreshed", {
+      accountId,
+      remainingMs: lifetimeMs,
+      // The age of the tip this rotation just replaced. THE point of recording it: a chain that
+      // dies at ~8h every time is one that rotation does not rejuvenate, and that is a completely
+      // different bug from one that dies after days.
+      ...(previousMintedAt === undefined ? {} : { previousTicketAgeMs: now() - previousMintedAt }),
+    })
+    // Anthropic shortening the token lifetime below the rotation threshold would make EVERY tick
+    // eligible to refresh EVERY account — a rotation storm against one egress IP, and a lease
+    // horizon permanently in the past. Loud on purpose: the fix is to lower the threshold, and
+    // nothing in this process can decide that on its own.
+    if (lifetimeMs <= MASTER_REFRESH_THRESHOLD_MS) {
+      log.error("master-refresher:lifetime-below-threshold", { accountId, lifetimeMs })
+    }
     return { access: fresh.access, expiresAt: fresh.expires }
   }
 
   return {
-    getFreshAccess(accountId: string): Promise<FreshAccess> {
+    getFreshAccess(accountId: string, minHorizonMs = 0): Promise<FreshAccess> {
+      // Keyed by account ID ALONE, deliberately: what single-flight protects is the one-time-use
+      // tip, and that is per account. A caller joining a flight started with a smaller minHorizon
+      // can therefore receive less headroom than it asked for — the lease server's own horizon
+      // check catches that and answers 503, which is one retry, not a lost chain.
       const existing = inflight.get(accountId)
       if (existing) return existing
       // The ENTIRE load → freshness check → POST → persist chain is the flight, not just the POST.
@@ -206,7 +291,7 @@ export function createRefresher(deps: RefresherDeps): Refresher {
       // boundary, so every concurrent caller would clear the freshness check before any of them
       // reached the map. Note this body is synchronous up to the `set` — `resolve()` suspends at
       // its first await and returns a promise, so no caller can slip in between.
-      const flight = resolve(accountId).finally(() => {
+      const flight = resolve(accountId, minHorizonMs).finally(() => {
         // Cleared on BOTH fulfilment and rejection. Leaving a rejected promise behind would make
         // every later caller re-await a dead promise, i.e. the account would be permanently
         // unrefreshable for the life of the process — a self-inflicted outage worse than the
