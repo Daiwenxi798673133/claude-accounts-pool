@@ -55,6 +55,30 @@ export const CLOUD_ROUTES = Object.freeze({
   // it controls would then serve the pool's traffic. The bind address is what narrows that.
   accountAuthorize: "/v1/account/authorize",
   accountAdd: "/v1/account/add",
+  // POST — the dashboard's "删除账号" flow: take one account OUT of the pool.
+  //
+  // THE RISK IS NOT SYMMETRIC WITH accountAdd, and every guard below exists because of that. Adding
+  // is incremental — the worst outcome is one account too many in the pool. Deleting is DESTRUCTIVE
+  // and IRREVERSIBLE upstream: the record carries the only copy of that account's refresh token, and
+  // Anthropic will not hand out another without a fresh OAuth authorization. So this route asks for
+  // more than an id:
+  //
+  //   • The caller must send BOTH the account's `idPrefix` AND its `label` (the email the dashboard
+  //     shows). The prefix says which record; the label is a CONFIRMATION the server re-checks, so
+  //     the dialog's "type the address to confirm" is enforced here rather than being browser-side
+  //     ceremony a stray fetch could skip.
+  //   • The prefix resolves against the roster with pickPreferred's `ambiguous` semantics: matching
+  //     more than one account is REFUSED, never resolved to the first match. Deleting the wrong
+  //     subscription cannot be undone by looking again.
+  //   • The master files the removed record beside the account library before the destructive write,
+  //     so a delete the operator regrets is a copy-back rather than a re-authorization.
+  //
+  // POST rather than DELETE for the same reason the two routes above are POST — this table maps a
+  // PATH to one handler and the method is enforced inside it, and a GET (which link scanners issue
+  // on sight) must never reach a write. What is deliberately NOT claimed is that a peer cannot
+  // delete an account: it can, if it can reach this port and read the dashboard the label is printed
+  // on. The bind address is what narrows that, exactly as for every other route here.
+  accountDelete: "/v1/account/delete",
 } as const)
 
 // Why the worker is asking. `prelease` is the routine path (startup or renewal before the
@@ -160,6 +184,37 @@ export type AccountAddResponse = {
   // two outcomes call for different words on screen and hiding the difference is how an operator ends
   // up believing the pool grew when it did not.
   existing: boolean
+}
+
+// ── Deletion payload (the 删除账号 flow) ──────────────────────────────────────────────────────────
+
+export type AccountDeleteRequest = {
+  // The SAME prefix the usage view publishes (UsageAccountView.idPrefix), never a full account id:
+  // the page can only ever name what it was shown, and the prefix→account resolution happens on the
+  // master, against a roster the caller cannot read.
+  idPrefix: string
+  // The account's label as the dashboard renders it, resent by the operator as the confirmation.
+  // Compared for EXACT equality against the resolved record — a mismatch is refused rather than
+  // treated as a stale page, because the two cases are indistinguishable from here and only one of
+  // them is safe to guess at.
+  label: string
+}
+
+// Why a deletion could not be performed. A closed union for the same reason LeaseRefusal is one: the
+// page renders each case as its own sentence, and the remedies differ (look again / narrow the
+// prefix / retype the address).
+export type AccountDeleteRefusal =
+  | "unknown" // the prefix matches no anthropic account in the pool
+  | "ambiguous" // it matches more than one, so which row the operator meant is not knowable
+  | "label-mismatch" // the confirmation does not name the account the prefix resolved to
+
+export type AccountDeleteRefusedBody = ErrorBody & { refused: AccountDeleteRefusal }
+
+export type AccountDeleteResponse = {
+  // The same redacted identity shape AccountAddResponse carries, so the two halves of the pool's
+  // membership flow report themselves identically.
+  idPrefix: string
+  label: string
 }
 
 // ── Dashboard payload (master → the operator's browser) ────────────────────────────────────────

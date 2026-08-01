@@ -9,13 +9,22 @@ const html = dashboardHtml({
   throttleMs: 30000,
   authorizeRoute: "/v1/accounts/authorize",
   addRoute: "/v1/accounts/add",
+  deleteRoute: "/v1/accounts/delete",
 })
 
-test("dashboard renders no account id prefix", () => {
+test("an account id prefix is carried as an opaque handle and never rendered", () => {
   // idPrefix must stay in the /v1/usage payload for the worker's manual-switch UI (see
   // usageView.test.ts) — this asserts on the DOCUMENT dashboardHtml renders instead, never on that
-  // payload: the 8-hex chip was the ONLY place the document itself mentioned idPrefix.
-  expect(html).not.toContain("idPrefix")
+  // payload. It used to be able to say "the document never mentions idPrefix at all", because the
+  // 8-hex chip on each card was the only mention and it was deleted. The delete flow needs the
+  // prefix as its handle, so the claim is now the narrower one that always mattered: the prefix
+  // reaches an <option>'s VALUE and a request body, and NEVER any text on screen.
+  expect(html).toContain("option.value = latest.accounts[i].idPrefix;")
+  expect(html).toContain("option.textContent = latest.accounts[i].label;")
+  expect(html).toContain("JSON.stringify({ idPrefix: idPrefix, label: label })")
+  // The exhaustive count is the point: a SIXTH mention means somebody added a use this list has not
+  // been checked against, which is precisely the review moment worth forcing.
+  expect(html.split("idPrefix").length - 1).toBe(5)
 })
 
 test("the expiry line names the access token, in both branches", () => {
@@ -52,11 +61,50 @@ test("orphans of the card redesign are gone and the footer claim is precise", ()
   expect(html).not.toContain("grid-template-columns: 1fr 48px")
 })
 
-test("the toolbar offers 添加账号 ahead of 刷新", () => {
+test("the toolbar offers 添加账号 and 删除账号 ahead of 刷新", () => {
   expect(html).toContain("<span>添加账号</span>")
-  // The accent-filled 刷新 stays last so the only filled button is still the one pressed every
-  // visit, and it is now the only sibling 添加账号 has.
-  expect(html.indexOf("id=\"add\"")).toBeLessThan(html.indexOf("id=\"refresh\""))
+  expect(html).toContain("<span>删除账号</span>")
+  // The accent-filled 刷新 stays last, so the only filled button on the page is still the one pressed
+  // every visit — emphatically NOT the destructive one.
+  expect(html.indexOf("id=\"add\"")).toBeLessThan(html.indexOf("id=\"del\""))
+  expect(html.indexOf("id=\"del\"")).toBeLessThan(html.indexOf("id=\"refresh\""))
+  // Shut until a snapshot exists to build the picker from. Asserted on the ATTRIBUTE because that is
+  // the state the document ships in — syncButton only ever relaxes it.
+  expect(html).toContain("<button id=\"del\" type=\"button\" disabled>")
+})
+
+test("deleting is confirmed by retyping the label, and the label is what gets sent", () => {
+  // The three controls the flow cannot exist without: the roster picker, the confirmation field, and
+  // a submit that names the destructive act rather than saying 确定.
+  expect(html).toContain("id=\"delpick\"")
+  expect(html).toContain("id=\"delconfirm\"")
+  expect(html).toContain("确认删除")
+  // EXACT equality against the selected row is what makes the field a confirmation rather than
+  // decoration — a substring or case-folded test could be satisfied by accident.
+  expect(html).toContain("delConfirm.value.trim() !== label")
+  // And the confirmed label really travels: the master re-checks it, so a request carrying only the
+  // prefix would make the whole typing step browser-side ceremony.
+  expect(html).toContain("JSON.stringify({ idPrefix: idPrefix, label: label })")
+})
+
+test("the delete flow reuses the ONE dialog shell rather than adding a second", () => {
+  // Same invariant the add flow is held to: a second #veil means a second Escape handler, a second
+  // backdrop handler and a second close path — three pairs that drift.
+  expect(html.split("id=\"veil\"").length - 1).toBe(1)
+  expect(html).toContain("id=\"d-del\"")
+  // done / fatal are SHARED between the two flows, which is exactly why the subtitle table had to
+  // become flow-keyed. A single flat table would caption a deletion with 添加成功.
+  expect(html).toContain("var subtitles = SUBTITLES[flow];")
+})
+
+test("a refusal is rendered from a fixed table, never from the server's own words", () => {
+  // The page consults a 409 body for its `refused` code and nothing else. Echoing the body's `error`
+  // string would put a server-supplied string into the DOM, which is the habit this page exists
+  // without — and the three codes below are the whole taxonomy the master can answer with.
+  expect(html).toContain("var DELETE_ERRORS = {")
+  expect(html).toContain("unknown:")
+  expect(html).toContain("ambiguous:")
+  expect(html).toContain("\"label-mismatch\":")
 })
 
 test("the pool key is gone from the page, markup and script together", () => {
@@ -94,6 +142,12 @@ test("the read-only badge is gone, markup and CSS together", () => {
   expect(html).not.toContain(".ro .dot {")
 })
 
-test("the footer names the one write operation and what it does not do", () => {
-  expect(html).toContain("本页不展示任何 token 明文。「添加账号」只向池中新增账号，不会切号或删号。")
+test("the footer no longer promises the page cannot delete, and says what a deletion costs", () => {
+  // The page deletes now. "不会切号或删号" was the previous truth and is now a false statement, which
+  // is worse than no statement — so it is REPLACED rather than supplemented, and what replaces it is
+  // the one fact an operator needs before pressing: it is irreversible, and where the copy lives.
+  expect(html).not.toContain("不会切号或删号")
+  expect(html).toContain("本页不展示任何 token 明文。")
+  expect(html).toContain("「删除账号」是不可撤销的")
+  expect(html).toContain("备份")
 })

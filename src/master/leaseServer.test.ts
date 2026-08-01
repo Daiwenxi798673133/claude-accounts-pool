@@ -4,6 +4,7 @@ import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS, ONBOARD_ADD_MIN_INTERVA
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
 import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
 import { createAccountOnboard } from "./accountOnboard.ts"
+import { createAccountRemove } from "./accountRemove.ts"
 import { startLeaseServer, USAGE_REFRESH_MIN_INTERVAL_MS } from "./leaseServer.ts"
 import type { UsageSnapshot } from "./scheduler.ts"
 
@@ -48,6 +49,10 @@ type Harness = {
   // Every code string the onboarding exchange was handed. Empty means the route refused BEFORE
   // reaching out, which is the distinction the throttle and the session-lifecycle cases turn on.
   exchanged: string[]
+  // The ids the delete path really removed, and the roster it removed them from. A refusal that
+  // still emptied a slot would be invisible from the status code alone.
+  deleted: string[]
+  roster: () => string[]
 }
 
 function startHarness(options?: {
@@ -108,6 +113,25 @@ function startHarness(options?: {
     now: clock,
   })
 
+  const deleted: string[] = []
+  const backedUp: string[] = []
+  // The REAL removal state machine over an in-memory roster, for the same reason accountOnboard is
+  // real here: the refusals (prefix ambiguity, the label confirmation) are what these HTTP cases
+  // exist to observe from the outside, and a stub returning canned outcomes would assert nothing
+  // about them. accountRemove.test.ts owns proving the ORDER of backup and delete.
+  const accountRemove = createAccountRemove({
+    loadAccounts: async () => accounts,
+    backup: async (target) => {
+      backedUp.push(target.id)
+    },
+    remove: async (id) => {
+      const index = accounts.findIndex((entry) => entry.id === id)
+      if (index < 0) return undefined
+      deleted.push(id)
+      return accounts.splice(index, 1)[0]
+    },
+  })
+
   const server = startLeaseServer({
     scheduler: {
       pickAccount({ accounts: pool, exclude }) {
@@ -152,6 +176,7 @@ function startHarness(options?: {
       usage = { at: clock(), stale: false, byId: usage.byId }
     },
     accountOnboard,
+    accountRemove,
     now: clock,
     // Loopback only — a test must never expose a lease endpoint on a real interface.
     hostname: "127.0.0.1",
@@ -173,6 +198,8 @@ function startHarness(options?: {
       nowMs += ms
     },
     exchanged,
+    deleted,
+    roster: () => accounts.map((entry) => entry.id),
   }
 }
 
@@ -1168,6 +1195,129 @@ test("the dashboard page carries the onboarding routes and still leaks nothing",
     // And the page is still a shell: adding a credential-handling flow to it must not have put a
     // credential or an account into the document.
     expect(body).not.toContain("verifier-under-test")
+    expect(body).not.toContain("example.test")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("the delete route is POST-only, and a GET moves nothing", async () => {
+  // Given: a two-account pool
+  const harness = startHarness()
+  try {
+    // When: something GETs the URL — a pasted link, a chat unfurler, a speculative prefetch
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.accountDelete}`)
+
+    // Then: 405, and the pool is intact. 405 rather than 404 because the route exists and the fault
+    // is the method — a 404 would read as "this master is too old to have the button".
+    expect(res.status).toBe(405)
+    expect(harness.deleted).toEqual([])
+    expect(harness.roster()).toEqual(["acct-a", "acct-b"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a delete request missing its confirmation is refused 400 before the roster is touched", async () => {
+  const harness = startHarness()
+  try {
+    // When: the prefix alone, i.e. exactly what a caller who skipped the dialog would send
+    const res = await post(harness.base, CLOUD_ROUTES.accountDelete, { idPrefix: "acct-a" })
+
+    // Then: 400. The label is not an optional nicety — it is the confirmation, and a request that
+    // omits it has not confirmed anything.
+    expect(res.status).toBe(400)
+    expect(harness.deleted).toEqual([])
+    expect(harness.roster()).toEqual(["acct-a", "acct-b"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a prefix matching two accounts is refused 409 ambiguous rather than deleting one of them", async () => {
+  // Given: a prefix both fixture accounts share
+  const harness = startHarness()
+  try {
+    // When
+    const res = await post(harness.base, CLOUD_ROUTES.accountDelete, { idPrefix: "acct-", label: "acct-a@example.test" })
+
+    // Then: refused, with the machine-readable code the page branches on. Resolving to the first
+    // match would delete whichever record sorted earlier — and unlike a wrong switch, that cannot be
+    // undone by trying again.
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual({ error: expect.any(String), refused: "ambiguous" })
+    expect(harness.deleted).toEqual([])
+    expect(harness.roster()).toEqual(["acct-a", "acct-b"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a confirmation naming a different account deletes nothing", async () => {
+  // Given: acct-a's prefix carrying acct-b's address — a stale page, or a misread row
+  const harness = startHarness()
+  try {
+    const res = await post(harness.base, CLOUD_ROUTES.accountDelete, { idPrefix: "acct-a", label: "acct-b@example.test" })
+
+    // Then: refused, and NEITHER account is gone. This is the case that makes the dialog's typing
+    // step load-bearing rather than browser-side ceremony a direct POST could skip.
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual({ error: expect.any(String), refused: "label-mismatch" })
+    expect(harness.roster()).toEqual(["acct-a", "acct-b"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a prefix naming nobody is refused 409 unknown", async () => {
+  const harness = startHarness()
+  try {
+    const res = await post(harness.base, CLOUD_ROUTES.accountDelete, { idPrefix: "acct-z", label: "acct-z@example.test" })
+
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual({ error: expect.any(String), refused: "unknown" })
+    expect(harness.roster()).toEqual(["acct-a", "acct-b"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a confirmed delete removes the account from the pool the dashboard and the leases both read", async () => {
+  // Given: a two-account pool, and a caller presenting no credential at all — the same entitlement
+  // every other route on this server grants, which is the bind address and nothing else
+  const harness = startHarness()
+  try {
+    // When
+    const res = await post(harness.base, CLOUD_ROUTES.accountDelete, { idPrefix: "acct-a", label: "acct-a@example.test" })
+
+    // Then: 200, answering with the SAME redacted identity shape the add route uses — an id prefix
+    // and the label, never the record's tokens.
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ idPrefix: "acct-a", label: "acct-a@example.test" })
+    expect(harness.deleted).toEqual(["acct-a"])
+
+    // AND IT REALLY LEFT THE POOL, which is the half a status code cannot show: the usage view is
+    // built from the same roster selection reads, so an account still listed here would still be
+    // leasable — a delete that only satisfied the dialog.
+    const view = (await (await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)).json()) as UsageSnapshotView
+    expect(view.accounts.map((entry) => entry.label)).toEqual(["acct-b@example.test"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("the dashboard page carries the delete route and still leaks nothing", async () => {
+  const harness = startHarness()
+  try {
+    const body = await (await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)).text()
+
+    // Injected from the same frozen table the server dispatches on, so a renamed route cannot leave
+    // a silently dead button behind.
+    expect(body).toContain(CLOUD_ROUTES.accountDelete)
+    expect(body).toContain("删除账号")
+
+    // The picker is built in the BROWSER from /v1/usage, never baked into the document: a page that
+    // shipped the roster would publish the pool's email addresses to anyone who fetched the shell.
     expect(body).not.toContain("example.test")
   } finally {
     harness.stop()

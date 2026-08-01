@@ -419,6 +419,26 @@ export async function removeAccount(id: string): Promise<StoredAccount | undefin
   })
 }
 
+// Files a COPY OF ONE RECORD beside the account library, for a caller that is about to delete it.
+// The `refresh` field of a StoredAccount is the only copy of that chain in existence — Anthropic
+// mints no replacement without a fresh OAuth authorization — so a deletion with no copy on disk is
+// unrecoverable, which is the whole reason this exists.
+//
+// A NEW FILE PER DELETION, never one overwritten "last deleted": two deletions in a row would
+// otherwise leave only the second one recoverable. Nothing prunes them, deliberately — an operator
+// deletes an account a handful of times in a pool's life, and a copy that expires on a schedule
+// nobody remembers is the same as no copy at all.
+//
+// It is written through atomicWriteJson for the 0o600 mode, which matters MORE here than for the
+// library itself: this file is a live credential sitting outside the store every other reader knows
+// about.
+export async function backupRemovedAccount(account: StoredAccount): Promise<string> {
+  const path = join(dirname(ACCOUNTS_PATH), `claude-accounts.deleted-${Date.now()}-${account.id.slice(0, 8)}.json`)
+  await atomicWriteJson(path, account)
+  log.info("accounts:remove-backup", { id: account.id, path })
+  return path
+}
+
 export async function setAccountExcluded(id: string, excluded: boolean): Promise<StoredAccount | undefined> {
   return withAuthLock(async () => {
     const file = await loadAccounts()

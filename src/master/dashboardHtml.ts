@@ -30,6 +30,7 @@ export type DashboardConfig = {
   throttleMs: number
   authorizeRoute: string
   addRoute: string
+  deleteRoute: string
 }
 
 export function dashboardHtml(config: DashboardConfig): string {
@@ -80,13 +81,20 @@ export function dashboardHtml(config: DashboardConfig): string {
   #meta { margin: 0; font-size: 15px; color: var(--text-2); }
   #meta.stale { color: var(--accent); font-weight: 600; }
   .actions { display: flex; align-items: center; gap: 12px; }
-  /* The quiet sibling of #refresh, and that is a statement of rank: onboarding an account is rare
-     and destructive-adjacent, so it may not compete with the button an operator presses every
-     visit. #refresh stays the only accent-filled button on the page. */
-  #add { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
+  /* The quiet siblings of #refresh, and that is a statement of rank: onboarding an account is rare
+     and destructive-adjacent, removing one is rarer and outright destructive, so neither may compete
+     with the button an operator presses every visit. #refresh stays the only accent-filled button on
+     the page — 删除账号 emphatically included: the most destructive control here is the last one that
+     should be easy to hit by reflex, so its accent lives in the text and never in a filled target. */
+  #add, #del { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
          border: 1px solid var(--divider); border-radius: 999px; background: var(--card-bg);
          color: #3D3929; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
-  #add:hover { background: #F0EEE6; border-color: #D3CFC3; }
+  #add:hover, #del:hover:enabled { background: #F0EEE6; border-color: #D3CFC3; }
+  #del { color: var(--accent); }
+  /* Disabled while the page holds no roster to choose from — an empty pool, or the seconds before
+     the first snapshot lands. A dialog offering an empty list is a dead end the operator has to read
+     to understand; a button that is plainly not yet available is not. */
+  #del:disabled { color: var(--text-3); opacity: 0.55; cursor: default; }
   #refresh { display: flex; align-items: center; gap: 8px; padding: 7px 14px; font: 500 13px/normal var(--sans);
              border: 1px solid var(--accent); border-radius: 999px; background: var(--accent);
              color: var(--card-bg); cursor: pointer; transition: background 120ms ease; }
@@ -211,6 +219,28 @@ export function dashboardHtml(config: DashboardConfig): string {
   #derr { font-size: 13px; color: var(--accent); font-weight: 600; line-height: 1.5; }
   #derr[hidden] { display: none; }
 
+  /* The 删除账号 stage. It borrows .field / .pill / .hint wholesale — the two flows are the same
+     dialog and must not drift into looking like two products — and adds only what deletion needs:
+     a roster picker and a confirm button that says what it does. */
+  #delpick { width: 100%; padding: 10px 13px; font: 13px/normal var(--sans); color: var(--text);
+             background: #FFFFFF; border: 1px solid var(--divider); border-radius: 10px; outline: none; }
+  #delpick:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(193,95,60,0.12); }
+  #delconfirm { width: 100%; padding: 10px 13px; font-family: var(--mono); font-size: 13px;
+                color: var(--text); background: #FFFFFF; border: 1px solid var(--divider);
+                border-radius: 10px; outline: none;
+                transition: border-color 120ms ease, box-shadow 120ms ease; }
+  #delconfirm:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(193,95,60,0.12); }
+  /* The DARKEST tone in the palette, the one a maxed usage bar uses. Inside the dialog the operator
+     has already committed to a flow, so the confirm button must read as the severe thing it is —
+     unlike the toolbar entry, which must not. */
+  .pill.danger { border-color: var(--accent-dark); background: var(--accent-dark); color: var(--card-bg);
+                 transition: background 120ms ease; }
+  .pill.danger:hover:enabled { background: #93401F; border-color: #93401F; }
+  /* Same rule as #derr, same reason: only ever filled from a fixed lookup keyed by the server's
+     refusal code, never from a response body. */
+  #delerr { font-size: 13px; color: var(--accent); font-weight: 600; line-height: 1.5; }
+  #delerr[hidden] { display: none; }
+
   #d-done { flex-direction: row; align-items: center; gap: 12px; padding: 22px 20px;
             border: 1px solid var(--card-border); border-radius: 12px; background: var(--chip-bg); }
   .tick { flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
@@ -238,6 +268,10 @@ export function dashboardHtml(config: DashboardConfig): string {
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 3.2v9.6"></path><path d="M3.2 8h9.6"></path></svg>
         <span>添加账号</span>
       </button>
+      <button id="del" type="button" disabled>
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.8 4.4h10.4"></path><path d="M6.4 4.4V3.1h3.2v1.3"></path><path d="M4.1 4.4l0.6 8.5h6.6l0.6-8.5"></path></svg>
+        <span>删除账号</span>
+      </button>
       <button id="refresh" type="button">
         <span class="spin" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.7 6.6A6 6 0 0 0 3.1 4.6"></path><path d="M2.3 9.4A6 6 0 0 0 12.9 11.4"></path><path d="M13.9 2.6v4h-4"></path><path d="M2.1 13.4v-4h4"></path></svg></span>
         <span id="refresh-label">刷新</span>
@@ -245,7 +279,7 @@ export function dashboardHtml(config: DashboardConfig): string {
     </div>
   </header>
   <div id="rows"></div>
-  <footer>本页不展示任何 token 明文。「添加账号」只向池中新增账号，不会切号或删号。</footer>
+  <footer>本页不展示任何 token 明文。「删除账号」是不可撤销的：删除前 master 会把该账号的记录备份到 claude-accounts.json 同目录下，恢复只能靠这份备份或重新走一次授权。</footer>
 </div>
 <div id="veil" hidden>
   <div id="dialog" role="dialog" aria-modal="true" aria-labelledby="dtitle">
@@ -278,6 +312,24 @@ export function dashboardHtml(config: DashboardConfig): string {
         <button id="cancel" class="pill" type="button">取消</button>
       </div>
     </div>
+    <div id="d-del" class="stage" hidden>
+      <div class="field">
+        <label for="delpick">选择要从池中删除的账号</label>
+        <select id="delpick"></select>
+      </div>
+      <div class="field">
+        <label for="delconfirm">再输入一次它的邮箱以确认</label>
+        <input id="delconfirm" type="text" spellcheck="false" autocomplete="off" placeholder="完整输入上面选中的邮箱">
+        <span class="hint">删除会把该账号连同它的 refresh token 一起移出池子，且无法在 Anthropic 侧撤销——想再用它只能重新授权一次。master 会在删除前把这条记录单独备份到 claude-accounts.json 的同目录下。</span>
+      </div>
+      <p id="delerr" hidden></p>
+      <div class="row">
+        <button id="delsubmit" class="pill danger" type="button" disabled>
+          <span id="delsubmitlabel">确认删除</span>
+        </button>
+        <button id="delcancel" class="pill" type="button">取消</button>
+      </div>
+    </div>
     <div id="d-done" class="stage" hidden>
       <span class="tick" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-6"></path></svg></span>
       <span id="donetext"></span>
@@ -298,6 +350,7 @@ export function dashboardHtml(config: DashboardConfig): string {
   var REFRESH_URL = "${config.refreshRoute}";
   var AUTHORIZE_URL = "${config.authorizeRoute}";
   var ADD_URL = "${config.addRoute}";
+  var DELETE_URL = "${config.deleteRoute}";
   var THROTTLE_MS = ${String(config.throttleMs)};
   var RELOAD_MS = 5000;
   var TICK_MS = 1000;
@@ -317,6 +370,7 @@ export function dashboardHtml(config: DashboardConfig): string {
   var meta = document.getElementById("meta");
   var button = document.getElementById("refresh");
   var buttonLabel = document.getElementById("refresh-label");
+  var delButton = document.getElementById("del");
   var latest = null;
   var sweeping = false;
   // Set when the server refuses a press; while it is in the future the meta line says how long is
@@ -418,6 +472,9 @@ export function dashboardHtml(config: DashboardConfig): string {
     button.disabled = sweeping || waiting;
     button.className = sweeping ? "busy" : "";
     buttonLabel.textContent = sweeping ? "刷新中…" : "刷新";
+    // 删除账号 opens a picker built from THIS snapshot, so it stays shut until there is one to build
+    // from — an empty pool, or the seconds before the first payload lands.
+    delButton.disabled = !latest || latest.accounts.length === 0;
   }
 
   function renderWindow(win) {
@@ -561,9 +618,14 @@ export function dashboardHtml(config: DashboardConfig): string {
   // 410 and 502 mean this PKCE session is spent and only a new link can help.
   var veil = document.getElementById("veil");
   var dsub = document.getElementById("dsub");
+  var dialogTitle = document.getElementById("dtitle");
+  // ONE shell, two flows. done and fatal are shared by both on purpose — a second veil would
+  // mean a second Escape handler, a second backdrop handler and a second close path, three pairs
+  // that drift — which is why the subtitle table below is keyed by FLOW first and stage second.
   var stages = {
     loading: document.getElementById("d-loading"),
     ready: document.getElementById("d-ready"),
+    del: document.getElementById("d-del"),
     done: document.getElementById("d-done"),
     fatal: document.getElementById("d-fatal")
   };
@@ -578,11 +640,18 @@ export function dashboardHtml(config: DashboardConfig): string {
   var fatalMessage = document.getElementById("fatalmsg");
 
   var SUBTITLES = {
-    loading: "正在准备 OAuth 授权，请稍候。",
-    ready: "打开链接完成登录授权，然后把返回的 code 粘贴回来。",
-    done: "添加成功。",
-    fatal: "本次授权没有完成。"
+    add: {
+      loading: "正在准备 OAuth 授权，请稍候。",
+      ready: "打开链接完成登录授权，然后把返回的 code 粘贴回来。",
+      done: "添加成功。",
+      fatal: "本次授权没有完成。"
+    },
+    del: {
+      del: "这一步不可撤销：删掉的是账号在池子里的唯一一份凭据。",
+      done: "删除成功。"
+    }
   };
+  var flow = "add";
   // Keyed by STATUS, never by the response body: the body's error field is a machine-readable reason
   // for the log, and echoing a server string into the DOM is the habit this page exists without.
   var ADD_ERRORS = {
@@ -594,17 +663,18 @@ export function dashboardHtml(config: DashboardConfig): string {
   // 410 and 502 are terminal for the session; everything else leaves the operator on the form.
   var FATAL_STATUS = { 410: true, 502: true };
 
-  var addStage = "loading";
+  var dialogStage = "loading";
   var pendingId = "";
   var submitting = false;
   var closeTimer = 0;
 
   function showStage(name) {
-    addStage = name;
+    dialogStage = name;
     for (var key in stages) {
       if (owns.call(stages, key)) stages[key].hidden = key !== name;
     }
-    dsub.textContent = owns.call(SUBTITLES, name) ? SUBTITLES[name] : "";
+    var subtitles = SUBTITLES[flow];
+    dsub.textContent = owns.call(subtitles, name) ? subtitles[name] : "";
   }
 
   function setError(text) {
@@ -623,6 +693,7 @@ export function dashboardHtml(config: DashboardConfig): string {
     veil.hidden = true;
     pendingId = "";
     submitting = false;
+    deleting = false;
   }
 
   // Asks for a fresh PKCE session every time the dialog opens. Deliberately NOT cached across opens:
@@ -630,6 +701,8 @@ export function dashboardHtml(config: DashboardConfig): string {
   // pendingId would fail at the worst moment — after they had gone and authorized in the browser.
   function beginAdd() {
     clearTimeout(closeTimer);
+    flow = "add";
+    dialogTitle.textContent = "添加 anthropic 账号";
     veil.hidden = false;
     pendingId = "";
     submitting = false;
@@ -786,6 +859,139 @@ export function dashboardHtml(config: DashboardConfig): string {
   });
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape" && !veil.hidden) closeDialog();
+  });
+
+  // ── 删除账号 ──────────────────────────────────────────────────────────────────────────────────
+  // The destructive half of pool membership, and deliberately the slowest control on this page: pick
+  // the row, RETYPE its address, then confirm. The retyped address is not decoration — it travels
+  // with the request and the master re-checks it against the record the prefix resolved to, so this
+  // dialog cannot be reduced to a single reflex click, and a page that has gone stale cannot delete
+  // an account the operator never looked at.
+  var delPick = document.getElementById("delpick");
+  var delConfirm = document.getElementById("delconfirm");
+  var delSubmit = document.getElementById("delsubmit");
+  var delSubmitLabel = document.getElementById("delsubmitlabel");
+  var delError = document.getElementById("delerr");
+  var deleting = false;
+
+  // Keyed by the server's "refused" code, exactly as ADD_ERRORS is keyed by status: the body's own
+  // "error" string is for whoever reads the route with curl, and putting a server-supplied string
+  // into the DOM is the habit this page exists without.
+  var DELETE_ERRORS = {
+    unknown: "池子里没有这个账号——多半是刚被别的地方删掉了。关掉重开一次看板再看。",
+    ambiguous: "这个 id 前缀同时命中了池里多个账号，master 拒绝替你猜是哪一个，请找维护者按完整 id 处理。",
+    "label-mismatch": "输入的邮箱和选中的账号对不上，什么都没有删。请照着上面选中的那一行完整输入。"
+  };
+
+  function selectedLabel() {
+    var option = delPick.options[delPick.selectedIndex];
+    return option ? option.textContent : "";
+  }
+
+  function setDeleteError(text) {
+    delError.textContent = text;
+    delError.hidden = !text;
+  }
+
+  function syncDelete() {
+    var label = selectedLabel();
+    // EXACT equality, not a substring and not a case-fold: the entire value of this field is that it
+    // cannot be satisfied by accident. Only surrounding whitespace is forgiven, because that is an
+    // artefact of copying the address off the row above.
+    delSubmit.disabled = deleting || !label || delConfirm.value.trim() !== label;
+    delSubmitLabel.textContent = deleting ? "删除中…" : "确认删除";
+  }
+
+  function beginDelete() {
+    // Guarded as well as disabled: syncButton owns the button's state, and a keyboard activation
+    // arriving in the same frame as an emptied roster must not open a dialog with nothing in it.
+    if (!latest || latest.accounts.length === 0) return;
+    clearTimeout(closeTimer);
+    flow = "del";
+    dialogTitle.textContent = "从池中删除账号";
+    veil.hidden = false;
+    deleting = false;
+    delConfirm.value = "";
+    setDeleteError("");
+    // REBUILT FROM THE CURRENT SNAPSHOT on every open, never kept alive across opens: a picker still
+    // listing an account that has since left the pool is how an operator confirms a deletion against
+    // a name that no longer means what they think it does.
+    delPick.textContent = "";
+    for (var i = 0; i < latest.accounts.length; i++) {
+      var option = document.createElement("option");
+      // Same rule as every other node here: the identifier goes in through a property and the text
+      // through textContent. An <option> built by string concatenation would be the one place a
+      // pool-derived label reached the parser as markup.
+      option.value = latest.accounts[i].idPrefix;
+      option.textContent = latest.accounts[i].label;
+      delPick.appendChild(option);
+    }
+    showStage("del");
+    syncDelete();
+    delConfirm.focus();
+  }
+
+  function submitDelete() {
+    if (deleting) return;
+    var idPrefix = delPick.value;
+    var label = selectedLabel();
+    // The same test syncDelete just made, re-made at the point of the request: the button is only one
+    // of the ways this function can be reached (Enter in the field is the other).
+    if (!idPrefix || delConfirm.value.trim() !== label) return;
+    deleting = true;
+    setDeleteError("");
+    syncDelete();
+    fetch(DELETE_URL, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ idPrefix: idPrefix, label: label })
+    })
+      .then(function (res) {
+        if (res.ok) return res.json();
+        // A 409 is the master's refusal taxonomy and the ONLY body consulted, for its "refused" code
+        // alone. Every refusal leaves the operator on this form with the pool untouched.
+        if (res.status === 409) {
+          return res.json().catch(function () { return null; }).then(function (body) {
+            throw { refused: body && body.refused };
+          });
+        }
+        throw { status: res.status };
+      })
+      .then(function (payload) {
+        doneText.textContent = "账号 " + payload.label + " 已移出池子，删除前的记录已备份在 master 上。";
+        showStage("done");
+        // The roster behind the dialog is now out of date by exactly one account.
+        load();
+        closeTimer = setTimeout(closeDialog, 2600);
+      })
+      .catch(function (failure) {
+        var refused = failure && failure.refused;
+        setDeleteError(
+          refused && owns.call(DELETE_ERRORS, refused)
+            ? DELETE_ERRORS[refused]
+            : "删除失败：" + (failure && failure.status ? "HTTP " + failure.status : "网络错误") + "，账号仍在池中。"
+        );
+      })
+      .then(function () {
+        deleting = false;
+        syncDelete();
+      });
+  }
+
+  delButton.addEventListener("click", beginDelete);
+  document.getElementById("delcancel").addEventListener("click", closeDialog);
+  delSubmit.addEventListener("click", submitDelete);
+  delPick.addEventListener("change", function () {
+    setDeleteError("");
+    syncDelete();
+  });
+  delConfirm.addEventListener("input", function () {
+    setDeleteError("");
+    syncDelete();
+  });
+  delConfirm.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") submitDelete();
   });
 
   // ── WAKING UP ─────────────────────────────────────────────────────────────────────────────────
