@@ -206,10 +206,15 @@ export const ONBOARD_ADD_MIN_INTERVAL_MS = 3_000
 // stopped calling home stops being a live credential without anyone having to notice.
 export const POOLKEY_TTL_MS = 7 * 24 * 3_600_000
 
-// Floor between two PERSISTED slides of the same key. A worker verifies every few minutes, so
-// writing the slid expiry on every verify would turn each lease into a kv write; this floor caps
-// that at one write per key per hour, and the price is bounded — the stored expiry trails the true
-// one by at most an hour, ~0.6% of the window above.
+// Floor between two PERSISTED slides of the same key. This is DEFENSIVE, not a fix for a measured
+// write storm, and the difference is worth recording so nobody later removes it believing it was
+// cargo: a worker checks its lease every LEASE_CHECK_INTERVAL_MS but only calls out when the lease
+// is inside LEASE_RENEW_BUFFER_MS of expiring, so the natural cadence is a handful of verifies per
+// worker per day, which would be perfectly affordable to persist unconditionally. What the floor
+// buys is DECOUPLING — the credential check on the lease path stops implying a disk write, so a
+// worker stuck in a retry loop, a fleet that grew, or a future shortening of the renewal buffer
+// cannot quietly turn authentication into I/O. The price is bounded and small: the stored expiry
+// trails the true one by at most an hour, ~0.6% of the window above.
 export const POOLKEY_SLIDE_MIN_INTERVAL_MS = 3_600_000
 
 // Server-wide floor between two self-service registrations. Minting is the one pool operation that

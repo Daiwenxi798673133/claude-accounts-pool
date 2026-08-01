@@ -178,9 +178,10 @@ export function createRegistry(deps: RegistryDeps): {
         log.info("master.registry.expired", { workerId })
         return undefined
       }
-      // Slide the window, but persist at most once per POOLKEY_SLIDE_MIN_INTERVAL_MS: a worker
-      // leases every few minutes, so writing here unconditionally would turn one lease into one
-      // kv write. The last-slide instant is DERIVED (`expiresAt - TTL`) rather than stored, so
+      // Slide the window, but persist at most once per POOLKEY_SLIDE_MIN_INTERVAL_MS, so that
+      // checking a credential never implies a disk write (the floor's full rationale, including
+      // why it is defensive rather than a response to a measured write rate, is on the constant).
+      // The last-slide instant is DERIVED (`expiresAt - TTL`) rather than stored, so
       // the record stays the four fields the http route is built against. When the write is
       // skipped the slid value is simply discarded — every call re-reads the kv, so there is no
       // in-memory copy that could drift away from what is on disk.
