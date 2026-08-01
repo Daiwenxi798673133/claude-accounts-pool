@@ -42,8 +42,10 @@ export const CLOUD_ROUTES = Object.freeze({
   //
   // THESE TWO BREAK THE "PURELY READ-ONLY DASHBOARD" PROPERTY, and that is a deliberate, recorded
   // reversal by the pool owner rather than an oversight — docs/cloud-mode.md used to promise
-  // "纯只读:不切号、不删号、不签 key" and that sentence has been amended along with this table. What
-  // they do NOT relax is anything about `lease`: minting a credential FOR A WORKER still needs a key.
+  // "纯只读:不切号、不删号、不签 key" and that sentence has been amended along with this table. The
+  // last third of that promise is gone as well: `workerRegister` below SIGNS A POOL KEY, keylessly.
+  // So do not read this pair as "at least the credential side is still gated" — what still demands a
+  // key is `lease` and `ratelimit` alone, and it is the key this table now hands out on request.
   //
   // Both POST for the same reason usageRefresh is: `accountAdd` reaches platform.claude.com, so a GET
   // would let a pasted link provoke upstream traffic. `accountAuthorize` makes no network call at all,
@@ -58,6 +60,26 @@ export const CLOUD_ROUTES = Object.freeze({
   // this port. The bind address is what narrows that, exactly as for `usage`.
   accountAuthorize: "/v1/account/authorize",
   accountAdd: "/v1/account/add",
+  // POST — the dashboard's 「注册 worker」 flow: mint ONE pool key and hand its plaintext to the
+  // browser, so a worker machine can be onboarded from the web page instead of only from `/reg`,
+  // which is a TUI command and therefore needs a session on the master's own console.
+  //
+  // KEYLESS BY THE SAME DELIBERATE DECISION as the rest of the dashboard, and this is the route where
+  // that decision costs the most — so the bounds standing in for the key are named HERE rather than
+  // left to be discovered in leaseServer.ts. All three live in src/constants.ts:
+  //   • REGISTER_MIN_INTERVAL_MS caps the RATE, server-wide. Minting rewrites the kv, so without it a
+  //     caller could turn this route into an unbounded write loop against the master's store.
+  //   • REGISTER_MAX_LIVE_KEYS caps how much kv an anonymous flood can ever occupy, which is what
+  //     makes the registry's size a CONSTANT rather than something a caller picks.
+  //   • POOLKEY_TTL_MS's 7-day sliding expiry means a key that is issued and never used disappears on
+  //     its own, so a flood that gets past the two caps still does not leave permanent credentials.
+  //
+  // WHAT IS DELIBERATELY NOT CLAIMED: that an anonymous peer cannot obtain a WORKING pool key. It
+  // can — reaching this port is the whole requirement, and the key it gets opens `lease`. The BIND
+  // ADDRESS is what narrows that, exactly as for `usage` and `accountAdd`. POST for the same reason
+  // as those two: a link unfurler speculatively GETting a pasted dashboard URL must not mint a
+  // credential.
+  workerRegister: "/v1/worker/register",
 } as const)
 
 // Why the worker is asking. `prelease` is the routine path (startup or renewal before the
@@ -163,6 +185,34 @@ export type AccountAddResponse = {
   // two outcomes call for different words on screen and hiding the difference is how an operator ends
   // up believing the pool grew when it did not.
   existing: boolean
+}
+
+// ── Worker registration payloads (the 注册 worker flow) ───────────────────────────────────────────
+
+export type WorkerRegisterRequest = {
+  // The operator's name for the machine being onboarded, and the ONLY thing this route accepts.
+  // Narrowed hard on the server (leaseServer.ts, parseWorkerRegisterRequest) rather than here,
+  // because it is stored and then rendered back on an UNAUTHENTICATED page: what the browser's own
+  // field can produce must be accepted, and nothing else may be.
+  label: string
+}
+
+export type WorkerRegisterResponse = {
+  // Assigned by the registry (`worker-N`), never chosen by the caller — a client-picked id could
+  // land on a live worker's entry and silently overwrite its digest.
+  workerId: string
+  // THE ONLY PLACE THIS PLAINTEXT WILL EVER EXIST. The registry persists a SHA-256 digest and nothing
+  // else, so the instant this response is written the value is unrecoverable — not by the operator,
+  // not by us, not from a dump of the kv store. It therefore must never be logged, never be echoed
+  // into a second response, and never be written anywhere but the worker's own tui.json. A field for
+  // it exists here and nowhere else on this wire, which is what makes that reviewable.
+  poolKey: string
+  // Echoed back so the page can name the machine it just registered without trusting its own input
+  // to have survived the server's narrowing unchanged.
+  label: string
+  // Absolute epoch-ms, not a duration. The key is LEASED — the window slides forward on every
+  // successful verify — so the page has to be able to say when an unused one lapses.
+  expiresAt: number
 }
 
 // ── Dashboard payload (master → the operator's browser) ────────────────────────────────────────

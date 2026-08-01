@@ -119,7 +119,13 @@ const controller = new AbortController()
 const server = startLeaseServer({
   scheduler: { pickAccount: ({ accounts, exclude }) => accounts.find((a) => a.id !== exclude), reportRateLimit: () => {} },
   refresher: { getFreshAccess: async (accountId) => ({ access: process.env.E2E_FAKE_ACCESS_PREFIX + accountId, expiresAt: Date.now() + ttl }) },
-  registry: { verify: (header) => (header === "Bearer " + process.env.E2E_POOL_KEY ? process.env.E2E_WORKER_ID : undefined) },
+  // register/list 只是补齐依赖形状:这条 e2e 验的是 worker 用一把「已经发好的」key 走完租约,
+  // 自助注册路由不在它的断言范围内,所以这里给最小实现而不是真的发 key。
+  registry: {
+    verify: (header) => (header === "Bearer " + process.env.E2E_POOL_KEY ? process.env.E2E_WORKER_ID : undefined),
+    register: () => ({ workerId: process.env.E2E_WORKER_ID, key: process.env.E2E_POOL_KEY, expiresAt: Date.now() + 7 * 24 * 3600_000 }),
+    list: () => [],
+  },
   loadAccounts: async () => [{ id, label: id + "@e2e.invalid", refresh: "e2e-master-only-refresh" }],
   hostname: "127.0.0.1",
   port: 0,

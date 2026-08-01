@@ -1,10 +1,27 @@
 import { expect, test } from "bun:test"
+import { randomBytes } from "node:crypto"
 import type { StoredAccount } from "../accounts.ts"
-import { LEASE_RENEW_BUFFER_MS, MASTER_MIN_REMAINING_MS, ONBOARD_ADD_MIN_INTERVAL_MS } from "../constants.ts"
+import {
+  LEASE_RENEW_BUFFER_MS,
+  MASTER_MIN_REMAINING_MS,
+  ONBOARD_ADD_MIN_INTERVAL_MS,
+  POOLKEY_TTL_MS,
+  REGISTER_MAX_LIVE_KEYS,
+  REGISTER_MIN_INTERVAL_MS,
+} from "../constants.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
-import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
+import type {
+  LeaseRequest,
+  LeaseResponse,
+  RateLimitReport,
+  ThrottledBody,
+  UsageSnapshotView,
+  WorkerRegisterRequest,
+  WorkerRegisterResponse,
+} from "../cloud/protocol.ts"
 import { createAccountOnboard } from "./accountOnboard.ts"
 import { startLeaseServer, USAGE_REFRESH_MIN_INTERVAL_MS } from "./leaseServer.ts"
+import type { PoolKeySummary } from "./registry.ts"
 import type { UsageSnapshot } from "./scheduler.ts"
 
 // A REAL Bun.serve on an EPHEMERAL port, driven by REAL fetch. The deliverable here is HTTP
@@ -49,6 +66,10 @@ type Harness = {
   // Every code string the onboarding exchange was handed. Empty means the route refused BEFORE
   // reaching out, which is the distinction the throttle and the session-lifecycle cases turn on.
   exchanged: string[]
+  // The fake registry's ACTUAL contents. Every registration case turns on what the registry holds
+  // afterwards — "the ceiling held", "nothing was minted" — and a mock returning canned answers
+  // could show neither.
+  minted: PoolKeySummary[]
 }
 
 function startHarness(options?: {
@@ -62,6 +83,8 @@ function startHarness(options?: {
   goodCode?: string
   onboardProfile?: { uuid: string; email: string }
   profileThrows?: boolean
+  // Pool keys already live when the server starts, for the capacity ceiling.
+  liveKeys?: number
 }): Harness {
   const accounts = options?.accounts ?? [account("acct-a"), account("acct-b")]
   const accountExpiresAt = options?.accountExpiresAt ?? ACCOUNT_EXPIRES_AT
@@ -79,6 +102,12 @@ function startHarness(options?: {
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
   const preferred: Harness["preferred"] = []
+  const minted: PoolKeySummary[] = Array.from({ length: options?.liveKeys ?? 0 }, (_slot, index) => ({
+    workerId: `worker-${index + 1}`,
+    label: `existing-${index + 1}`,
+    issuedAt: nowMs,
+    expiresAt: nowMs + POOLKEY_TTL_MS,
+  }))
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
 
@@ -146,6 +175,20 @@ function startHarness(options?: {
     },
     registry: {
       verify: (header) => (header === `Bearer ${POOL_KEY}` ? WORKER_ID : undefined),
+      // Mints the same 32-random-bytes-base64url shape the real registry does, because the only
+      // promise this route makes the operator is that the plaintext it hands back is a USABLE key —
+      // a fake answering "fake-key" could not show the wire carrying one.
+      register: (label) => {
+        const summary: PoolKeySummary = {
+          workerId: `worker-${minted.length + 1}`,
+          label,
+          issuedAt: clock(),
+          expiresAt: clock() + POOLKEY_TTL_MS,
+        }
+        minted.push(summary)
+        return { workerId: summary.workerId, key: randomBytes(32).toString("base64url"), expiresAt: summary.expiresAt }
+      },
+      list: () => minted,
     },
     loadAccounts: async () => accounts,
     // Stands in for the usage poller's tickOnce. It ADVANCES THE SNAPSHOT INSTANT, because that is
@@ -177,6 +220,7 @@ function startHarness(options?: {
       nowMs += ms
     },
     exchanged,
+    minted,
   }
 }
 
@@ -1088,6 +1132,202 @@ test("the dashboard page carries the onboarding routes and still leaks nothing",
     expect(body).not.toContain("verifier-under-test")
     expect(body).not.toContain(POOL_KEY)
     expect(body).not.toContain("example.test")
+  } finally {
+    harness.stop()
+  }
+})
+
+// ── 注册 worker (self-service pool keys) ────────────────────────────────────────────────────────
+// The first KEYLESS route on this server that hands out a CREDENTIAL, so what the cases below pin
+// down is mostly the three bounds standing in for the key: the rate floor, the live-key ceiling, and
+// a label narrow enough that nothing arbitrary reaches the unauthenticated page that renders it.
+
+test("register mints a pool key and hands the plaintext back exactly once", async () => {
+  // Given: a master no machine has registered against yet
+  const harness = startHarness()
+  try {
+    // When: the dashboard posts the machine's name, with NO credential of any kind — the whole point
+    // of the route is that a machine holding no key can obtain its first one
+    const res = await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "vince-laptop" } satisfies WorkerRegisterRequest)
+
+    // Then
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as WorkerRegisterResponse
+    // EXACTLY these four fields, asserted as a set rather than field by field: this is the one
+    // response on this wire carrying a live credential, so an EXTRA field is the failure to catch —
+    // a digest, an issuedAt, or a second copy of the key going somewhere nobody looked.
+    expect(Object.keys(body).sort()).toEqual(["expiresAt", "label", "poolKey", "workerId"])
+    // The id is the REGISTRY's (`worker-N`), never the caller's: a client-chosen id could land on a
+    // live worker's entry and overwrite its digest.
+    expect(body.workerId).toBe("worker-1")
+    expect(body.label).toBe("vince-laptop")
+    // 32 random bytes base64url — the real registry's shape. A truncated or placeholder key pastes
+    // into a tui.json just fine and then fails at the first lease, hours later and far from here.
+    expect(body.poolKey.length).toBe(43)
+    // The key is LEASED, not permanent, so the page has to be able to say when it lapses.
+    expect(body.expiresAt).toBeGreaterThan(Date.now())
+
+    // And the registry really grew — the response is the registry's answer, not the route's own.
+    expect(harness.minted.map((key) => key.label)).toEqual(["vince-laptop"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a GET can never mint a pool key", async () => {
+  const harness = startHarness()
+  try {
+    // When: the route is fetched the way a browser, a link scanner or a chat-app unfurler
+    // speculatively fetches any URL it sees
+    const res = await fetch(`${harness.base}${CLOUD_ROUTES.workerRegister}`)
+
+    // Then: 405 rather than 404, so the fault reads as "wrong method" instead of "this master is too
+    // old to have the button". And the assertion that matters: pasting the dashboard's link into a
+    // chat window left no working pool key in an unfurler's cache.
+    expect(res.status).toBe(405)
+    expect(harness.minted).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a label the dashboard could never produce is refused before anything is minted", async () => {
+  const harness = startHarness()
+  try {
+    // Given: every shape a hand-rolled curl can send that the browser's own sanitiser — strip
+    // [^A-Za-z0-9-_], lowercase, cap 32 — never would
+    const refused: unknown[] = [
+      { nope: true },
+      {},
+      { label: 42 },
+      { label: "" },
+      { label: "   " },
+      { label: "my laptop" },
+      { label: "Vince" },
+      // The reason the rule exists at all: this label is stored and then rendered back on an
+      // UNAUTHENTICATED page, so arbitrary text here is an anonymous write into a surface the
+      // operator reads.
+      { label: "<img src=x onerror=alert(1)>" },
+      { label: "x".repeat(33) },
+      "{not json",
+    ]
+
+    // When / Then
+    for (const body of refused) {
+      // The rate floor sits AHEAD of the parse and is stamped even by a call it goes on to refuse, so
+      // the clock is stepped between attempts. Without this the second answer would be a 429 and the
+      // case would be asserting the wrong guard entirely.
+      harness.advance(REGISTER_MIN_INTERVAL_MS)
+      const res = await post(harness.base, CLOUD_ROUTES.workerRegister, body)
+      expect(res.status).toBe(400)
+    }
+
+    // AND THE LOAD-BEARING ASSERTION: not one key was minted. A 400 returned AFTER register() would
+    // leave an unreachable entry squatting one of the REGISTER_MAX_LIVE_KEYS slots for a full week.
+    expect(harness.minted).toEqual([])
+
+    // And the value on the other side of each rule is ACCEPTED, so the pattern is proven to be a rule
+    // rather than a blanket refusal — including the trim, since whitespace is an artefact of how the
+    // name was moved rather than part of it.
+    harness.advance(REGISTER_MIN_INTERVAL_MS)
+    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "  vince_laptop-2  " })).status).toBe(200)
+    harness.advance(REGISTER_MIN_INTERVAL_MS)
+    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "x".repeat(32) })).status).toBe(200)
+    expect(harness.minted.map((key) => key.label)).toEqual(["vince_laptop-2", "x".repeat(32)])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("registration is throttled server-wide and says how long to wait", async () => {
+  const harness = startHarness()
+  try {
+    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "first" })).status).toBe(200)
+
+    // A second press inside the window is REFUSED, and on a keyless route that floor is not
+    // politeness: minting reads and rewrites the kv, so without it a caller could turn the button
+    // into an unbounded write loop against the master's store.
+    const throttled = await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "second" })
+    expect(throttled.status).toBe(429)
+    const body = (await throttled.json()) as ThrottledBody
+    expect(body.retryAfterMs).toBeGreaterThan(0)
+    expect(body.retryAfterMs).toBeLessThanOrEqual(REGISTER_MIN_INTERVAL_MS)
+    // The header for anything speaking plain HTTP, in whole seconds; the body's exact ms is what the
+    // page counts down. Both, because a disabled button with no stated reason is the thing to avoid.
+    expect(throttled.headers.get("retry-after")).toBe(String(Math.ceil(body.retryAfterMs / 1000)))
+    // NOTHING was minted by the refused call — that, not the status code, is the property protected.
+    expect(harness.minted).toHaveLength(1)
+
+    // One millisecond short of the window: still refused. Exactly at it: allowed. Both asserted so
+    // that neither a `<` / `<=` slip nor a throttle that never lifts can pass.
+    harness.advance(REGISTER_MIN_INTERVAL_MS - 1)
+    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "third" })).status).toBe(429)
+    harness.advance(1)
+    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "fourth" })).status).toBe(200)
+    expect(harness.minted.map((key) => key.label)).toEqual(["first", "fourth"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a registry already at its ceiling answers 409, never 429", async () => {
+  // Given: every slot REGISTER_MAX_LIVE_KEYS allows is occupied by a live key
+  const harness = startHarness({ liveKeys: REGISTER_MAX_LIVE_KEYS })
+  try {
+    // When: one more machine registers — a well-formed request, and the first since boot, so neither
+    // the parser nor the rate floor can be what refuses it
+    const res = await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "one-too-many" })
+
+    // Then: 409, and the split from the 429 above is the caller's next move. A 429 tells the page
+    // "wait and this exact request succeeds", which is false here — waiting helps only once an
+    // operator retires a key or an unused one reaches the end of its 7-day window. Collapsing the two
+    // would put a browser into a retry loop against a wall.
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual({ error: "registry full" })
+    // And the ceiling HELD: the refusal landed before register(), so the kv did not grow past it.
+    expect(harness.minted).toHaveLength(REGISTER_MAX_LIVE_KEYS)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("the dashboard page carries the register route", async () => {
+  const harness = startHarness()
+  try {
+    const body = await (await fetch(`${harness.base}${CLOUD_ROUTES.dashboard}`)).text()
+
+    // Injected from the same frozen table the server dispatches on, exactly as the other four route
+    // injections are, so a renamed route cannot leave a silently dead button behind.
+    expect(body).toContain(CLOUD_ROUTES.workerRegister)
+    // And the page is still a shell: a route that MINTS a key must not have put one in the document.
+    expect(body).not.toContain(POOL_KEY)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a keyless mint route did not make the credential routes keyless", async () => {
+  const harness = startHarness()
+  try {
+    // Given: an anonymous caller that has just minted itself a pool key through the open route
+    expect((await post(harness.base, CLOUD_ROUTES.workerRegister, { label: "anon" })).status).toBe(200)
+
+    // When: the very same caller, still presenting NO Authorization header, asks for a lease and
+    // reports a limit
+    const lease = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
+    const ratelimit = await post(harness.base, CLOUD_ROUTES.ratelimit, {
+      workerId: WORKER_ID,
+      accountId: "acct-a",
+      headers: {},
+    } satisfies RateLimitReport)
+
+    // Then: both still refused. A keyless route that hands out the key these two demand makes that
+    // demand the pool's ONLY remaining gate, so it has to survive being made easy to satisfy.
+    expect(lease.status).toBe(401)
+    expect(ratelimit.status).toBe(401)
+    // Nothing was minted and no pool state moved, which is the consequence those statuses stand for.
+    expect(harness.refreshed).toEqual([])
+    expect(harness.reports).toEqual([])
   } finally {
     harness.stop()
   }
