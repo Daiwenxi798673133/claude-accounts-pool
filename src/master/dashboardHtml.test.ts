@@ -44,6 +44,33 @@ test("account cards are laid out in a multi-column grid", () => {
   expect(html).not.toContain("#rows { display: flex; flex-direction: column; gap: 20px; }")
 })
 
+test("a window the pool has but one account lacks is padded as an inert row", () => {
+  // A standard seat carries no Fable quota, so Anthropic omits that window entirely and the card came
+  // out one row shorter than its neighbours — in a grid that means the bars stop lining up across the
+  // whole row (measured on the live master: 211px against 262px). Every card is therefore padded to
+  // the SNAPSHOT'S OWN set of labels, derived from the payload rather than from a hardcoded "Fable":
+  // the scoped windows are whatever Anthropic's `limits` happens to name, which is the same reason
+  // shortLabel falls through instead of switching.
+  expect(html).toContain("function windowOrder(accounts)")
+  expect(html).toContain("function missingWindow(label)")
+  expect(html).toContain("renderAccount(latest.accounts[i], order)")
+  // The padded label goes through the same lookup a real one does, so a future scoped window needs no
+  // edit here.
+  expect(html).toContain("el(\"div\", \"wl dim\", shortLabel(label))")
+  // Reads as ABSENT, never as idle. An empty track next to 0% is exactly what a healthy unused window
+  // looks like, and this row makes the opposite claim: there is no such quota to use. Same distinction
+  // the 本轮无数据 badge exists to protect.
+  expect(html).toContain("\"不适用\"")
+  // Kept in the layout for its BOX alone — identical geometry is the entire point — while painting
+  // neither track nor fill.
+  expect(html).toContain(".bar.ghost { visibility: hidden; }")
+  expect(html).toContain("el(\"div\", \"bar ghost\")")
+  expect(html).toContain(".wl.dim")
+  // The exhaustive count is the guard: a fill belongs to renderWindow alone, so a second mention
+  // would mean the placeholder had grown a bar that reads as a real measurement.
+  expect(html.split("\"fill\"").length - 1).toBe(1)
+})
+
 test("the document carries no template-literal residue", () => {
   // The whole document lives inside a TS template literal, so a stray backtick or ${ would be a
   // build-breaking edit with no compiler watching it. A standing invariant, not a feature under test.

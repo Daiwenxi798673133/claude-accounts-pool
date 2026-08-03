@@ -150,6 +150,14 @@ export function dashboardHtml(config: DashboardConfig): string {
   .reset { font-size: 13px; color: var(--text-2); white-space: nowrap; }
   /* A 0% window is deliberately de-emphasised — it is the row with nothing to look at. */
   .pct.dim, .reset.dim { color: var(--text-3); }
+  /* The label of a window this account does not HAVE — a standard seat carries no Fable quota, so
+     Anthropic omits it. Dimmer than a real label, because the row must read as "does not apply". */
+  .wl.dim { color: var(--text-3); }
+  /* Kept in the layout for its BOX ALONE, painting nothing: the row has to be exactly as tall as a
+     real one or the cards across a grid row stop lining up, which is the only reason it exists. A
+     visible empty track would have read as a window sitting idle at 0% — the one misreading this
+     page must never invite, and the same confusion the 本轮无数据 badge exists to prevent. */
+  .bar.ghost { visibility: hidden; }
 
   .empty { font-size: 13px; color: var(--text-3); }
   footer { margin: 4px 0 0; font-size: 13px; color: var(--text-3); line-height: 1.6; }
@@ -505,7 +513,44 @@ export function dashboardHtml(config: DashboardConfig): string {
     return row;
   }
 
-  function renderAccount(account) {
+  // The ordered union of every window label in the snapshot, walked in payload order so the two fixed
+  // windows keep their places and a dynamic per-model one lands after them. Derived from the payload
+  // and never hardcoded, for the same reason shortLabel falls through: which scoped windows exist is
+  // Anthropic's decision, per account, and it changes without this page being edited.
+  function windowOrder(accounts) {
+    var order = [];
+    var seen = {};
+    for (var i = 0; i < accounts.length; i++) {
+      var wins = accounts[i].windows;
+      for (var j = 0; j < wins.length; j++) {
+        // hasOwnProperty for the same reason shortLabel uses it: a pool-derived label of "constructor"
+        // must not test as already seen.
+        if (!owns.call(seen, wins[j].label)) {
+          seen[wins[j].label] = true;
+          order.push(wins[j].label);
+        }
+      }
+    }
+    return order;
+  }
+
+  // A window this account has no quota for at all. Same elements and same type sizes as a real row, so
+  // the header line's height matches to the pixel, and the bar is present but unpainted.
+  function missingWindow(label) {
+    var row = el("div", "win");
+    var top = el("div", "win-top");
+    top.appendChild(el("div", "wl dim", shortLabel(label)));
+    var right = el("div", "win-right");
+    // 不适用, never 0%: having no such quota is a different fact from having one and not having used
+    // it, and only one of the two is worth an operator's attention.
+    right.appendChild(el("div", "pct dim", "不适用"));
+    top.appendChild(right);
+    row.appendChild(top);
+    row.appendChild(el("div", "bar ghost"));
+    return row;
+  }
+
+  function renderAccount(account, order) {
     var card = el("article", "card" + (account.coolingDown ? " cooling" : ""));
     var head = el("div", "head");
     var who = el("div", "who");
@@ -523,7 +568,20 @@ export function dashboardHtml(config: DashboardConfig): string {
       card.appendChild(el("div", "empty", account.hasUsage ? "该账号本轮未报告任何窗口。" : "本轮轮询未取到该账号的用量（未知，不是 0%）。"));
     } else {
       var wins = el("div", "wins");
-      for (var i = 0; i < account.windows.length; i++) wins.appendChild(renderWindow(account.windows[i]));
+      // Walked in the SNAPSHOT's order rather than this account's own, so every card carries one row
+      // per label the pool knows about and the bars line up across a grid row. Nothing is dropped by
+      // doing so: every window's label is in the order list by construction, and two windows sharing
+      // one label would both be rendered rather than silently collapsed into one.
+      for (var k = 0; k < order.length; k++) {
+        var hit = 0;
+        for (var i = 0; i < account.windows.length; i++) {
+          if (account.windows[i].label === order[k]) {
+            wins.appendChild(renderWindow(account.windows[i]));
+            hit++;
+          }
+        }
+        if (hit === 0) wins.appendChild(missingWindow(order[k]));
+      }
       card.appendChild(wins);
     }
     return card;
@@ -538,7 +596,8 @@ export function dashboardHtml(config: DashboardConfig): string {
       rows.appendChild(el("div", "empty", "池内没有 anthropic 账号。"));
       return;
     }
-    for (var i = 0; i < latest.accounts.length; i++) rows.appendChild(renderAccount(latest.accounts[i]));
+    var order = windowOrder(latest.accounts);
+    for (var i = 0; i < latest.accounts.length; i++) rows.appendChild(renderAccount(latest.accounts[i], order));
   }
 
   function load() {
