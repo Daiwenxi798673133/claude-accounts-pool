@@ -115,6 +115,28 @@ Claude 撞到订阅额度上限时会自动切号并续接被打断的那一轮;
 
 **4. 采用之前请先读一遍 [docs/limitations.md](docs/limitations.md)。** 跨机器的计费归属尚未验证、worker 无法在请求层被拦住、同一账号会从多个出口 IP 出现——这些都是已知且明写的限制,不是待修的 bug。
 
+## 提 issue
+
+出了问题请到 <https://github.com/Daiwenxi798673133/claude-accounts-pool/issues> 开一个 issue,**需要两样东西**:
+
+**1. 问题描述** —— 你做了什么、期望看到什么、实际看到什么。有报错或 toast 就把原文抄进去。
+
+**2. 相关日志 zip** —— 在 OpenCode 里执行 `/update-log`,插件会把日志打成一个 zip 并把路径 toast 出来(默认落在 `~/Downloads/`,没有这个目录就落在家目录),把这个文件拖进 issue 即可。
+
+开 issue 时仓库的表单会把这两项列成必填项,照着填即可。
+
+zip 里是三样东西:
+
+- `meta.txt` —— 插件版本、**运行模式**(local / cloud-master / cloud-worker)、OpenCode 版本、操作系统、**终端**、运行时、**日志级别开关**、**已加载的插件清单**、日志目录,以及日志按 `run`(OpenCode 给每个进程的标识)的分布。字段是对着 `opencode debug info` 和 OpenCode 自己的 issue 表单选的——插件清单尤其关键,新旧两个插件是否同装只有这里看得出来。
+- `issue.md` —— 一份填好环境信息的 issue 草稿,复现/期望/实际留空,直接复制粘贴即可。
+- `plugin-<日志文件名>.log` —— OpenCode 日志里属于本插件的行(每个文件最多保留**最后** 20000 行,裁掉的永远是旧的那头;真被裁了 `meta.txt` 会写明"命中 N 行、保留 M 行、已丢弃最早 X 行",不会拿截断过的日志假装完整)。
+
+**脱敏是在写入 zip 之前做的**,不是让你自己事后检查:token / Bearer / JWT / `*_token` 字段一律掩码,账号邮箱只留首字母与域名(`alice@gmail.com` → `a***@gmail.com`)。zip 本身是明文的,上传前仍然建议你解开扫一眼。
+
+三种模式都有这个命令。cloud 模式下 **master 与 worker 各打各的包**:选号与刷新只在 master 的日志里看得见,所以只要问题涉及"为什么给我这个号"、刷新失败或租约,请把 master 那一侧的包也一起带上。
+
+两个例外:模式配置非法时插件**什么都不装**(这个命令也没有),先按 toast 里的提示修好 `tui.json`;想附更详细的 debug 级日志,按 [docs/internals.md](docs/internals.md#日志与排查) 打开开关再复现一次,然后再 `/update-log`。
+
 ## License
 
 MIT

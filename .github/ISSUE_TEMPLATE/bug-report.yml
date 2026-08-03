@@ -1,0 +1,56 @@
+name: 报告缺陷
+description: 插件行为不对、报错、切号或租约异常
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前先在 OpenCode 里执行 **`/update-log`**：它会在 `~/Downloads/` 生成一个日志 zip（token / 邮箱已脱敏），里面还有一份填好环境信息的 `issue.md` 草稿，可以直接拿来填下面两栏。
+
+        请直接描述现象，不要粘贴大段 AI 生成的分析。
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 你做了什么、期望看到什么、实际看到什么。有报错或 toast 请原文照抄。
+      placeholder: |
+        执行 X 后期望 Y，实际 Z。
+        toast 原文：切换失败: ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志 zip
+      description: 把 `/update-log` 生成的 zip 拖到这一栏。没有它基本无法定位问题；确实拿不到就在这里说明原因，并把下面的「环境」栏填满。
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行模式
+      description: zip 里的 `meta.txt` 有这一项
+      options:
+        - local
+        - cloud-master
+        - cloud-worker
+        - 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1.
+        2.
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境（无法附 zip 时才需要手填）
+      description: 插件版本、运行模式、OpenCode 版本、操作系统、终端。`opencode debug info` 能一次打出后三项。
+      placeholder: |
+        插件版本: 0.4.0
+        OpenCode: 1.18.11
+        OS: macOS 26.0.1
+        终端: Ghostty / xterm-256color
