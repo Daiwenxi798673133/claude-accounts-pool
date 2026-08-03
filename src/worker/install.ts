@@ -12,6 +12,7 @@ import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { readActiveId, recordLeasedActiveId, writeAuthAnthropic, readAuthAnthropic } from "../accounts.ts"
 import { installAutoSwitch } from "../autoswitch.ts"
 import { installTokenKeeper } from "../keeper.ts"
+import { logBundleCommand } from "../logbundle.ts"
 import { log } from "../logger.ts"
 import type { ModeConfig } from "../mode.ts"
 import { createLeaseClient } from "./leaseClient.ts"
@@ -189,6 +190,7 @@ export function installCloudWorker(
           })()
         },
       },
+      logBundleCommand(api, "cloud-worker"),
     ])
   } else {
     // Not fatal: /usage is a convenience, and a worker with no command surface still leases and

@@ -12,7 +12,7 @@
 | **`cloud-master`** | 一台中心主机 | 持有**全部**账号的真实 refresh token,是**整个系统里唯一的刷新者**;保活所有 token、按用量挑最空的号、通过 HTTP 把短时效 access token 租借给 worker。**它自己不跑推理** |
 | **`cloud-worker`** | 每个工程师的机器 | **永不持有可用的 refresh token**;向 master 租借 access token 并在过期前续租。撞 **429** 时由 master 换一个账号、自动续接那一轮;租来的 token 撞 **401** 则属于租约失效(master 刷新某个账号会当场作废它在外的 access token),这时 worker 重租**同一个**账号,不冷却也不换号。ChatGPT 仍走本地,不纳入池子 |
 
-命令也是**按模式注册**的:`local` 有 `/usage` 和 `/stats`,`cloud-worker` 只有一个精简版 `/usage`(见下文),而 **`cloud-master` 一个命令都不注册**——它没有 `/usage` 也没有 `/stats`,master 端要看用量请打开 web 看板。
+命令也是**按模式注册**的:`local` 有 `/usage` 和 `/stats`,`cloud-worker` 只有一个精简版 `/usage`(见下文),而 **`cloud-master` 只注册 `/update-log`**——它没有 `/usage` 也没有 `/stats`,master 端要看用量请打开 web 看板。三种模式都有 `/update-log`(把本机日志脱敏打包成 zip,用于提 issue,见 [README 的「提 issue」](../README.md#提-issue)):它只读本机日志、不发放也不读取任何凭据,所以不受"master 不注册账号类命令"那条约束。
 
 master 与 worker 的分工再拆细一层:
 

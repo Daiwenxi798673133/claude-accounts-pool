@@ -28,6 +28,7 @@ import {
   type AuthToken,
   type StoredAccount,
 } from "../accounts.ts"
+import { logBundleCommand } from "../logbundle.ts"
 import { log } from "../logger.ts"
 import type { ModeConfig } from "../mode.ts"
 import { fetchProfile } from "../profile.ts"
@@ -203,6 +204,17 @@ export function installCloudMaster(
     signal: api.lifecycle.signal,
   })
 
+  // THE ONE COMMAND A MASTER REGISTERS, and the exception is narrow on purpose: /update-log mints
+  // nothing and reads nothing but this machine's own log file, so it does not touch the reason a
+  // master has no /usage and no /stats (it runs no inference and holds no single active account).
+  // It has to be here because master-side lease and refresh failures are the ones a worker's log
+  // cannot explain — see docs/internals.md's note that selection is only visible on the master.
+  let unregisterCommand: (() => void) | undefined
+  const command = api.command
+  if (command) unregisterCommand = command.register(() => [logBundleCommand(api, "cloud-master")])
+  // Not fatal, exactly as on a worker: a master with no command surface still serves every lease.
+  else log.warn("master:no-command-api")
+
   let disposed = false
 
   // TWO PATHS TO THE SAME TEARDOWN, deliberately. The per-piece lifecycle registrations below are
@@ -212,6 +224,7 @@ export function installCloudMaster(
   const dispose = (): void => {
     if (disposed) return
     disposed = true
+    unregisterCommand?.()
     usagePoller.dispose()
     keeper.dispose()
     server.stop()
@@ -221,9 +234,10 @@ export function installCloudMaster(
   api.lifecycle.onDispose(keeper.dispose)
   api.lifecycle.onDispose(usagePoller.dispose)
 
-  // A master registers NO commands: it runs no inference, so it has no /usage and no /stats, and
-  // there is no longer a credential for a palette entry to mint. Everything an operator needs is on
-  // the web dashboard this server already serves.
+  // A master registers no ACCOUNT commands: it runs no inference, so it has no /usage and no
+  // /stats, and there is no longer a credential for a palette entry to mint. Everything an operator
+  // needs is on the web dashboard this server already serves — the one palette entry above is
+  // /update-log, which only reads this machine's log file.
   log.info("master:installed", { hostname: cfg.hostname, port: server.port })
   return { dispose }
 }

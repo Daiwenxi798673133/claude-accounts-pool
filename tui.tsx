@@ -7,6 +7,7 @@ import { backfillOpenaiLabel, captureOpenaiSlot, switchToOpenaiAccount } from ".
 import { backfillClaudePlans } from "./src/plan-backfill.ts"
 import { installAutoSwitch } from "./src/autoswitch.ts"
 import { installTokenKeeper } from "./src/keeper.ts"
+import { logBundleCommand } from "./src/logbundle.ts"
 import { initLogger, log } from "./src/logger.ts"
 import { openUsageDialog, type UsageState } from "./src/dialogs.tsx"
 import { aggregate, loadRows, type RawRow, type TimeRange } from "./src/stats.ts"
@@ -221,6 +222,7 @@ const tui: TuiPlugin = async (api, options) => {
         await reloadStats("all")
       },
     },
+    logBundleCommand(api, "local"),
   ])
 }
 

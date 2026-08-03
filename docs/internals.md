@@ -46,7 +46,16 @@ grep "claude-accounts-usage" ~/.local/share/opencode/log/opencode.log
 
 cloud 模式下 master 与 worker 各写各的日志,而且**只有 master 那一侧看得到选号与刷新**:worker 的日志里只有租约与撞限,查"为什么给我这个号"要去 master 上 grep。master 侧的每条租约日志都带一个 `workerId`,那是 worker 自己声明的标签(见 [cloud-mode.md](cloud-mode.md#workerid-只是一个日志标签)),用来把日志行归到机器上。
 
-提 issue 时:把相关日志行 grep 出来,贴到 <https://github.com/Daiwenxi798673133/claude-accounts-pool/issues>,并附上复现步骤。日志已对 token 做脱敏处理,但仍建议你粘贴前自查一遍,确认没有夹带敏感信息。
+**提 issue 不用手工 grep**:在 OpenCode 里执行 `/update-log`,插件会把上面那些行抽出来、脱敏、连同一份环境摘要和一份预填的 issue 草稿打成一个 zip,路径会 toast 出来(默认 `~/Downloads/`)。三种模式都注册了这个命令——`cloud-master` 只注册它一个,因为 master 不跑推理,没有 `/usage` 也没有 `/stats`。打包内容与该附什么见 [README 的「提 issue」](../README.md#提-issue)。
+
+脱敏发生在写入 zip 之前:token / Bearer / JWT / `*_token` 字段掩码,邮箱只留首字母与域名。**这层脱敏不是重复劳动**——OpenCode 自己的 logger(`packages/core/src/observability/logging.ts`)对写进 `opencode.log` 的内容不做任何 redact,仓库里那份 redaction 只服务于 http-recorder 的测试夹具。
+
+实现在 [`src/logbundle.ts`](../src/logbundle.ts),两个容易踩的点都在那里注释了:
+
+- **抽行的唯一依据是 `message="claude-accounts-usage ` 这个前缀**,而不是裸的服务名:仓库旧名会作为**目录名**出现在别人的日志行里(`cwd=/.../claude-accounts-usage`),按裸名 grep 会把那些无关行一起抽进来(本机实测 10547 行里只有 4274 行真的是插件的)。
+- **日志目录只认 `XDG_DATA_HOME`**。OpenCode 通过 `xdg-basedir` 解析数据目录,只有 config 那一条有 env 覆盖(`OPENCODE_CONFIG_DIR`);`OPENCODE_DATA_DIR` 只存在于一个**未合并**的 PR(anomalyco/opencode#8963)里,实测 `OPENCODE_DATA_DIR=/tmp/x opencode debug paths` 仍然报 `~/.local/share`。注意 [`src/stats.ts`](../src/stats.ts) 里仍留着这个来自上游 fork 的死变量。查日志到底在哪,最可靠的是 `opencode debug paths`。
+
+OpenCode 当前只写**一个** `opencode.log` 且**不轮转**(官方 troubleshooting 文档里"带时间戳、保留最近 10 个"的说法已经过时,那描述的是 Desktop 版的独立 logger),所有进程都往同一个文件里 append,靠每行的 `run=` 八位标识区分历次启动——所以 zip 的 `meta.txt` 会把行数按 `run` 分组列出来并标出最近一次。
 
 ## 开发
 
