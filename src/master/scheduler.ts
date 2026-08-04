@@ -245,17 +245,21 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     const byId = new Map<string, UsageResponse>()
     for (const entry of entries) byId.set(entry.id, entry.usage)
     usageCache = { at: now(), byId }
-    // The ONLY path that can resolve a deadline-less cooldown, so an INV-M2 exclusion is never
-    // permanent: a fresh snapshot either supplies the real reset (upgrade to a timed cooldown, and
-    // automatic recovery becomes possible again) or shows the account is no longer at the limit
-    // (drop it). An account MISSING from the snapshot taught us nothing and keeps cooling —
-    // absence of data is not evidence of recovery.
-    for (const id of [...cooldownPending]) {
-      const usage = byId.get(id)
-      if (!usage) continue
+    // A MAXED window IS cooldown evidence, not merely the thing that resolves a worker's report:
+    // quota gets spent by paths that never report to this master (an account used outside the pool,
+    // a worker that hit the wall and died), and an account sitting at 100% with no cooldown is still
+    // servable — pickPreferred refuses only cooling and needs-reauth, so an operator naming it gets a
+    // token whose very next request 429s, and pickAccount hands it out as soon as the rest cool.
+    //
+    // Also the ONLY path that can resolve a deadline-less cooldown, so an INV-M2 exclusion is never
+    // permanent. But ONLY a PENDING one is dropped when no window is maxed: a timed cooldown came
+    // with an authoritative deadline and owns a recovery timer, and over-cooling merely delays an
+    // account rejoining selection while under-cooling costs a second burn. An account MISSING from
+    // the snapshot taught us nothing and keeps cooling — absence of data is not evidence of recovery.
+    for (const [id, usage] of byId) {
       const resetsAt = latestMaxedReset(PROVIDERS.anthropic.normalize(usage), now())
       if (resetsAt !== undefined) markCooldown(id, resetsAt)
-      else clearCooldown(id)
+      else if (cooldownPending.has(id)) clearCooldown(id)
     }
   }
 

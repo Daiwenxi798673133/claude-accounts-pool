@@ -206,6 +206,38 @@ test("reportRateLimit starts cooldown and recovery restores availability", async
   expect(scheduler.isCoolingDown("d")).toBe(true)
 })
 
+test("a maxed snapshot cools an account nobody ever reported", () => {
+  const { kv, snapshot } = makeKv()
+  const clock = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => clock })
+  const accounts = [account("spent"), account("idle")]
+  const resetsAt = clock + 40 * 60_000
+
+  // Given NO reportRateLimit for `spent` — its quota was burned by something this master never saw
+  // (used outside the pool, or by a worker that died before it could report).
+  scheduler.setUsageCache([
+    { id: "spent", usage: usage(100, new Date(resetsAt).toISOString()) },
+    { id: "idle", usage: usage(20) },
+  ])
+
+  // Then the snapshot alone is enough: the dashboard's badge, selection and the named-pick refusal
+  // all read this one flag, so all three stop lying about an account that cannot serve a request.
+  expect(scheduler.isCoolingDown("spent")).toBe(true)
+  expect(snapshot()).toEqual({ spent: resetsAt })
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("idle")
+  expect(scheduler.pickPreferred({ accounts, prefix: "spent" })).toEqual({ ok: false, refusal: "cooling" })
+
+  // A TIMED cooldown is not dropped by a later snapshot that is merely no longer maxed — the
+  // deadline is authoritative and recovery is the timer's job. Only pending ones are resolved here.
+  scheduler.setUsageCache([{ id: "spent", usage: usage(30) }])
+  expect(scheduler.isCoolingDown("spent")).toBe(true)
+
+  // A maxed window whose reset already passed is not a cooldown: latestMaxedReset drops it, and
+  // fabricating a deadline for `fresh` would exclude it on nothing.
+  scheduler.setUsageCache([{ id: "fresh", usage: usage(100, new Date(clock - 1).toISOString()) }])
+  expect(scheduler.isCoolingDown("fresh")).toBe(false)
+})
+
 test("getUsageSnapshot reports the poller's data with the scheduler's own staleness verdict", () => {
   const { kv } = makeKv()
   let clock = 1_000_000
