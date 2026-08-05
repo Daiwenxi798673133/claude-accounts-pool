@@ -23,6 +23,7 @@ function snapshot(entries: Array<[string, UsageResponse]>, extra?: Partial<Usage
 }
 
 const never = (): boolean => false
+const unheld = (): string[] => []
 
 test("joins roster, snapshot and cooldown into one anthropic-only view", () => {
   const view = buildUsageView({
@@ -49,6 +50,7 @@ test("joins roster, snapshot and cooldown into one anthropic-only view", () => {
       ["cccccccc-9999-9999-9999-999999999999", { five_hour: { utilization: 3 } }],
     ]),
     isCoolingDown: never,
+    holdersOf: unheld,
   })
 
   expect(view.at).toBe(1_700_000_000_000)
@@ -86,6 +88,7 @@ test("a null resets_at from the API is omitted, not forwarded as null", () => {
     accounts: [account("zero")],
     snapshot: snapshot([["zero", withNull]]),
     isCoolingDown: never,
+    holdersOf: unheld,
   })
 
   // The KEY IS ABSENT, not present-and-null. UsageWindowView promises "absent or a string", so a
@@ -103,6 +106,7 @@ test("an account missing from the snapshot is unknown, never zero", () => {
     accounts,
     snapshot: snapshot([["kept", { five_hour: { utilization: 50 } }]]),
     isCoolingDown: never,
+    holdersOf: unheld,
   })
 
   // The poller OMITS accounts whose usage fetch failed (a 429 on /api/oauth/usage lasts minutes), so
@@ -129,6 +133,7 @@ test("cooldown, reauth and excluded flags come through, and a token never does",
     // can be cooling on a deadline-less rate-limit report while its last snapshot still reads 3%.
     snapshot: snapshot([["cool", { five_hour: { utilization: 3 } }]], { stale: true }),
     isCoolingDown: (accountId) => accountId === "cool",
+    holdersOf: unheld,
   })
 
   expect(view.stale).toBe(true)

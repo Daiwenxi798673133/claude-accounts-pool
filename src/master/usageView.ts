@@ -21,6 +21,7 @@ export type UsageViewInput = {
   accounts: StoredAccount[]
   snapshot: UsageSnapshot
   isCoolingDown: (accountId: string) => boolean
+  holdersOf: (accountId: string) => string[]
 }
 
 // `typeof === "string"`, NOT `!== undefined`. MEASURED against the live endpoint: a window sitting at
@@ -53,6 +54,9 @@ export function buildUsageView(input: UsageViewInput): UsageSnapshotView {
       coolingDown: input.isCoolingDown(account.id),
       excluded: account.excluded === true,
       needsReauth: account.needsReauth === true,
+      // ALWAYS present, empty when nobody holds it: the page has to tell "no worker is on this account"
+      // apart from "this master cannot say", and only an omitted field may mean the latter.
+      holders: input.holdersOf(account.id),
       ...(account.expires === undefined ? {} : { expiresAt: account.expires }),
     })
   }

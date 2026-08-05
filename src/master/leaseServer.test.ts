@@ -37,7 +37,7 @@ type Harness = {
   abort: () => void
   reports: Array<{ accountId: string; resetsAt?: number }>
   refreshed: string[]
-  picks: Array<{ ids: string[]; exclude?: string }>
+  picks: Array<{ ids: string[]; exclude?: string; workerId?: string }>
   // One entry per NAMED pick. Kept apart from `picks` because the whole claim of the preference path
   // is that ranked selection is not consulted at all, and one shared log could not show that.
   preferred: Array<{ ids: string[]; prefix: string }>
@@ -53,6 +53,9 @@ type Harness = {
   // still emptied a slot would be invisible from the status code alone.
   deleted: string[]
   roster: () => string[]
+  // Who the master believes holds what, right now. A snapshot copy rather than the live map, so a
+  // case cannot assert against a book that has moved on since it looked.
+  book: () => Array<[string, string]>
 }
 
 function startHarness(options?: {
@@ -85,6 +88,7 @@ function startHarness(options?: {
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
   const preferred: Harness["preferred"] = []
+  const leases = new Map<string, { accountId: string; expiresAt: number }>()
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
 
@@ -136,10 +140,20 @@ function startHarness(options?: {
 
   const server = startLeaseServer({
     scheduler: {
-      pickAccount({ accounts: pool, exclude }) {
-        picks.push({ ids: pool.map((a) => a.id), ...(exclude === undefined ? {} : { exclude }) })
+      pickAccount({ accounts: pool, exclude, workerId }) {
+        picks.push({
+          ids: pool.map((a) => a.id),
+          ...(exclude === undefined ? {} : { exclude }),
+          ...(workerId === undefined ? {} : { workerId }),
+        })
         return pool.find((a) => a.id !== exclude && !cooled.has(a.id))
       },
+      // A REAL book, not a spy list: these cases assert that a refused lease books nothing, which a
+      // recorder that only appends could not distinguish from one that books and never releases.
+      recordLease({ workerId, accountId, expiresAt }) {
+        leases.set(workerId, { accountId, expiresAt })
+      },
+      holdersOf: (accountId) => [...leases].filter(([, hold]) => hold.accountId === accountId).map(([workerId]) => workerId),
       // Mirrors the real scheduler's verdicts (scheduler.test.ts owns proving those), reading the SAME
       // `cooled` set as the pick filter and isCoolingDown so a row shown as 冷却中, an account skipped
       // by selection, and a refused switch can never disagree in this harness. `excluded` is
@@ -203,6 +217,7 @@ function startHarness(options?: {
     exchanged,
     deleted,
     roster: () => accounts.map((entry) => entry.id),
+    book: () => [...leases].map(([workerId, hold]) => [workerId, hold.accountId]),
   }
 }
 
@@ -232,8 +247,10 @@ test("lease is served to a caller that presents no credential at all", async () 
     // without also deciding how a worker would ever get past it.
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ accountId: "acct-a", access: "sk-ant-oat01-acct-a", expiresAt: EXPIRES_AT })
-    expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"] }])
+    expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"], workerId: WORKER_ID }])
     expect(harness.refreshed).toEqual(["acct-a"])
+    // And: the served lease is BOOKED, which is what lets the next pick steer away from acct-a.
+    expect(harness.book()).toEqual([[WORKER_ID, "acct-a"]])
 
     // And: the same caller gets 200 on health, which may not leak in exchange — it is a readiness
     // probe a worker calls BEFORE it trusts a master URL (and an ops liveness check calls forever),
@@ -396,10 +413,12 @@ test("lease returns 200 with accountId access expiresAt", async () => {
     // already holds. acct-b exists precisely so this is a distinguishing fixture: an
     // implementation that excluded `currentAccountId` regardless of reason would answer acct-b
     // here and rotate the pool on every routine renewal.
-    expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"] }])
+    expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"], workerId: "worker-impersonated" }])
 
-    // The workerId changed nothing about WHICH account was served: it is a self-declared label
-    // that reaches the log file and nothing else, so selection must never come to depend on it.
+    // The workerId DOES reach selection now — but only so the holder count can discount this worker's
+    // own outstanding lease. It can never make an account more attractive, only stop the requester
+    // from counting as its own competition, so a forged label buys the caller nothing here: with an
+    // empty book every candidate has zero holders either way and the answer is the ranked one.
     expect(lease.accountId).toBe("acct-a")
   } finally {
     harness.stop()
@@ -587,7 +606,10 @@ test("ratelimit report cools the account and next lease picks another", async ()
     )
     expect(second.status).toBe(200)
     expect(((await second.json()) as LeaseResponse).accountId).toBe("acct-b")
-    expect(harness.picks[1]).toEqual({ ids: ["acct-a", "acct-b"], exclude: "acct-a" })
+    expect(harness.picks[1]).toEqual({ ids: ["acct-a", "acct-b"], exclude: "acct-a", workerId: WORKER_ID })
+    // And: the book MOVED rather than grew — one worker, one account, so the spent acct-a is released
+    // by the very write that takes acct-b. Nothing on the wire says "release".
+    expect(harness.book()).toEqual([[WORKER_ID, "acct-b"]])
     expect(harness.refreshed).toEqual(["acct-a", "acct-b"])
   } finally {
     harness.stop()
@@ -711,6 +733,10 @@ test("usage returns the whole pool with no token in it", async () => {
       coolingDown: false,
       excluded: false,
       needsReauth: false,
+      // EMPTY, not absent: nobody has leased this account, which is a different fact from a master
+      // that cannot say who holds it. The page renders no badge for the former and none for the
+      // latter either, but selection ranks by the former and must not by the latter.
+      holders: [],
     })
 
     // And the served rows carry the real windows, including each one's reset instant.

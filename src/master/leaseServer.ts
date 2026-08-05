@@ -46,7 +46,11 @@ import { buildUsageView } from "./usageView.ts"
 
 export type LeaseServerDeps = {
   scheduler: {
-    pickAccount(input: { accounts: StoredAccount[]; exclude?: string }): StoredAccount | undefined
+    pickAccount(input: { accounts: StoredAccount[]; exclude?: string; workerId?: string }): StoredAccount | undefined
+    // Booked only by serveLease, only after a token was actually minted. Both lease paths share that
+    // tail, which is what keeps the named-account route from silently escaping the book.
+    recordLease(input: { workerId: string; accountId: string; expiresAt: number }): void
+    holdersOf(accountId: string): string[]
     // Selection for a lease that NAMES its account, kept a separate verb from pickAccount so the
     // ranked path cannot accidentally inherit "excluded is servable" and vice versa.
     pickPreferred(input: PreferredInput): PreferredPick
@@ -289,7 +293,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // the routine renewal path with nothing to avoid — handing back the same account is the
     // expected answer there, and excluding it would rotate the pool for no reason.
     const exclude = request.reason === "ratelimit" ? request.currentAccountId : undefined
-    const account = deps.scheduler.pickAccount({ accounts, exclude })
+    const account = deps.scheduler.pickAccount({ accounts, exclude, workerId })
     if (!account) {
       // 503, kept DISTINCT from the 401 above: both refuse, but the worker acts on them
       // differently. A 401 says "this key will never work, stop"; a 503 says "the pool is
@@ -341,6 +345,10 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       log.warn("master:lease-horizon-spent", { workerId, accountId: account.id, expiresAt })
       return json(503, { error: "no account available" })
     }
+    // Booked AFTER every refusal above, so the book only ever holds leases the worker was really given
+    // — a pick whose mint failed, or whose horizon was already spent, leaves the worker on whatever it
+    // had, and recording it would have the pool steer around a hold that does not exist.
+    deps.scheduler.recordLease({ workerId, accountId: account.id, expiresAt })
     // PRIVACY: `fresh.access` is a live credential and must NEVER reach the log file; the account
     // id and the expiry carry the entire diagnostic value anyway.
     log.info("master:lease-served", { workerId, accountId: account.id, expiresAt })
@@ -382,6 +390,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       // Wrapped rather than passed by reference: the scheduler is an injected object here, and a
       // detached method would break on any implementation that is not closure-based.
       isCoolingDown: (accountId) => deps.scheduler.isCoolingDown(accountId),
+      holdersOf: (accountId) => deps.scheduler.holdersOf(accountId),
     })
   }
 

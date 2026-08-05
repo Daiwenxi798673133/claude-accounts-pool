@@ -127,6 +127,25 @@ export function dashboardHtml(config: DashboardConfig): string {
   .badge.cool { color: var(--accent); }
   .badge.reauth { color: var(--accent-soft); }
   .badge.muted { color: var(--text-3); }
+  /* One per worker holding this account, so the row answers "who" and "how many" with the same marks
+     and the operator never has to reconcile a count against a list. FILLED where the other three
+     badges are outlined, because holding a lease is a normal operating state rather than a fault and
+     must not borrow a fault's hue; mono because a workerId is a configured string an operator matches
+     character-for-character against that machine's tui.json. No new colour enters the palette. */
+  .badge.busy { font-family: var(--mono); color: var(--text-2); background: var(--chip-bg);
+                border-color: transparent; }
+  /* ITS OWN ROW, NOT part of .who, and a FIXED height present on every card whether or not anyone
+     holds the account — the same reason .bar.ghost exists further down. Holder count is the one thing
+     on this page that varies per account without bound, so leaving these badges to wrap inside .who
+     grew that block from one line to three and broke the equal card heights the placeholder rows were
+     added to guarantee.
+     nowrap + overflow-x is what pins it to exactly one line: an account with more holders than fit
+     scrolls instead of growing, and an account with more holders than fit is itself the anomaly this
+     row exists to surface. The scrollbar is hidden because it would be taller than the row it sits in. */
+  .crew { display: flex; align-items: center; gap: 6px; height: 23px; flex-wrap: nowrap;
+          overflow-x: auto; scrollbar-width: none; }
+  .crew::-webkit-scrollbar { display: none; }
+  .crew .badge { flex: 0 0 auto; }
   .token { font-size: 14px; color: var(--text-2); }
 
   .wins { display: flex; flex-direction: column; gap: 14px; }
@@ -563,6 +582,18 @@ export function dashboardHtml(config: DashboardConfig): string {
     if (!account.hasUsage) who.appendChild(el("span", "badge muted", "本轮无数据"));
     head.appendChild(who);
     head.appendChild(el("span", "token", account.expiresAt ? "access token " + fmtLeft(account.expiresAt - Date.now()) : "access token 到期时间未知"));
+    // ONE BADGE PER HOLDER, naming the worker rather than counting them: a count is a number the
+    // operator then has to go and resolve into machines, and the names are what they were going to
+    // ask for next anyway.
+    //
+    // The row is appended UNCONDITIONALLY so its fixed height applies to every card. A master that
+    // predates holder tracking sends no holders field at all, which is NOT the same fact as "nobody
+    // holds this" — but both render as an empty row here, because the alternative is a page that
+    // states a holder count the master never computed while selection is not ranking by one either.
+    var crew = el("div", "crew");
+    var holders = account.holders || [];
+    for (var h = 0; h < holders.length; h++) crew.appendChild(el("span", "badge busy", holders[h]));
+    head.appendChild(crew);
     card.appendChild(head);
     if (account.windows.length === 0) {
       card.appendChild(el("div", "empty", account.hasUsage ? "该账号本轮未报告任何窗口。" : "本轮轮询未取到该账号的用量（未知，不是 0%）。"));
