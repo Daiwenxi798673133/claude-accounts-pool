@@ -51,6 +51,7 @@ test("joins roster, snapshot and cooldown into one anthropic-only view", () => {
     ]),
     isCoolingDown: never,
     holdersOf: unheld,
+    pinnersOf: unheld,
   })
 
   expect(view.at).toBe(1_700_000_000_000)
@@ -89,6 +90,7 @@ test("a null resets_at from the API is omitted, not forwarded as null", () => {
     snapshot: snapshot([["zero", withNull]]),
     isCoolingDown: never,
     holdersOf: unheld,
+    pinnersOf: unheld,
   })
 
   // The KEY IS ABSENT, not present-and-null. UsageWindowView promises "absent or a string", so a
@@ -107,6 +109,7 @@ test("an account missing from the snapshot is unknown, never zero", () => {
     snapshot: snapshot([["kept", { five_hour: { utilization: 50 } }]]),
     isCoolingDown: never,
     holdersOf: unheld,
+    pinnersOf: unheld,
   })
 
   // The poller OMITS accounts whose usage fetch failed (a 429 on /api/oauth/usage lasts minutes), so
@@ -134,6 +137,7 @@ test("cooldown, reauth and excluded flags come through, and a token never does",
     snapshot: snapshot([["cool", { five_hour: { utilization: 3 } }]], { stale: true }),
     isCoolingDown: (accountId) => accountId === "cool",
     holdersOf: unheld,
+    pinnersOf: unheld,
   })
 
   expect(view.stale).toBe(true)

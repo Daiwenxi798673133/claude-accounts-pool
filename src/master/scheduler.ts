@@ -15,10 +15,17 @@ import type { UsageResponse } from "../usage.ts"
 // PURE helpers (scoreWindows / latestMaxedReset / PROVIDERS.anthropic.normalize) really are
 // imported, so scoring and reset resolution keep exactly one implementation.
 //
-// DELIBERATELY NO STICKINESS. There is no worker→account affinity anywhere in this file: the owner
-// chose maximum throughput (usage-based rotation) over prompt-cache locality. Do not add one.
+// DELIBERATELY NO STICKINESS BY DEFAULT. There is no worker→account affinity this file invents: the
+// owner chose maximum throughput (usage-based rotation) over prompt-cache locality. Do not add one.
 // pickPreferred is NOT an exception to that: it answers ONE request naming ONE account and remembers
 // nothing about who asked, so the very next renewal ranks by usage like every other pick.
+//
+// THE PIN IS THE ONE SANCTIONED EXCEPTION, and it is recorded rather than invented — an amendment to
+// the paragraph above, made deliberately by the pool owner. The stickiness lives entirely on the
+// WORKER: it re-names its account through pickPreferred on every renewal, and nothing here pulls a
+// worker back to anything. What this file gained is the FLAG on the lease book, used for exactly two
+// read-only purposes — telling the dashboard which holders will not move, and steering a pick for a
+// DIFFERENT worker around the reservation. Neither is affinity; do not let them grow into it.
 //
 // The lease book below is NOT the affinity that paragraph forbids — it is its OPPOSITE. It remembers
 // who holds what in order to push the next lease AWAY from an account already in use, so two workers
@@ -89,8 +96,11 @@ export type Scheduler = {
   // Called once per lease actually SERVED, never on one merely picked: a pick that then fails to mint
   // a token leaves the worker holding whatever it had, and booking that account would make the pool
   // steer around a hold nobody has.
-  recordLease: (input: { workerId: string; accountId: string; expiresAt: number }) => void
+  recordLease: (input: { workerId: string; accountId: string; expiresAt: number; pinned: boolean }) => void
   holdersOf: (accountId: string) => string[]
+  // The subset of holdersOf that PINNED this account. A subset by construction — the flag lives on the
+  // lease record — which is the invariant both renderers of UsageAccountView.pinnedBy rely on.
+  pinnersOf: (accountId: string) => string[]
 }
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
@@ -113,7 +123,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // expiry. Restoring the book would make the pool steer around holds it can no longer observe; an
   // empty one merely under-counts for at most one renewal cycle, after which every live worker has
   // re-registered itself by asking.
-  const leases = new Map<string, { accountId: string; expiresAt: number }>()
+  const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean }>()
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   // Rotation cursor for the no-usage-data path. An id, not an index, so it stays meaningful when
   // the caller's account list changes shape between picks.
@@ -182,17 +192,21 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // consulted nowhere else, and dropping the lapsed entry here keeps it from growing without bound
   // over a master that runs for weeks. An expired lease is not a hold — that token is already dead by
   // INV-CLOUD-4, and whoever held it will book its replacement by asking.
-  function activeHolders(accountId: string, at: number, ignoreWorkerId?: string): string[] {
-    const holders: string[] = []
+  function activeLeases(accountId: string, at: number, ignoreWorkerId?: string): { workerId: string; pinned: boolean }[] {
+    const held: { workerId: string; pinned: boolean }[] = []
     for (const [workerId, hold] of leases) {
       if (hold.expiresAt <= at) {
         leases.delete(workerId)
         continue
       }
       if (hold.accountId !== accountId || workerId === ignoreWorkerId) continue
-      holders.push(workerId)
+      held.push({ workerId, pinned: hold.pinned })
     }
-    return holders
+    return held
+  }
+
+  function activeHolders(accountId: string, at: number, ignoreWorkerId?: string): string[] {
+    return activeLeases(accountId, at, ignoreWorkerId).map((hold) => hold.workerId)
   }
 
   // Fewest CURRENT holders wins outright, ranked ABOVE utilization rather than blended with it. So an
@@ -211,6 +225,22 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       if (count < fewest) fewest = count
     }
     return candidates.filter((account) => counts.get(account.id) === fewest)
+  }
+
+  // Steers a pick AWAY from an account somebody else has pinned, but only within the tier
+  // fewestHolders already chose — deliberately WEAKER than holder count, and that ordering is the
+  // whole correctness of it. A pinner IS a holder, so fewestHolders already demotes a pinned account
+  // by one; ranking pin-avoidance ABOVE it would send this worker to a 3-holder account at 95% in
+  // order to avoid an unshared one at 5%, which costs the pool far more than the reservation it was
+  // protecting. Here it decides TIES only: two accounts held by one worker each, one of them pinned,
+  // now resolve to the one whose holder is still free to rotate off.
+  //
+  // A PREFERENCE, NEVER A RESERVATION: if every candidate is pinned the whole list survives, because
+  // a pool that refuses to serve its own accounts is worse for everyone than a shared window. Nothing
+  // here can make a pin deny capacity.
+  function unpinnedFirst(candidates: StoredAccount[], at: number, workerId?: string): StoredAccount[] {
+    const free = candidates.filter((account) => activeLeases(account.id, at, workerId).every((hold) => !hold.pinned))
+    return free.length > 0 ? free : candidates
   }
 
   // Pinned to the anthropic normalizer, matching the anthropic-only pool in pickAccount. `undefined`
@@ -271,7 +301,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     // narrowing before rankByUsage rather than after is what makes it hold even with no usage data at
     // all: holder count is always known, so the round-robin fallback rotates within the least-held
     // tier instead of across the whole pool.
-    const leastHeld = fewestHolders(candidates, at, input.workerId)
+    const leastHeld = unpinnedFirst(fewestHolders(candidates, at, input.workerId), at, input.workerId)
     const picked = rankByUsage(leastHeld, at) ?? roundRobin(pool, leastHeld, input.exclude)
     lastPickedId = picked.id
     return picked
@@ -357,7 +387,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     setUsageCache,
     isCoolingDown,
     getUsageSnapshot,
-    recordLease: (input) => void leases.set(input.workerId, { accountId: input.accountId, expiresAt: input.expiresAt }),
+    recordLease: (input) =>
+      void leases.set(input.workerId, { accountId: input.accountId, expiresAt: input.expiresAt, pinned: input.pinned }),
     holdersOf: (accountId: string) => activeHolders(accountId, now()),
+    pinnersOf: (accountId: string) =>
+      activeLeases(accountId, now())
+        .filter((hold) => hold.pinned)
+        .map((hold) => hold.workerId),
   }
 }

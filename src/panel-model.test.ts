@@ -4,6 +4,7 @@ import type { OpenaiUsage } from "./openai-usage.ts"
 import {
   clampSelection,
   heldStateFor,
+  pinnedStateFor,
   initialPageSelection,
   initialWorkerSelection,
   moveSelection,
@@ -263,6 +264,16 @@ test("U23:持有判定三态 —— 不知道保持 undefined,前缀命中为 tr
   expect(heldStateFor("3f9c1a20", undefined)).toBeUndefined()
   expect(heldStateFor("3f9c1a20", HELD)).toBe(true)
   expect(heldStateFor("0f1e2d3c", HELD)).toBe(false)
+})
+
+// 和 heldStateFor 相反:pin 只有两态。pin 只存在于本机的 kv 里,读它永远读得出结论,
+// 所以这里没有"还不知道"这一档 —— 补一档就等于凭空造出一个 UI 画不出来的状态。
+// 存的是前缀还是完整 id 都能命中(worker 存前缀,面板拿到的行也是前缀),这一条把两种都钉住。
+test("U23b:钉住判定只有两态 —— 未钉住为 false,前缀命中为 true", () => {
+  expect(pinnedStateFor("3f9c1a20", undefined)).toBe(false)
+  expect(pinnedStateFor("3f9c1a20", HELD)).toBe(true)
+  expect(pinnedStateFor("3f9c1a20", "3f9c1a20")).toBe(true)
+  expect(pinnedStateFor("0f1e2d3c", HELD)).toBe(false)
 })
 
 // issue #29:箭头恒停在第一行。初始选中必须由 ● 那一行(持有行)决定,和标记同一条判定。

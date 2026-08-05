@@ -18,6 +18,7 @@ import type { ModeConfig } from "../mode.ts"
 import { createLeaseClient } from "./leaseClient.ts"
 import { installLeaseKeeper } from "./leaseKeeper.ts"
 import { createManualSwitch } from "./manualSwitch.ts"
+import { createPinnedLease, type PinStore } from "./pin.ts"
 import { createSwitchStrategy } from "./switchStrategy.ts"
 import { createUsageClient, type UsageFetchFailure } from "./usageClient.ts"
 import { openWorkerUsageDialog } from "../dialogs.tsx"
@@ -27,6 +28,11 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 // Command-value namespace, matching master/install.ts's local `ID`. Restated rather than imported
 // from tui.tsx: importing the plugin ENTRY from a composition root would depend on its own caller.
 const ID = "claude-accounts-usage"
+
+// The pinned account's id prefix, in OpenCode's own KV — the same store autoswitch keeps its cooldown
+// book in, chosen for the same reason: it is the one place this plugin can write per-machine state that
+// outlives the process without inventing a file and a lock for it.
+const PIN_KV_KEY = "claude-accounts-usage.worker.pin"
 
 // A switch rather than accounts.ts's Record table, for ONE reason: `throttled` carries a number, and
 // a table of static strings has nowhere to put it. Exhaustiveness survives the change — the declared
@@ -85,10 +91,26 @@ export function installCloudWorker(
     workerId: cfg.workerId,
   })
 
+  // Read through a shape check, not trusted: the value came back from an untyped JSON store, and a
+  // non-string there would be sent to the master as a `preferredAccountIdPrefix` and 400 every renewal.
+  const pin: PinStore = {
+    get: () => {
+      const stored = api.kv.get<unknown>(PIN_KV_KEY, undefined)
+      return typeof stored === "string" && stored.length > 0 ? stored : undefined
+    },
+    // The empty string is the CLEARED form rather than a `delete`, because TuiKV has no remove verb.
+    // `get` above reads it back as undefined, so the two agree on what "no pin" looks like.
+    set: (idPrefix) => api.kv.set(PIN_KV_KEY, idPrefix ?? ""),
+  }
+
+  // The lease verb every AUTOMATIC path uses. Built once and shared, so the pin is given up in exactly
+  // one place no matter which path hit the refusal (see pin.ts).
+  const pinnedLease = createPinnedLease({ client, pin, toast: api.ui.toast })
+
   // Rate-limit recovery: this worker DETECTS the limit and RESUMES the turn, the master DECIDES
   // which account comes next. Handing installAutoSwitch a strategy is what swaps its local
   // pick-and-switch for that split (INV-CLOUD-2) — the local selection code is never reached.
-  const strategy = createSwitchStrategy({ client, writeLease, toast: api.ui.toast })
+  const strategy = createSwitchStrategy({ client, pinnedLease, pin, writeLease, toast: api.ui.toast })
 
   const autoSwitch = installAutoSwitch(api, strategy)
   api.lifecycle.onDispose(autoSwitch.dispose)
@@ -101,7 +123,9 @@ export function installCloudWorker(
   api.lifecycle.onDispose(keeper.dispose)
 
   const leaseKeeper = installLeaseKeeper({
-    client,
+    // The PIN-AWARE verb, not the raw client: this is the loop that would otherwise let the master
+    // rotate a pinned worker away every renewal cycle.
+    client: { lease: pinnedLease },
     readAuth: readAuthAnthropic,
     writeLease,
     toast: api.ui.toast,
@@ -169,6 +193,9 @@ export function installCloudWorker(
               // of a process used to have nothing to mark. The in-memory value is the fallback for
               // the one case the record cannot cover: a lease whose bookkeeping write failed.
               heldAccountId: (await readActiveId()) ?? leaseKeeper.heldAccountId(),
+              // A PREFIX where heldAccountId is a full id. Both are matched against a row the same
+              // way (startsWith), so the panel needs no new rule for it.
+              pinnedAccountId: pin.get(),
               // The SAME label this worker sends on every lease, so the name the master reports back
               // in `holders` is byte-identical to the one the panel highlights as this machine.
               workerId: cfg.workerId,
@@ -178,6 +205,28 @@ export function installCloudWorker(
                   // The renewal loop performed no lease, so it would otherwise keep naming the account
                   // we just left as the one we hold — and that id is the master's rotation anchor.
                   if (switched.ok) leaseKeeper.adoptAccount(switched.accountId)
+                })()
+              },
+              // `p`. The SAME lease `enter` performs, plus the flag, plus the local record that makes
+              // every FUTURE renewal name this account.
+              //
+              // THE LOCAL WRITE COMES FIRST, and the order is the point twice over. A renewal that
+              // fires while this request is in flight must already see the new intent — otherwise it
+              // asks for a ranked pick and rotates the operator off the row they just pinned. And on an
+              // un-pin, clearing first is what makes the local state correct even if the master never
+              // answers (manualSwitch's failure sentence says exactly that).
+              onPin: ({ prefix, label, pin: wanted }) => {
+                void (async () => {
+                  pin.set(wanted ? prefix : undefined)
+                  const switched = await manualSwitch.switchTo({ prefix, label, pin: wanted })
+                  if (switched.ok) {
+                    leaseKeeper.adoptAccount(switched.accountId)
+                    return
+                  }
+                  // A pin the master would not serve must not survive as a standing instruction: every
+                  // renewal from here would name it, be refused, and fall back — one wasted round trip
+                  // per cycle for an account the operator has already been told is unavailable.
+                  if (wanted) pin.set(undefined)
                 })()
               },
               // The wording still belongs here, with every other string this transport can produce —

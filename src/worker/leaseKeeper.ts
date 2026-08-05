@@ -26,6 +26,11 @@ import type { LeaseFailure, LeaseOutcome } from "./leaseClient.ts"
 export type LeaseKeeperDeps = {
   // Structural, not the concrete client: this loop needs exactly one verb, and narrowing the
   // dependency to it is what lets every test drive the loop without a transport at all.
+  //
+  // IN PRODUCTION THIS IS createPinnedLease, NOT the raw transport, which is how a pinned worker keeps
+  // naming its account here without this loop knowing pins exist. That wrapper also owns the fallback
+  // for a pin the master refuses — see pin.ts on why a loop that cannot give a pin up is a bricked
+  // worker.
   client: { lease(input: { reason: "prelease" | "ratelimit"; currentAccountId?: string }): Promise<LeaseOutcome> }
   readAuth: () => Promise<{ access?: string; expires?: number } | undefined>
   // The `{kind:"lease"}` write seam — access + expiry and NOTHING else of the CREDENTIAL. A worker

@@ -6,7 +6,7 @@ import { createManualSwitch } from "./manualSwitch.ts"
 const NOW = 1_900_000_000_000
 const LEASE = { accountId: "eaaa1a79-4c1d-4f6e-9a52-6b7c8d9e0f11", access: "sk-ant-oat01-leased", expiresAt: NOW + 3_600_000 }
 
-type LeaseCall = { reason: string; preferredAccountIdPrefix: string; attempts: number }
+type LeaseCall = { reason: string; preferredAccountIdPrefix: string; attempts: number; pinned?: boolean }
 type Written = { access: string; expires: number; accountId: string }
 type Toasted = { variant: string; message: string }
 
@@ -135,4 +135,46 @@ test("a lease for a DIFFERENT account than the one named is refused, not written
   expect(toasts).toHaveLength(1)
   expect(toasts[0].variant).toBe("error")
   expect(toasts[0].message).toContain("未切号")
+})
+
+test("`p` sends the pin flag and promises the account will not be rotated away", async () => {
+  const { manual, leases, written, toasts } = harness({ ok: true, lease: LEASE })
+
+  const result = await manual.switchTo({ prefix: "eaaa1a79", label: "vince.dai3@potentia.ai", pin: true })
+
+  // THE SAME LEASE `enter` performs, plus one flag. A pin is not a second kind of request: it is a
+  // switch the master is additionally told to record as sticky, which is why both keys share this path.
+  expect(leases).toEqual([{ reason: "prelease", preferredAccountIdPrefix: "eaaa1a79", attempts: 1, pinned: true }])
+  expect(written).toEqual([{ access: LEASE.access, expires: LEASE.expiresAt, accountId: LEASE.accountId }])
+  expect(result).toEqual({ ok: true, accountId: LEASE.accountId })
+  expect(toasts[0].variant).toBe("success")
+  expect(toasts[0].message).toContain("已钉住")
+  // The pin's WHOLE promise, and the one sentence the plain switch cannot say: it is the end condition
+  // ("额度用满") that tells the operator when this stops being true without them doing anything.
+  expect(toasts[0].message).toContain("额度用满")
+  // …and it must NOT keep the plain switch's warning, which says the opposite of what a pin means.
+  expect(toasts[0].message).not.toContain("可能被账号池")
+})
+
+test("un-`p` sends pinned:false, so the master drops a flag it is still advertising", async () => {
+  const { manual, leases, toasts } = harness({ ok: true, lease: LEASE })
+
+  await manual.switchTo({ prefix: "eaaa1a79", label: "vince.dai3@potentia.ai", pin: false })
+
+  // `false` ON THE WIRE, not an omitted field. Omitting it is what `enter` does and would leave the
+  // master's book — and therefore the dashboard's 📌 badge — claiming a reservation that is over.
+  expect(leases).toEqual([{ reason: "prelease", preferredAccountIdPrefix: "eaaa1a79", attempts: 1, pinned: false }])
+  expect(toasts[0].message).toContain("已取消钉住")
+})
+
+test("a failed un-`p` still reports that the pin is off locally", async () => {
+  const { manual, toasts, written } = harness({ ok: false, failure: { kind: "unreachable", detail: "ECONNREFUSED" } })
+
+  const result = await manual.switchTo({ prefix: "eaaa1a79", label: "vince.dai3@potentia.ai", pin: false })
+
+  expect(result).toEqual({ ok: false })
+  expect(written).toEqual([])
+  // The local pin is ALREADY cleared by the caller before this ran, so reporting a flat failure would
+  // tell the operator their un-pin did not take — and they would press `p` again, re-pinning it.
+  expect(toasts[0].message).toContain("已取消钉住")
 })

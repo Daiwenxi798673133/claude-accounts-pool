@@ -103,6 +103,19 @@ export type LeaseRequest = {
   // pick. A worker that asked for account A and was handed B would report a switch that did not
   // happen, and the operator would attribute the next turn's usage to the wrong subscription.
   preferredAccountIdPrefix?: string
+  // Whether the named account is a PIN — the operator pressed `p`, so this worker intends to keep
+  // naming it on every renewal until its quota is spent — or a one-off `enter` switch that the next
+  // renewal is free to rotate away from.
+  //
+  // THE MASTER SERVES BOTH IDENTICALLY; this changes only what it RECORDS against the lease, which is
+  // what makes the dashboard able to say "this holder is not going to move" and what lets a pick for
+  // ANOTHER worker steer around the reservation. A `false` is therefore meaningful and not merely a
+  // default: it is how a worker that just un-pinned tells the master to drop the flag.
+  //
+  // ONLY EVER SENT WITH `preferredAccountIdPrefix`, and refused at the boundary without one: a pin is
+  // a claim about a SPECIFIC account, so a worker cannot pin whatever the ranked pick happens to hand
+  // back — it does not yet know what that will be.
+  pinned?: boolean
 }
 
 // Why a NAMED account could not be served. A closed union rather than a message string: the worker
@@ -260,6 +273,17 @@ export type UsageAccountView = {
   // An account nobody holds carries an EMPTY array, never an absent one — absent means "this master
   // does not track holders at all", which is a different fact from "nobody is holding it".
   holders?: string[]
+  // The subset of `holders` that asked to STAY on this account — an operator pressed `p` on that
+  // worker's /usage panel, so its renewals name this account instead of taking the ranked pick, until
+  // the account's quota is actually spent.
+  //
+  // A SUBSET OF `holders` BY CONSTRUCTION: a pin is recorded against a lease, so it cannot outlive
+  // one. Both renderers rely on that — they decorate a holder chip rather than drawing a second list,
+  // and a name here that is not in `holders` would simply not be shown.
+  //
+  // OPTIONAL for the same reason `holders` is: a master predating pins sends none, and an absent field
+  // means "this master does not track pins", which is not the same fact as "nobody pinned it".
+  pinnedBy?: string[]
 }
 
 export type UsageSnapshotView = {

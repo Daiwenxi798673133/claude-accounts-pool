@@ -49,8 +49,9 @@ export type LeaseServerDeps = {
     pickAccount(input: { accounts: StoredAccount[]; exclude?: string; workerId?: string }): StoredAccount | undefined
     // Booked only by serveLease, only after a token was actually minted. Both lease paths share that
     // tail, which is what keeps the named-account route from silently escaping the book.
-    recordLease(input: { workerId: string; accountId: string; expiresAt: number }): void
+    recordLease(input: { workerId: string; accountId: string; expiresAt: number; pinned: boolean }): void
     holdersOf(accountId: string): string[]
+    pinnersOf(accountId: string): string[]
     // Selection for a lease that NAMES its account, kept a separate verb from pickAccount so the
     // ranked path cannot accidentally inherit "excluded is servable" and vice versa.
     pickPreferred(input: PreferredInput): PreferredPick
@@ -139,7 +140,7 @@ async function readJson(req: Request): Promise<unknown> {
 
 function parseLeaseRequest(raw: unknown): LeaseRequest | undefined {
   if (typeof raw !== "object" || raw === null) return undefined
-  const { workerId, reason, currentAccountId, preferredAccountIdPrefix } = raw as Record<string, unknown>
+  const { workerId, reason, currentAccountId, preferredAccountIdPrefix, pinned } = raw as Record<string, unknown>
   if (!isWorkerLabel(workerId)) return undefined
   // Strict, because this field decides whether an account is excluded from the pick. An unknown
   // reason silently defaulting to `prelease` would re-issue the spent account to a worker that
@@ -152,11 +153,17 @@ function parseLeaseRequest(raw: unknown): LeaseRequest | undefined {
   if (preferredAccountIdPrefix !== undefined && (typeof preferredAccountIdPrefix !== "string" || preferredAccountIdPrefix.length === 0)) {
     return undefined
   }
+  if (pinned !== undefined && typeof pinned !== "boolean") return undefined
+  // A pin is a claim about a SPECIFIC account, so it cannot ride a request that names none — the
+  // worker does not yet know what the ranked pick will hand back. Refused rather than dropped: a
+  // silently ignored pin is a `p` press the operator watched succeed and that changed nothing.
+  if (pinned !== undefined && preferredAccountIdPrefix === undefined) return undefined
   return {
     workerId,
     reason,
     ...(currentAccountId === undefined ? {} : { currentAccountId }),
     ...(preferredAccountIdPrefix === undefined ? {} : { preferredAccountIdPrefix }),
+    ...(pinned === undefined ? {} : { pinned }),
   }
 }
 
@@ -286,8 +293,8 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
         log.warn("master:lease-refused", { workerId, prefix: request.preferredAccountIdPrefix, refused: preferred.refusal })
         return json(409, { error: LEASE_REFUSAL_DETAIL[preferred.refusal], refused: preferred.refusal })
       }
-      log.info("master:lease-preferred", { workerId, accountId: preferred.account.id })
-      return serveLease(workerId, preferred.account)
+      log.info("master:lease-preferred", { workerId, accountId: preferred.account.id, pinned: request.pinned === true })
+      return serveLease(workerId, preferred.account, request.pinned === true)
     }
     // `ratelimit` names an account that is SPENT, so it is excluded from this pick. `prelease` is
     // the routine renewal path with nothing to avoid — handing back the same account is the
@@ -302,13 +309,15 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       log.warn("master:lease-unavailable", { workerId, reason: request.reason, exclude })
       return json(503, { error: "no account available" })
     }
-    return serveLease(workerId, account)
+    // `false` unconditionally: a pin names its account, and parseLeaseRequest refuses a `pinned`
+    // that arrives without one — so a RANKED pick is by construction never a pinned lease.
+    return serveLease(workerId, account, false)
   }
 
   // The tail BOTH lease paths share: mint a fresh access token, bound its horizon, answer. Extracted
   // rather than duplicated because the arithmetic below is INV-CLOUD-4 — two copies of it would let
   // the named-account path drift into serving a lease that outlives the master's own refresh point.
-  async function serveLease(workerId: string, account: StoredAccount): Promise<Response> {
+  async function serveLease(workerId: string, account: StoredAccount, pinned: boolean): Promise<Response> {
     let fresh: { access: string; expiresAt: number }
     try {
       // The refresher is TOLD how much horizon this lease needs rather than asked for whatever is
@@ -348,7 +357,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // Booked AFTER every refusal above, so the book only ever holds leases the worker was really given
     // — a pick whose mint failed, or whose horizon was already spent, leaves the worker on whatever it
     // had, and recording it would have the pool steer around a hold that does not exist.
-    deps.scheduler.recordLease({ workerId, accountId: account.id, expiresAt })
+    deps.scheduler.recordLease({ workerId, accountId: account.id, expiresAt, pinned })
     // PRIVACY: `fresh.access` is a live credential and must NEVER reach the log file; the account
     // id and the expiry carry the entire diagnostic value anyway.
     log.info("master:lease-served", { workerId, accountId: account.id, expiresAt })
@@ -391,6 +400,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       // detached method would break on any implementation that is not closure-based.
       isCoolingDown: (accountId) => deps.scheduler.isCoolingDown(accountId),
       holdersOf: (accountId) => deps.scheduler.holdersOf(accountId),
+      pinnersOf: (accountId) => deps.scheduler.pinnersOf(accountId),
     })
   }
 

@@ -401,7 +401,7 @@ test("an account someone holds loses to a free one, even when the free one is fu
   ])
   expect(scheduler.pickAccount({ accounts })?.id).toBe("a")
 
-  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
 
   expect(scheduler.pickAccount({ accounts, workerId: "w2" })?.id).toBe("b")
   // …while the holder itself renews back onto `a`: its own lease is discounted, so from w1's view `a`
@@ -421,15 +421,15 @@ test("holders are ranked fewest-first, and a lapsed lease stops counting", () =>
     { id: "c", usage: usage(50) },
   ])
 
-  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
-  scheduler.recordLease({ workerId: "w2", accountId: "a", expiresAt: at + 60_000 })
-  scheduler.recordLease({ workerId: "w3", accountId: "b", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
+  scheduler.recordLease({ workerId: "w2", accountId: "a", expiresAt: at + 60_000, pinned: false })
+  scheduler.recordLease({ workerId: "w3", accountId: "b", expiresAt: at + 60_000, pinned: false })
 
   expect(scheduler.holdersOf("a")).toEqual(["w1", "w2"])
   expect(scheduler.holdersOf("c")).toEqual([])
 
   expect(scheduler.pickAccount({ accounts, workerId: "w4" })?.id).toBe("c")
-  scheduler.recordLease({ workerId: "w4", accountId: "c", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w4", accountId: "c", expiresAt: at + 60_000, pinned: false })
   expect(scheduler.pickAccount({ accounts, workerId: "w5" })?.id).toBe("b")
 
   // Past every expiry the book is empty again — swept on read, so nothing had to fire a timer. A
@@ -443,8 +443,8 @@ test("re-leasing moves a worker rather than adding a second hold", () => {
   const at = 5_000_000
   const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
 
-  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
-  scheduler.recordLease({ workerId: "w1", accountId: "b", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
+  scheduler.recordLease({ workerId: "w1", accountId: "b", expiresAt: at + 60_000, pinned: false })
 
   // The wire has no release verb, and does not need one: a worker writes its lease into ONE auth.json
   // slot, so booking the new account IS releasing the old.
@@ -457,7 +457,7 @@ test("holder count still orders the pick when there is no usage data to rank by"
   const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
   const accounts = [account("a"), account("b")]
 
-  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
 
   // No snapshot at all, so ranking is unavailable and selection is round-robin — but the narrowing
   // happens BEFORE that fallback, so rotation runs inside the least-held tier and cannot wander back
@@ -474,8 +474,81 @@ test("a cooling account is still excluded outright, never merely demoted below h
   // `b` cools, `a` is held by two workers. Ordering alone would put the cooling account first — it has
   // no holders — so this pins that cooling remains a FILTER applied before any of that.
   scheduler.reportRateLimit("b", at + 60_000)
-  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
-  scheduler.recordLease({ workerId: "w2", accountId: "a", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
+  scheduler.recordLease({ workerId: "w2", accountId: "a", expiresAt: at + 60_000, pinned: false })
 
   expect(scheduler.pickAccount({ accounts, workerId: "w3" })?.id).toBe("a")
+})
+
+test("a pinned holder is avoided only as a TIE-BREAK inside the least-held tier", () => {
+  const at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+  const accounts = [account("a"), account("b")]
+  // Flat usage, so neither ranking nor rotation can be what decides this — only the pin flag can.
+  scheduler.setUsageCache([
+    { id: "a", usage: usage(50) },
+    { id: "b", usage: usage(50) },
+  ])
+
+  // One holder each, so fewestHolders leaves BOTH in the tier and hands the choice to the pin pass.
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: true })
+  scheduler.recordLease({ workerId: "w2", accountId: "b", expiresAt: at + 60_000, pinned: false })
+
+  expect(scheduler.pinnersOf("a")).toEqual(["w1"])
+  expect(scheduler.pinnersOf("b")).toEqual([])
+  // …and pinnedBy stays a SUBSET of holders, which is the invariant both renderers rely on.
+  expect(scheduler.holdersOf("a")).toEqual(["w1"])
+
+  expect(scheduler.pickAccount({ accounts, workerId: "w3" })?.id).toBe("b")
+  // The pinner's OWN renewal still comes back to `a`: its lease is discounted from both passes, so
+  // the pin it set cannot be the thing that rotates it away.
+  expect(scheduler.pickAccount({ accounts, workerId: "w1" })?.id).toBe("a")
+})
+
+test("pin avoidance NEVER outranks holder count, and never denies the pool", () => {
+  const at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+  const accounts = [account("a"), account("b")]
+  scheduler.setUsageCache([
+    { id: "a", usage: usage(5) },
+    { id: "b", usage: usage(95) },
+  ])
+
+  // `a` is pinned by ONE worker; `b` is shared by three and nearly spent. Ranking pin-avoidance above
+  // holder count would answer `b` here — trading a 5% unshared window for a 95% triple-shared one to
+  // protect a reservation. It must answer `a`.
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: true })
+  scheduler.recordLease({ workerId: "w2", accountId: "b", expiresAt: at + 60_000, pinned: false })
+  scheduler.recordLease({ workerId: "w3", accountId: "b", expiresAt: at + 60_000, pinned: false })
+  scheduler.recordLease({ workerId: "w4", accountId: "b", expiresAt: at + 60_000, pinned: false })
+
+  expect(scheduler.pickAccount({ accounts, workerId: "w5" })?.id).toBe("a")
+
+  // And with EVERY candidate pinned the preference dissolves rather than emptying the pool: a pin may
+  // never be the reason a worker gets no account at all.
+  scheduler.recordLease({ workerId: "w2", accountId: "b", expiresAt: at + 60_000, pinned: true })
+  scheduler.recordLease({ workerId: "w3", accountId: "a", expiresAt: at + 60_000, pinned: true })
+  scheduler.recordLease({ workerId: "w4", accountId: "a", expiresAt: at + 60_000, pinned: true })
+  expect(scheduler.pickAccount({ accounts, workerId: "w5" })?.id).toBe("b")
+})
+
+test("re-leasing the same account overwrites its pin flag in both directions", () => {
+  const at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+
+  // The un-pin path on the wire: the worker asks for the SAME account with pinned:false, and the book
+  // must forget the flag. A book that only ever ADDED pins would leave the dashboard claiming a
+  // reservation the operator has already released.
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: true })
+  expect(scheduler.pinnersOf("a")).toEqual(["w1"])
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
+  expect(scheduler.pinnersOf("a")).toEqual([])
+  expect(scheduler.holdersOf("a")).toEqual(["w1"])
+
+  // A lapsed lease takes its pin with it — same sweep-on-read as holders, so a worker that vanished
+  // cannot reserve an account forever.
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: true })
+  const later = createScheduler({ kv: makeKv().kv, now: () => at + 60_001 })
+  later.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: true })
+  expect(later.pinnersOf("a")).toEqual([])
 })

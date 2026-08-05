@@ -134,6 +134,12 @@ export function dashboardHtml(config: DashboardConfig): string {
      character-for-character against that machine's tui.json. No new colour enters the palette. */
   .badge.busy { font-family: var(--mono); color: var(--text-2); background: var(--chip-bg);
                 border-color: transparent; }
+  /* A pinned holder, i.e. a worker that will NOT be rotated off this account until its quota is spent.
+     Same filled chip as .busy so the two read as one list, but outlined in --accent and carrying the
+     glyph, because "this lease is sticky" is the one thing about a holder that changes what the
+     operator should expect to see here on the next refresh. No new colour enters the palette. */
+  .badge.pin { font-family: var(--mono); color: var(--accent); background: var(--chip-bg);
+               border-color: var(--accent); }
   /* ITS OWN ROW, NOT part of .who, and a FIXED height present on every card whether or not anyone
      holds the account — the same reason .bar.ghost exists further down. Holder count is the one thing
      on this page that varies per account without bound, so leaving these badges to wrap inside .who
@@ -599,7 +605,13 @@ export function dashboardHtml(config: DashboardConfig): string {
     // states a holder count the master never computed while selection is not ranking by one either.
     var crew = el("div", "crew");
     var holders = account.holders || [];
-    for (var h = 0; h < holders.length; h++) crew.appendChild(el("span", "badge busy", holders[h]));
+    // pinnedBy is a SUBSET of holders by construction (see the protocol type), so a pin DECORATES the
+    // holder it belongs to instead of adding a second chip — one list, one chip per machine.
+    var pinned = account.pinnedBy || [];
+    for (var h = 0; h < holders.length; h++) {
+      var sticky = pinned.indexOf(holders[h]) >= 0;
+      crew.appendChild(el("span", sticky ? "badge pin" : "badge busy", sticky ? "📌 " + holders[h] : holders[h]));
+    }
     head.appendChild(crew);
     card.appendChild(head);
     if (account.windows.length === 0) {
