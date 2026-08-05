@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
-import { createMemo, createSignal, For, Show } from "solid-js"
-import { useKeyboard } from "@opentui/solid"
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
+import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { StoredAccount } from "./accounts.ts"
 import { NEEDS_REAUTH_ERROR, type AccountUsage, type UsageResponse, type UsageWindow } from "./usage.ts"
@@ -16,9 +16,13 @@ import {
   moveSelection,
   openaiRows,
   panelPages,
+  poolColumns,
+  poolLayout,
   selectedIndex,
   unattributedOpenaiUsage,
   PAGE_LABEL,
+  POOL_COLUMN_GAP,
+  POOL_COLUMN_WIDTH,
   type OpenaiRow,
   type OpenaiRowState,
 } from "./panel-model.ts"
@@ -561,16 +565,35 @@ export function openUsageDialog(api: TuiPluginApi, options: UsageDialogOptions):
 // Deliberately NOT ported from the local panel: `d` (delete) and `m` (不自动切), because both write to
 // the account LIBRARY, which lives on the master and is not this machine's to edit.
 
+// Solid blocks rather than the local panel's `[###---]`. Two columns of accounts only reads as a
+// grid if the bars line up as a shape, and brackets plus hashes carry too much visual noise at that
+// density. The local panel keeps its own form — this is the pool view's alone.
+const POOL_BAR_WIDTH = 16
+
+function blockBar(util: number): string {
+  const pct = Math.max(0, Math.min(100, util))
+  const fill = Math.round((pct / 100) * POOL_BAR_WIDTH)
+  return `${"█".repeat(fill)}${"░".repeat(POOL_BAR_WIDTH - fill)}`
+}
+
+// An untouched window is not "healthy", it is unused, and painting it the same green as 40% makes
+// a wall of idle accounts look like a wall of active ones.
+function poolTone(api: TuiPluginApi, util: number) {
+  return util <= 0 ? api.theme.current.textMuted : tone(api, util)
+}
+
+// Every cell is padded to a fixed width because these rows now sit in a grid: an unpadded
+// percentage shifts the reset countdown, and the neighbouring column then reads as ragged.
 function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
   const theme = () => props.api.theme.current
+  const util = () => props.win.utilization
   return (
     <box flexDirection="row" gap={1}>
       <text fg={theme().textMuted}>{shortWindowLabel(props.win.label).padEnd(6)}</text>
-      <text fg={tone(props.api, props.win.utilization)}>
-        {bar(props.win.utilization)} {percent(props.win.utilization)}
-      </text>
+      <text fg={poolTone(props.api, util())}>{blockBar(util())}</text>
+      <text fg={poolTone(props.api, util())}>{percent(util()).padStart(4)}</text>
       <Show when={props.win.resetsAt}>
-        <text fg={theme().textMuted}>重置 {resetIn(props.win.resetsAt!)}</text>
+        <text fg={theme().textMuted}>重置 {resetIn(props.win.resetsAt!).padStart(7)}</text>
       </Show>
     </box>
   )
@@ -616,6 +639,10 @@ function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView;
 }
 
 const WORKER_KEYS_HINT = "↑↓ 选择 · enter 切号 · r 刷新 · esc 关闭"
+// Spells out the marker column, which is the one thing on this panel that cannot be inferred from
+// the row itself once a blank marker is in play (see WorkerAccountRow). Deliberately says 本机 and
+// not 空闲: `○` means THIS worker is not on that account, and says nothing about the other workers.
+const WORKER_LEGEND = "● 本机在用 · ○ 本机未用"
 
 export type WorkerUsageDialogOptions = {
   view: UsageSnapshotView
@@ -661,6 +688,29 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
   // drawn on, and one rule is the only way to keep that true.
   const heldFor = (account: UsageAccountView): boolean | undefined =>
     heldStateFor(account.idPrefix, props.options.heldAccountId)
+
+  const dims = useTerminalDimensions()
+  const layout = createMemo(() => poolLayout(accounts().length, dims().width))
+  // Resized from INSIDE the panel rather than once at open time, because the roster changes under
+  // `r` and the terminal can be resized while the dialog is up; either can flip the column count.
+  createEffect(() => api.ui.dialog.setSize(layout().size))
+  const columns = createMemo(() => poolColumns(accounts(), layout().columns))
+  // Where each column starts in the FLAT list — the cursor is a single index over all accounts, so
+  // a row has to be able to work out its own flat position to know whether it is the selected one.
+  const columnOffsets = createMemo(() => {
+    let at = 0
+    return columns().map((column) => {
+      const start = at
+      at += column.length
+      return start
+    })
+  })
+  // "可用" is the pool's own word for it: a row this worker could actually be handed. Not a usage
+  // threshold — a 90%-used account is still available, it is just nearly spent.
+  const summary = () => {
+    const usable = accounts().filter((a) => !a.coolingDown && !a.needsReauth && !a.excluded).length
+    return `${accounts().length} 个账号 · ${usable} 可用`
+  }
 
   // Clamp, NOT wrap — moveSelection in panel-model.ts does the same, and the two panels must not feel
   // different under the same keys.
@@ -723,31 +773,52 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
 
   return (
     <box paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1} flexDirection="column">
-      <box flexDirection="row" justifyContent="center" width="100%">
+      <box flexDirection="row" justifyContent="space-between" gap={2} width="100%">
         <text fg={theme().text}>
           <b>账号池用量</b>
         </text>
+        <text fg={theme().textMuted}>{summary()}</text>
       </box>
+      <text fg={theme().border}>{"─".repeat(layout().contentWidth)}</text>
       <Show when={view().stale}>
         <text fg={theme().warning}>⚠ 快照已陈旧,master 可能已停止轮询,以下数字仅供参考</text>
       </Show>
       <Show when={accounts().length > 0} fallback={<text fg={theme().textMuted}>账号池暂无用量数据</text>}>
-        <For each={accounts()}>
-          {(account, i) => (
-            <WorkerAccountRow api={api} account={account} selected={i() === index()} held={heldFor(account)} />
-          )}
-        </For>
+        <box flexDirection="row" gap={POOL_COLUMN_GAP}>
+          <For each={columns()}>
+            {(column, ci) => (
+              <box flexDirection="column" gap={1} width={POOL_COLUMN_WIDTH} overflow="hidden">
+                <For each={column}>
+                  {(account, ri) => (
+                    <WorkerAccountRow
+                      api={api}
+                      account={account}
+                      selected={columnOffsets()[ci()] + ri() === index()}
+                      held={heldFor(account)}
+                    />
+                  )}
+                </For>
+              </box>
+            )}
+          </For>
+        </box>
       </Show>
       <Show when={notice()}>{(message) => <text fg={theme().warning}>{message()}</text>}</Show>
-      <box flexDirection="row" justifyContent="space-between" gap={2}>
+      <text fg={theme().border}>{"─".repeat(layout().contentWidth)}</text>
+      <box flexDirection="column">
+        <box flexDirection="row" justifyContent="space-between" gap={2} width="100%">
+          <text fg={theme().textMuted}>{WORKER_LEGEND}</text>
+          <text fg={theme().textMuted}>{refreshing() ? "刷新中…" : `快照于 ${clockTime(view().at)}`}</text>
+        </box>
         <text fg={theme().textMuted}>{WORKER_KEYS_HINT}</text>
-        <text fg={theme().textMuted}>{refreshing() ? "刷新中…" : `快照于 ${clockTime(view().at)}`}</text>
       </box>
     </box>
   )
 }
 
 export function openWorkerUsageDialog(api: TuiPluginApi, options: WorkerUsageDialogOptions): void {
+  // Opens narrow and lets the panel's own effect widen it — the roster is already known here, but
+  // the terminal width that decides whether two columns FIT is not.
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() => <WorkerUsagePanel api={api} options={options} />)
 }
