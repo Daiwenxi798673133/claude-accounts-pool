@@ -64,6 +64,12 @@ function parseAccount(raw: unknown): UsageAccountView | undefined {
   if (r.holders !== undefined && (!Array.isArray(r.holders) || r.holders.some((h) => typeof h !== "string"))) {
     return undefined
   }
+  // Same rule again for the pins, and it has to be spelled out rather than inferred: this function
+  // REBUILDS the row field by field, so a field nobody copies here is a field the panel can never see
+  // however faithfully the master sent it.
+  if (r.pinnedBy !== undefined && (!Array.isArray(r.pinnedBy) || r.pinnedBy.some((p) => typeof p !== "string"))) {
+    return undefined
+  }
   return {
     idPrefix: r.idPrefix,
     label: r.label,
@@ -73,6 +79,7 @@ function parseAccount(raw: unknown): UsageAccountView | undefined {
     excluded: r.excluded,
     needsReauth: r.needsReauth,
     ...(r.holders === undefined ? {} : { holders: r.holders as string[] }),
+    ...(r.pinnedBy === undefined ? {} : { pinnedBy: r.pinnedBy as string[] }),
     ...(r.expiresAt === undefined ? {} : { expiresAt: r.expiresAt as number }),
   }
 }
