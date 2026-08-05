@@ -9,6 +9,8 @@ import {
   moveSelection,
   openaiRows,
   panelPages,
+  poolColumns,
+  poolLayout,
   selectedIndex,
   unattributedOpenaiUsage,
 } from "./panel-model.ts"
@@ -271,4 +273,43 @@ test("U25:没有持有的号 / 持有的号不在快照里 → 退回第一行",
   expect(initialWorkerSelection(accounts, undefined)).toBe(0)
   expect(initialWorkerSelection(accounts, HELD)).toBe(0)
   expect(initialWorkerSelection([], HELD)).toBe(0)
+})
+
+const WIDE = 200
+
+test("U26:账号数不超过阈值 → 单列 medium,超过才换成双列 xlarge", () => {
+  expect(poolLayout(6, WIDE)).toMatchObject({ columns: 1, size: "medium" })
+  expect(poolLayout(7, WIDE)).toMatchObject({ columns: 2, size: "xlarge" })
+  expect(poolLayout(0, WIDE)).toMatchObject({ columns: 1, size: "medium" })
+})
+
+// 终端不够宽时 host 会把弹窗压到 terminalWidth − 2,第二列会被裁掉半截 —— 宁可退回单列。
+test("U27:窄终端即使账号很多也退回单列", () => {
+  expect(poolLayout(9, 80)).toMatchObject({ columns: 1, size: "medium" })
+  expect(poolLayout(9, 100)).toMatchObject({ columns: 2, size: "xlarge" })
+})
+
+// 内容宽度是分隔线的长度,必须跟着弹窗实际拿到的宽度走,不能按标称尺寸写死。
+test("U28:内容宽度取标称尺寸与终端上限的较小者", () => {
+  expect(poolLayout(3, WIDE).contentWidth).toBe(56)
+  expect(poolLayout(9, WIDE).contentWidth).toBe(112)
+  expect(poolLayout(3, 40).contentWidth).toBe(34)
+})
+
+// 列主序:↑↓ 走的是扁平列表,所以第一列必须是前 ceil(n/cols) 个,光标才是往下走而不是左右横跳。
+test("U29:分列按列主序切分,余数落在最后一列", () => {
+  expect(poolColumns([1, 2, 3, 4, 5, 6, 7, 8, 9], 2)).toEqual([
+    [1, 2, 3, 4, 5],
+    [6, 7, 8, 9],
+  ])
+  expect(poolColumns([1, 2, 3], 1)).toEqual([[1, 2, 3]])
+  expect(poolColumns([], 2)).toEqual([])
+})
+
+// 空列还是会吃掉一个 gap,把网格顶歪,所以列数按 rows 反推而不是照单全收。
+test("U30:账号数撑不满请求的列数时不产生空列", () => {
+  expect(poolColumns([1, 2, 3, 4], 3)).toEqual([
+    [1, 2],
+    [3, 4],
+  ])
 })

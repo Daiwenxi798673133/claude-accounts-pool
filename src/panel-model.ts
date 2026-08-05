@@ -202,3 +202,48 @@ export function initialWorkerSelection(accounts: readonly { idPrefix: string }[]
   const at = accounts.findIndex((account) => heldStateFor(account.idPrefix, heldAccountId) === true)
   return at < 0 ? 0 : at
 }
+
+// ── worker panel layout ──────────────────────────────────────────────────────────────────────
+// The host dialog is a FIXED width per size — 60 / 88 / 116 cells, capped at terminal width − 2 —
+// not a fraction of the terminal, so how many columns fit is arithmetic rather than a guess.
+// Mirrored from OpenCode's dialog renderer; if those numbers ever move, the panel gets a column
+// too many and the rightmost one is clipped.
+const DIALOG_WIDTH = { medium: 60, xlarge: 116 } as const
+// paddingLeft + paddingRight on the panel box.
+const PANEL_PADDING = 4
+// One account block is `▶ ● label` over up to three window lines, and the window line is the wide
+// one: 4 indent + 6 label + 16 bar + percentage + reset countdown.
+export const POOL_COLUMN_WIDTH = 45
+export const POOL_COLUMN_GAP = 4
+// Below this, one column still fits on a normal screen without scrolling, and a single list reads
+// better than a grid.
+export const POOL_COLUMN_THRESHOLD = 6
+
+export type PoolLayout = { columns: number; size: "medium" | "xlarge"; contentWidth: number }
+
+// ponytail: two columns is the ceiling. A third needs 3×45 + 2×4 = 143 cells and the dialog stops
+// at 116, so it could only exist by shrinking the bar row below what it needs.
+export function poolLayout(accounts: number, terminalWidth: number): PoolLayout {
+  const single = (size: "medium" | "xlarge"): PoolLayout => ({
+    columns: 1,
+    size,
+    contentWidth: Math.max(1, Math.min(DIALOG_WIDTH[size], terminalWidth - 2) - PANEL_PADDING),
+  })
+  if (accounts <= POOL_COLUMN_THRESHOLD) return single("medium")
+  const wide = single("xlarge")
+  // A narrow terminal clamps the dialog below its nominal size, so the second column has to be
+  // re-checked against what the dialog ACTUALLY got rather than against 116.
+  if (wide.contentWidth < POOL_COLUMN_WIDTH * 2 + POOL_COLUMN_GAP) return single("medium")
+  return { ...wide, columns: 2 }
+}
+
+// Column-MAJOR. ↑↓ walk the flat account list, so filling each column top to bottom is what makes
+// the cursor travel down the screen instead of hopping sideways on every press.
+export function poolColumns<T>(items: readonly T[], columns: number): T[][] {
+  const rows = Math.ceil(items.length / Math.max(1, columns))
+  if (rows <= 0) return []
+  // Derived from `rows`, not from `columns`: 4 accounts across 2 columns is 2 rows each, and
+  // asking for a third column would only produce an empty one that still eats its gap.
+  const used = Math.ceil(items.length / rows)
+  return Array.from({ length: used }, (_, i) => items.slice(i * rows, i * rows + rows))
+}
