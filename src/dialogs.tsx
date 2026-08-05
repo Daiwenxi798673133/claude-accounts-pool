@@ -16,6 +16,7 @@ import {
   moveSelection,
   openaiRows,
   panelPages,
+  pinnedStateFor,
   displayWidth,
   holderChips,
   poolColumns,
@@ -611,6 +612,10 @@ function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
 // rest of this row prints, so a badge whose literal drifted from the one being counted would silently
 // overrun the column and get clipped.
 const IN_USE_LABEL = " In Use"
+// Replaces " In Use" rather than joining it: a pin is only ever placed on the account this worker
+// holds, so printing both would say the same thing twice. Six cells + the flex row's gap is exactly
+// the seven " In Use" occupied, which is what keeps the holder budget below unchanged.
+const PINNED_LABEL = "已钉住"
 const COOLING_LABEL = "冷却中"
 const REAUTH_LABEL = "需重新登录"
 const EXCLUDED_LABEL = "不自动切"
@@ -620,6 +625,10 @@ function WorkerAccountRow(props: {
   account: UsageAccountView
   selected: boolean
   held?: boolean
+  // THIS machine's pin, not the pool's: `pinnedBy` on the row says who else asked to stay, and this
+  // says whether we did. Kept separate because the local answer is known instantly (the operator just
+  // pressed `p`) while the pool's copy only appears on the next snapshot.
+  pinned: boolean
   // This machine's own self-declared label, so its name in the holder list can be told apart from
   // the other machines'. Not an identity — nothing authenticates a workerId.
   workerId: string
@@ -636,7 +645,8 @@ function WorkerAccountRow(props: {
       account().needsReauth ? REAUTH_LABEL : undefined,
       account().excluded ? EXCLUDED_LABEL : undefined,
     ].filter((badge): badge is string => badge !== undefined)
-    const head = 2 + 2 + displayWidth(account().label) + (props.held === true ? displayWidth(IN_USE_LABEL) : 0)
+    const state = props.pinned ? 1 + displayWidth(PINNED_LABEL) : props.held === true ? displayWidth(IN_USE_LABEL) : 0
+    const head = 2 + 2 + displayWidth(account().label) + state
     return badges.reduce((total, badge) => total + 1 + displayWidth(badge), head) + 1
   }
   const chips = () => holderChips(account().holders ?? [], props.columnWidth - titleUsed())
@@ -647,8 +657,11 @@ function WorkerAccountRow(props: {
           <text fg={props.selected ? theme().primary : theme().textMuted}>{props.selected ? "▶" : " "}</text>
           <text fg={props.selected ? theme().primary : theme().text}>
             {marker()} {account().label}
-            {props.held === true ? IN_USE_LABEL : ""}
+            {props.held === true && !props.pinned ? IN_USE_LABEL : ""}
           </text>
+          <Show when={props.pinned}>
+            <text fg={theme().warning}>{PINNED_LABEL}</text>
+          </Show>
           <Show when={account().coolingDown}>
             <text fg={theme().warning}>{COOLING_LABEL}</text>
           </Show>
@@ -659,9 +672,22 @@ function WorkerAccountRow(props: {
         <box flexDirection="row" gap={1}>
           {/* Our own name in the SAME green as `●`, every other machine muted — "the green one is me"
               is then the same sentence the marker at the head of this row already says, rather than a
-              second convention to learn. */}
+              second convention to learn. A machine that PINNED this account borrows the same amber the
+              已钉住 label above uses, so one colour means one thing on this panel. */}
           <For each={chips().names}>
-            {(name) => <text fg={name === props.workerId ? theme().success : theme().textMuted}>{name}</text>}
+            {(name) => (
+              <text
+                fg={
+                  name === props.workerId
+                    ? theme().success
+                    : (account().pinnedBy ?? []).includes(name)
+                      ? theme().warning
+                      : theme().textMuted
+                }
+              >
+                {name}
+              </text>
+            )}
           </For>
           <Show when={chips().overflow > 0}>
             <text fg={theme().textMuted}>+{chips().overflow}</text>
@@ -683,7 +709,9 @@ function WorkerAccountRow(props: {
 // ←→ is announced only where it does something. At one column poolStepColumn is a no-op, and a key
 // advertised as 换列 that moves nothing reads as a broken panel rather than an absent feature.
 const workerKeysHint = (columns: number): string =>
-  columns > 1 ? "↑↓ 选择 · ←→ 换列 · enter 切号 · r 刷新 · esc 关闭" : "↑↓ 选择 · enter 切号 · r 刷新 · esc 关闭"
+  columns > 1
+    ? "↑↓ 选择 · ←→ 换列 · enter 切号 · p 钉住 · r 刷新 · esc 关闭"
+    : "↑↓ 选择 · enter 切号 · p 钉住 · r 刷新 · esc 关闭"
 // Spells out the marker column, which is the one thing on this panel that cannot be inferred from
 // the row itself once a blank marker is in play (see WorkerAccountRow). Deliberately says 本机 and
 // not 空闲: `○` means THIS worker is not on that account, and says nothing about the other workers.
@@ -695,11 +723,21 @@ export type WorkerUsageDialogOptions = {
   // and undefined until the first lease lands. Matched against a row by PREFIX because the prefix is
   // all the snapshot carries (UsageAccountView.idPrefix).
   heldAccountId?: string
+  // FULL id of the account this machine has pinned, matched by prefix exactly as heldAccountId is.
+  // Undefined when nothing is pinned, which is the normal state.
+  pinnedAccountId?: string
   // This machine's `workerId` from tui.json, used only to pick its own name out of a holder list.
   workerId: string
   // `enter`. The panel is CLOSED before this runs, exactly as the local panel does it, so the verdict
   // arrives as a toast rather than as a dialog that has to describe its own failure.
   onSwitch: (input: { prefix: string; label: string }) => void
+  // `p`. `pin:false` is the un-pin of the row already pinned — one key, both directions, because the
+  // 已钉住 marker on the row is what says which of the two this press will do.
+  //
+  // CLOSES THE PANEL AND TOASTS, exactly like `enter` and for the same reason: pinning an account this
+  // worker does not hold has to switch to it, which is `enter`'s flow with a pin recorded first — so
+  // the two keys must not report themselves differently.
+  onPin?: (input: { prefix: string; label: string; pin: boolean }) => void
   // `r`. Either a fresher snapshot, or the sentence explaining why there is none.
   //
   // A MESSAGE RATHER THAN A TOAST, and this is MEASURED, not stylistic: a toast raised while this
@@ -735,6 +773,8 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
   // drawn on, and one rule is the only way to keep that true.
   const heldFor = (account: UsageAccountView): boolean | undefined =>
     heldStateFor(account.idPrefix, props.options.heldAccountId)
+  const pinnedFor = (account: UsageAccountView): boolean =>
+    pinnedStateFor(account.idPrefix, props.options.pinnedAccountId)
 
   const dims = useTerminalDimensions()
   const layout = createMemo(() => poolLayout(accounts().length, dims().width))
@@ -779,6 +819,13 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
     if (!account) return
     api.ui.dialog.clear()
     props.options.onSwitch({ prefix: account.idPrefix, label: account.label })
+  }
+
+  function togglePin(): void {
+    const account = selected()
+    if (!account) return
+    api.ui.dialog.clear()
+    props.options.onPin?.({ prefix: account.idPrefix, label: account.label, pin: !pinnedFor(account) })
   }
 
   async function refresh(): Promise<void> {
@@ -831,6 +878,12 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
       moveColumn(1)
       return
     }
+    if (evt.name === "p") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      togglePin()
+      return
+    }
     if (evt.name === "r") {
       evt.preventDefault()
       evt.stopPropagation()
@@ -865,6 +918,7 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
                       account={account}
                       selected={columnOffsets()[ci()] + ri() === index()}
                       held={heldFor(account)}
+                      pinned={pinnedFor(account)}
                       workerId={props.options.workerId}
                       columnWidth={layout().columnWidth}
                     />

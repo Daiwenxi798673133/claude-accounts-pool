@@ -5,7 +5,8 @@
 //
 // Therefore NOTHING HERE PICKS AN ACCOUNT and nothing here refreshes a token. This module reports
 // what the worker observed, asks for a replacement, and writes back whatever lease comes home.
-import type { createLeaseClient, LeaseFailure } from "./leaseClient.ts"
+import type { createLeaseClient, LeaseFailure, LeaseOutcome } from "./leaseClient.ts"
+import type { PinStore } from "./pin.ts"
 import { log } from "../logger.ts"
 
 // Derived from the client rather than restated: a change to that wire surface must be a COMPILE
@@ -31,6 +32,10 @@ export type SwitchStrategy = {
 
 export type SwitchStrategyDeps = {
   client: LeaseClient
+  // The pin-aware lease verb (createPinnedLease), used by onStaleLease ONLY. Not by onLimit: that path
+  // is leaving a SPENT account, which is the one account a pin must never keep naming.
+  pinnedLease: (input: { reason: "prelease"; currentAccountId?: string }) => Promise<LeaseOutcome>
+  pin: PinStore
   // Narrower than accounts.ts's TokenWrite on purpose: access + expires and NO refresh slot, so a
   // worker cannot express a {kind:"full"} write here even by accident — the master is the only
   // holder of real refresh chains. `accountId` is the master's answer to "who did you give me",
@@ -62,6 +67,19 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
 
   return {
     async onLimit(ctx: SwitchContext): Promise<boolean> {
+      // THE PIN'S END CONDITION, and the only automatic one: `p` promises to hold an account until its
+      // quota is spent, and this event IS that quota being spent. Cleared BEFORE the report and the
+      // lease below, so neither can name the account we are leaving.
+      //
+      // UNCONDITIONAL, not "only if the pin names ctx.accountId". A worker holds exactly one account,
+      // so the two agree in every reachable state; and if they ever disagreed, keeping the pin would be
+      // the dangerous direction — reportRateLimit is best-effort, so a lost report leaves the master
+      // willing to hand the spent account straight back, and a pin naming it would ask for exactly
+      // that, forever.
+      // Guarded, not unconditional: `set` reaches a persisted store, and the overwhelmingly common
+      // rate limit is one with no pin in play at all.
+      const hadPin = deps.pin.get() !== undefined
+      if (hadPin) deps.pin.set(undefined)
       // FIRST, and awaited: the master must know this account is spent BEFORE it answers the lease
       // below, or it may hand the very same account straight back. The report is best-effort BY
       // CONTRACT (leaseClient never retries and never throws across that boundary, it answers a
@@ -87,8 +105,13 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
 
       await deps.writeLease({ access: lease.access, expires: lease.expiresAt, accountId: lease.accountId })
       // Never the access token itself — it is a live credential.
-      log.info("switch:leased", { from: ctx.accountId, to: lease.accountId, expiresAt: lease.expiresAt })
-      deps.toast({ variant: "warning", message: `当前账号额度已满，已切到云端账号「${lease.accountId}」并自动重试` })
+      log.info("switch:leased", { from: ctx.accountId, to: lease.accountId, expiresAt: lease.expiresAt, unpinned: hadPin })
+      deps.toast({
+        variant: "warning",
+        message: hadPin
+          ? `钉住的账号额度已用满，已解除钉住并切到云端账号「${lease.accountId}」并自动重试`
+          : `当前账号额度已满，已切到云端账号「${lease.accountId}」并自动重试`,
+      })
       return true
     },
 
@@ -104,7 +127,10 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
       // only its token was rotated away. leaseServer excludes currentAccountId for "ratelimit"
       // ONLY, so prelease is the one reason that says "keep me here, just re-issue the token"
       // instead of cooling a fine account and shrinking pool capacity for nothing.
-      const outcome = await deps.client.lease({ reason: "prelease", currentAccountId: ctx.accountId })
+      // THROUGH THE PIN, unlike onLimit: the account is healthy and only its token was rotated away, so
+      // a pinned worker must come back to the same account. Plain `client.lease` would hand this to the
+      // ranked pick and quietly rotate the operator off the row they pinned.
+      const outcome = await deps.pinnedLease({ reason: "prelease", currentAccountId: ctx.accountId })
       if (!outcome.ok) {
         log.warn("switch:stale-lease-failed", { accountId: ctx.accountId, failure: outcome.failure.kind })
         deps.toast({ variant: "error", message: FAILURE_MESSAGE[outcome.failure.kind] })

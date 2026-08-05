@@ -20,7 +20,12 @@ export type ManualSwitchDeps = {
   // Structural, not the concrete client: this needs exactly one verb, which is what lets every test
   // drive it without a transport. `attempts` is part of the shape because passing it is the point.
   client: {
-    lease(input: { reason: "prelease"; preferredAccountIdPrefix: string; attempts: number }): Promise<LeaseOutcome>
+    lease(input: {
+      reason: "prelease"
+      preferredAccountIdPrefix: string
+      attempts: number
+      pinned?: boolean
+    }): Promise<LeaseOutcome>
   }
   // The `{kind:"lease"}` write seam — access + expiry and NOTHING else of the credential, so this
   // path cannot express a real refresh token even by accident (INV-CLOUD-1). Same seam the renewal
@@ -35,7 +40,12 @@ export type ManualSwitchOutcome = { ok: true; accountId: string } | { ok: false 
 export type ManualSwitch = {
   // `label` is carried in purely so the messages can name the account: a worker has no account
   // library to look it up in, and the panel already has the label the operator is reading.
-  switchTo(input: { prefix: string; label: string }): Promise<ManualSwitchOutcome>
+  //
+  // `pin` says which of the panel's two keys pressed this. `undefined` is `enter` — a one-off switch
+  // the pool may rotate away from. `true`/`false` are `p`: the SAME lease request, plus the flag that
+  // tells the master whether to record this holder as staying put. All three share one code path
+  // because they are one operation; only the sentence at the end differs.
+  switchTo(input: { prefix: string; label: string; pin?: boolean }): Promise<ManualSwitchOutcome>
 }
 
 // Worded for THIS path, deliberately not shared with switchStrategy's table: there the sentence ends
@@ -60,11 +70,28 @@ function messageFor(failure: LeaseFailure, label: string): string {
   return failure.kind === "refused" ? REFUSAL_MESSAGE[failure.refused](label) : FAILURE_MESSAGE[failure.kind]
 }
 
+function successMessage(label: string, pin?: boolean): string {
+  if (pin === true) return `已钉住「${label}」，在额度用满前不再被账号池轮换走`
+  if (pin === false) return `已取消钉住「${label}」，续租恢复按用量轮换`
+  // Not hedging, but the truth about this pool: with no pin there is NO worker→account affinity, so
+  // the next renewal ranks by utilization like any other and may well move off this account. Saying so
+  // beats letting the operator discover it as a bug — and now names the key that prevents it.
+  return `已切到「${label}」，续租时可能被账号池按用量轮换走(按 p 可钉住)`
+}
+
+// A FAILED un-pin is not a failed switch, and must not be reported as one: the local pin is already
+// gone by the time this runs (worker/install.ts clears it before asking), so the operator's intent DID
+// take effect here — only the master has not heard yet, and its own next renewal will tell it.
+function failureMessage(failure: LeaseFailure, label: string, pin?: boolean): string {
+  const base = messageFor(failure, label)
+  return pin === false ? `${base}；本机已取消钉住，master 会在下次续租时同步` : base
+}
+
 export function createManualSwitch(deps: ManualSwitchDeps): ManualSwitch {
   const now = deps.now ?? Date.now
 
   return {
-    async switchTo(input: { prefix: string; label: string }): Promise<ManualSwitchOutcome> {
+    async switchTo(input: { prefix: string; label: string; pin?: boolean }): Promise<ManualSwitchOutcome> {
       // `prelease`, never `ratelimit`: the account being LEFT is healthy — the operator just wants a
       // different one — and `ratelimit` would have the master cool a perfectly good account, shrinking
       // pool capacity for everyone because one person changed their mind.
@@ -72,10 +99,11 @@ export function createManualSwitch(deps: ManualSwitchDeps): ManualSwitch {
         reason: "prelease",
         preferredAccountIdPrefix: input.prefix,
         attempts: MANUAL_LEASE_ATTEMPTS,
+        ...(input.pin === undefined ? {} : { pinned: input.pin }),
       })
       if (!outcome.ok) {
-        log.warn("manual-switch:lease-failed", { prefix: input.prefix, failure: outcome.failure.kind })
-        deps.toast({ variant: "error", message: messageFor(outcome.failure, input.label) })
+        log.warn("manual-switch:lease-failed", { prefix: input.prefix, pin: input.pin, failure: outcome.failure.kind })
+        deps.toast({ variant: "error", message: failureMessage(outcome.failure, input.label, input.pin) })
         return { ok: false }
       }
 
@@ -103,11 +131,8 @@ export function createManualSwitch(deps: ManualSwitchDeps): ManualSwitch {
 
       await deps.writeLease({ access: lease.access, expires: lease.expiresAt, accountId: lease.accountId })
       // Never `lease.access` — it is a live credential.
-      log.info("manual-switch:leased", { accountId: lease.accountId, expiresAt: lease.expiresAt })
-      // The second clause is not hedging, it is the truth about this pool: there is NO worker→account
-      // affinity by design, so the next renewal ranks by utilization like any other and may well move
-      // off this account. Saying so beats letting the operator discover it as a bug.
-      deps.toast({ variant: "success", message: `已切到「${input.label}」，续租时可能被账号池按用量轮换走` })
+      log.info("manual-switch:leased", { accountId: lease.accountId, expiresAt: lease.expiresAt, pin: input.pin })
+      deps.toast({ variant: "success", message: successMessage(input.label, input.pin) })
       return { ok: true, accountId: lease.accountId }
     },
   }

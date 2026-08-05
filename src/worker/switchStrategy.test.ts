@@ -35,6 +35,11 @@ const { createSwitchStrategy } = await import("./switchStrategy.ts")
 type Effect =
   | { kind: "report"; accountId: string; headers: Record<string, string>; resetsAt?: number }
   | { kind: "lease-request"; reason: string; currentAccountId?: string }
+  // The pin-aware verb, kept a SEPARATE effect from `lease-request` because which of the two a path
+  // used is the contract: onLimit must never route through the pin (it is leaving a spent account),
+  // onStaleLease must always route through it (the account is healthy and the pin still stands).
+  | { kind: "pinned-lease-request"; reason: string; currentAccountId?: string }
+  | { kind: "pin-set"; idPrefix?: string }
   // Tagged as the accounts.ts TokenWrite variant this seam produces in production —
   // writeAuthAnthropic({ kind: "lease", access, expires }). A worker may never produce
   // {kind:"full"}: that would file a refresh token it must not hold, and the writeLease dep's
@@ -48,8 +53,9 @@ type Effect =
 type Toast = { variant?: string; message: string }
 type Handler = (event: { id: string; properties: Record<string, unknown> }) => void
 
-function setup(outcome: LeaseOutcome) {
+function setup(outcome: LeaseOutcome, pinnedAt?: string) {
   const effects: Effect[] = []
+  let pinned = pinnedAt
   const toasts: Toast[] = []
   const handlers = new Map<string, Handler>()
   const messages = [
@@ -99,6 +105,17 @@ function setup(outcome: LeaseOutcome) {
         return true
       },
     },
+    pinnedLease: async (input) => {
+      effects.push({ kind: "pinned-lease-request", reason: input.reason, currentAccountId: input.currentAccountId })
+      return outcome
+    },
+    pin: {
+      get: () => pinned,
+      set: (idPrefix) => {
+        pinned = idPrefix
+        effects.push({ kind: "pin-set", idPrefix })
+      },
+    },
     writeLease: async (input) => {
       effects.push({ kind: "lease", access: input.access, expires: input.expires, accountId: input.accountId })
     },
@@ -130,7 +147,7 @@ function setup(outcome: LeaseOutcome) {
       properties: { sessionID: "s1", error: { name: "APIError", data: { statusCode: 401 } } },
     })
 
-  return { controller, effects, toasts, fireLimit, fireStale }
+  return { controller, effects, toasts, fireLimit, fireStale, pinOf: () => pinned }
 }
 
 async function flush(pred: () => boolean): Promise<void> {
@@ -214,8 +231,8 @@ test("stale lease 401 triggers immediate re-lease and resume", async () => {
 
   // Then: lease → credential write → the caller's own continue resume. The ABSENT "report" is the
   // headline: a 401 must never be reported as a rate limit.
-  expect(effects.map((effect) => effect.kind)).toEqual(["lease-request", "lease", "resume"])
-  expect(effects[0]).toEqual({ kind: "lease-request", reason: "prelease", currentAccountId: HELD_ID })
+  expect(effects.map((effect) => effect.kind)).toEqual(["pinned-lease-request", "lease", "resume"])
+  expect(effects[0]).toEqual({ kind: "pinned-lease-request", reason: "prelease", currentAccountId: HELD_ID })
   // Re-issued for the SAME account, so the recorded id does not move either.
   expect(effects[1]).toEqual({ kind: "lease", access: LEASE_ACCESS, expires: expiresAt, accountId: HELD_ID })
   expect(effects[2]).toEqual({ kind: "resume", text: "continue" })
@@ -231,7 +248,7 @@ test("stale lease re-lease failure surfaces toast and does not write", async () 
   await flush(() => toasts.length > 0)
 
   // Then: one lease attempt and NOTHING else — still no report on this path.
-  expect(effects.map((effect) => effect.kind)).toEqual(["lease-request"])
+  expect(effects.map((effect) => effect.kind)).toEqual(["pinned-lease-request"])
   expect(effects.some((effect) => effect.kind === "lease")).toBe(false)
   // No resume either: the token we hold is revoked, so a retry would fail 401 again and the user
   // would pay for the same dead turn twice.
@@ -252,8 +269,34 @@ test("stale lease refuses an already-expired replacement and does not write", as
 
   // Then: refused before the write. An expired `expires` in auth.json is the ONE state that turns
   // the local auth provider into a second refresher of the master's one-time-use chain.
-  expect(effects.map((effect) => effect.kind)).toEqual(["lease-request"])
+  expect(effects.map((effect) => effect.kind)).toEqual(["pinned-lease-request"])
   expect(effects.some((effect) => effect.kind === "resume")).toBe(false)
   expect(toasts.some((toast) => toast.variant === "error" && /[\u4e00-\u9fff]/.test(toast.message))).toBe(true)
+  controller.dispose()
+})
+
+test("a rate limit spends the pin: it is cleared, said out loud, and never named in the lease", async () => {
+  // Given: this worker pinned the account it holds, and that account just hit its subscription limit —
+  // which is EXACTLY the end condition `p` promised.
+  const expiresAt = Date.now() + 3_600_000
+  const { controller, effects, toasts, fireLimit, pinOf } = setup(
+    { ok: true, lease: { accountId: "acct-fresh", access: LEASE_ACCESS, expiresAt } },
+    "acct-spe",
+  )
+
+  fireLimit()
+  await flush(() => effects.some((effect) => effect.kind === "resume"))
+
+  // THE PIN GOES FIRST, before the report and before the lease. Both of those name the spent account,
+  // and a pin still in the store would have the pinned lease verb ask for it right back.
+  expect(effects.map((effect) => effect.kind)).toEqual(["pin-set", "report", "lease-request", "lease", "resume"])
+  expect(effects[0]).toEqual({ kind: "pin-set", idPrefix: undefined })
+  expect(pinOf()).toBeUndefined()
+  // The RANKED verb, not the pinned one: this path is leaving a spent account and must never be able
+  // to name it.
+  expect(effects[2]).toEqual({ kind: "lease-request", reason: "ratelimit", currentAccountId: SPENT_ID })
+  // And the operator is TOLD the pin is off — otherwise they would still believe they were parked on
+  // that account, and would not understand why the pool moved them again an hour later.
+  expect(toasts.some((toast) => toast.message.includes("解除钉住"))).toBe(true)
   controller.dispose()
 })

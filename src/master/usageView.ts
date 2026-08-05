@@ -22,6 +22,7 @@ export type UsageViewInput = {
   snapshot: UsageSnapshot
   isCoolingDown: (accountId: string) => boolean
   holdersOf: (accountId: string) => string[]
+  pinnersOf: (accountId: string) => string[]
 }
 
 // `typeof === "string"`, NOT `!== undefined`. MEASURED against the live endpoint: a window sitting at
@@ -57,6 +58,9 @@ export function buildUsageView(input: UsageViewInput): UsageSnapshotView {
       // ALWAYS present, empty when nobody holds it: the page has to tell "no worker is on this account"
       // apart from "this master cannot say", and only an omitted field may mean the latter.
       holders: input.holdersOf(account.id),
+      // ALWAYS present alongside `holders`, for the same reason: an omitted field is the ONLY way to
+      // say "this master cannot answer", so a master that tracks pins must send the empty array.
+      pinnedBy: input.pinnersOf(account.id),
       ...(account.expires === undefined ? {} : { expiresAt: account.expires }),
     })
   }

@@ -92,6 +92,9 @@ export function createLeaseClient(deps: LeaseClientDeps): {
     currentAccountId?: string
     // The account the operator named in a worker's /usage panel, as the prefix that panel showed.
     preferredAccountIdPrefix?: string
+    // Whether that named account is a PIN this worker will keep re-naming, or a one-off switch.
+    // MUST accompany the prefix: the master answers 400 to a `pinned` that names no account.
+    pinned?: boolean
     // How many times to try before giving up. INTERACTIVE CALLERS PASS 1: an operator who just
     // pressed enter is watching a dialog, and the ladder below can spend minutes reaching its
     // verdict. Only the background renewal loop can afford that, so only it takes the default.
@@ -176,6 +179,7 @@ export function createLeaseClient(deps: LeaseClientDeps): {
         reason: input.reason,
         ...(input.currentAccountId === undefined ? {} : { currentAccountId: input.currentAccountId }),
         ...(input.preferredAccountIdPrefix === undefined ? {} : { preferredAccountIdPrefix: input.preferredAccountIdPrefix }),
+        ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
       }
       const maxAttempts = input.attempts ?? MAX_LEASE_ATTEMPTS
       let detail = "no attempt made"

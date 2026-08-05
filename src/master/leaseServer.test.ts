@@ -88,7 +88,7 @@ function startHarness(options?: {
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
   const preferred: Harness["preferred"] = []
-  const leases = new Map<string, { accountId: string; expiresAt: number }>()
+  const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean }>()
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
 
@@ -150,10 +150,12 @@ function startHarness(options?: {
       },
       // A REAL book, not a spy list: these cases assert that a refused lease books nothing, which a
       // recorder that only appends could not distinguish from one that books and never releases.
-      recordLease({ workerId, accountId, expiresAt }) {
-        leases.set(workerId, { accountId, expiresAt })
+      recordLease({ workerId, accountId, expiresAt, pinned }) {
+        leases.set(workerId, { accountId, expiresAt, pinned })
       },
       holdersOf: (accountId) => [...leases].filter(([, hold]) => hold.accountId === accountId).map(([workerId]) => workerId),
+      pinnersOf: (accountId) =>
+        [...leases].filter(([, hold]) => hold.accountId === accountId && hold.pinned).map(([workerId]) => workerId),
       // Mirrors the real scheduler's verdicts (scheduler.test.ts owns proving those), reading the SAME
       // `cooled` set as the pick filter and isCoolingDown so a row shown as 冷却中, an account skipped
       // by selection, and a refused switch can never disagree in this harness. `excluded` is
@@ -737,6 +739,9 @@ test("usage returns the whole pool with no token in it", async () => {
       // that cannot say who holds it. The page renders no badge for the former and none for the
       // latter either, but selection ranks by the former and must not by the latter.
       holders: [],
+      // Same rule, same reason — and empty here even though `holders` is too, which is the pair a
+      // renderer needs in order to tell "held but free to rotate" from "held and staying".
+      pinnedBy: [],
     })
 
     // And the served rows carry the real windows, including each one's reset instant.
@@ -1386,6 +1391,80 @@ test("the dashboard page carries the delete route and still leaks nothing", asyn
     // The picker is built in the BROWSER from /v1/usage, never baked into the document: a page that
     // shipped the roster would publish the pool's email addresses to anyone who fetched the shell.
     expect(body).not.toContain("example.test")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a pin without a named account is malformed, never a pin on whatever gets ranked", async () => {
+  const harness = startHarness()
+  try {
+    const res = await post(harness.base, CLOUD_ROUTES.lease, { workerId: WORKER_ID, reason: "prelease", pinned: true })
+
+    // 400 at the boundary rather than a silently ignored flag. A pin is a claim about a SPECIFIC
+    // account and the worker does not yet know what a ranked pick will hand back — so serving this as
+    // an ordinary lease would answer 200 to a `p` press that reserved nothing, which the operator
+    // would then see confirmed by a success toast and contradicted by the pool an hour later.
+    expect(res.status).toBe(400)
+    expect(harness.picks).toEqual([])
+    expect(harness.preferred).toEqual([])
+    expect(harness.refreshed).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a non-boolean pin is refused, not coerced", async () => {
+  const harness = startHarness()
+  try {
+    const res = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      preferredAccountIdPrefix: "acct-a",
+      pinned: "yes",
+    })
+
+    // Truthiness is not consent: `"false"` is truthy too, so a coercing parser would turn a worker's
+    // un-pin into a pin. Refused for the same reason `reason` is strictly checked.
+    expect(res.status).toBe(400)
+    expect(harness.preferred).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a pinned lease reaches the dashboard as pinnedBy, and an un-pin removes it again", async () => {
+  const harness = dashboardHarness(false)
+  try {
+    const pinLease = (pinned: boolean) =>
+      post(
+        harness.base,
+        CLOUD_ROUTES.lease,
+        { workerId: "laptop-1", reason: "prelease", preferredAccountIdPrefix: "acct-live", pinned } satisfies LeaseRequest,
+      )
+    const rowOf = async () => {
+      const view = JSON.parse(await (await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)).text()) as UsageSnapshotView
+      return view.accounts.find((row) => row.idPrefix === "acct-liv")
+    }
+
+    // Before any lease: held by nobody, pinned by nobody. The two empty arrays are what let the page
+    // tell those apart from a master that does not track either.
+    expect((await rowOf())?.holders).toEqual([])
+    expect((await rowOf())?.pinnedBy).toEqual([])
+
+    expect((await pinLease(true)).status).toBe(200)
+    const pinnedRow = await rowOf()
+    // The 📌 badge's data, and the SUBSET invariant both renderers depend on: a pinner is always also
+    // a holder, so the page decorates one chip rather than drawing a second list.
+    expect(pinnedRow?.holders).toEqual(["laptop-1"])
+    expect(pinnedRow?.pinnedBy).toEqual(["laptop-1"])
+
+    // The un-pin: the same request with the flag off. The hold survives — the worker is still using
+    // the account — but the reservation is gone, which is precisely what the badge must stop claiming.
+    expect((await pinLease(false)).status).toBe(200)
+    const unpinnedRow = await rowOf()
+    expect(unpinnedRow?.holders).toEqual(["laptop-1"])
+    expect(unpinnedRow?.pinnedBy).toEqual([])
   } finally {
     harness.stop()
   }

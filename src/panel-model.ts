@@ -194,6 +194,13 @@ export function heldStateFor(idPrefix: string, heldAccountId?: string): boolean 
   return heldAccountId === undefined ? undefined : heldAccountId.startsWith(idPrefix)
 }
 
+// The same prefix test heldStateFor makes, minus the third state: a pin either was recorded on this
+// machine or it was not, and there is no "we have not found out yet" — the local store is the only
+// place a pin lives, so reading it can never be inconclusive.
+export function pinnedStateFor(idPrefix: string, pinnedAccountId?: string): boolean {
+  return pinnedAccountId !== undefined && pinnedAccountId.startsWith(idPrefix)
+}
+
 // Seeds the cursor on the row the panel already marks as held, THROUGH heldStateFor rather than a
 // second prefix test of its own: one rule means `▶` can never land on a row that is not the `●`
 // one. Two rules is precisely how they drifted apart. No held row — nothing leased yet, or a lease
