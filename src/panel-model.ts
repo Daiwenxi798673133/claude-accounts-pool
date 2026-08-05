@@ -237,6 +237,30 @@ export function poolLayout(accounts: number, terminalWidth: number): PoolLayout 
   return { ...wide, columns: 2 }
 }
 
+// ←→'s counterpart to ↑↓'s ±1: the list is filled column-major, so the row at the same height one
+// column over sits exactly one column's worth of entries away.
+//
+// NO-OP AT THE EDGE, not a clamp, and this is the difference that matters. ↑↓ clamp because the
+// flat list is what they walk, but `index ± rows` clamped would make ← on the leftmost column land
+// on index 0 — the cursor jumps UP a few rows in the column it was already in, which is neither
+// "moved left" nor "stayed put". Deciding on the COLUMN first is what keeps a horizontal key from
+// producing vertical movement. Same reason a single column returns early: there is no column to
+// step to, and ±rows would there be ±length.
+//
+// The row is preserved, except against a short final column: → from the bottom of a full column
+// lands on the last account of the next one rather than off the end.
+export function poolStepColumn(index: number, delta: number, total: number, columns: number): number {
+  if (columns <= 1) return index
+  const rows = Math.ceil(total / columns)
+  if (rows <= 0) return index
+  const target = Math.floor(index / rows) + delta
+  // Against the columns poolColumns will actually draw, not against `columns`: those two differ
+  // whenever the accounts do not fill the requested grid, and stepping into a column that was never
+  // rendered would move the cursor somewhere the operator cannot see it.
+  if (target < 0 || target >= Math.ceil(total / rows)) return index
+  return clampSelection(target * rows + (index % rows), total)
+}
+
 // Column-MAJOR. ↑↓ walk the flat account list, so filling each column top to bottom is what makes
 // the cursor travel down the screen instead of hopping sideways on every press.
 export function poolColumns<T>(items: readonly T[], columns: number): T[][] {

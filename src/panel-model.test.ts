@@ -11,6 +11,7 @@ import {
   panelPages,
   poolColumns,
   poolLayout,
+  poolStepColumn,
   selectedIndex,
   unattributedOpenaiUsage,
 } from "./panel-model.ts"
@@ -312,4 +313,38 @@ test("U30:账号数撑不满请求的列数时不产生空列", () => {
     [1, 2],
     [3, 4],
   ])
+})
+
+// 9 个号分两列 → 每列 5 行,所以左列第 i 行和右列第 i 行在扁平列表里差 5。
+test("U31:←→ 跨一整列,左右对位", () => {
+  expect(poolStepColumn(0, 1, 9, 2)).toBe(5)
+  expect(poolStepColumn(5, -1, 9, 2)).toBe(0)
+  expect(poolStepColumn(2, 1, 9, 2)).toBe(7)
+})
+
+// 真机上发现的:边界必须是"原地不动",不能是把扁平下标夹到 0。夹取会让最左列按 ← 跳到第 0 行 ——
+// 一个水平键产生了垂直位移,既不是"往左"也不是"没动"。
+test("U32:最外侧列按向外方向 = 原地不动,不产生垂直位移", () => {
+  expect(poolStepColumn(1, -1, 9, 2)).toBe(1)
+  expect(poolStepColumn(4, -1, 9, 2)).toBe(4)
+  expect(poolStepColumn(6, 1, 9, 2)).toBe(6)
+})
+
+// 右列只有 4 行,左列第 5 行按 → 没有对位行,落到右列末行而不是越界。
+test("U33:短列按 → 落到该列末行", () => {
+  expect(poolStepColumn(4, 1, 9, 2)).toBe(8)
+  expect(poolStepColumn(8, -1, 9, 2)).toBe(3)
+})
+
+// 单列时 ±rows 就是 ±length,不加这道闸门,→ 会把光标从任意位置直接甩到最后一个账号。
+test("U34:单列时 ←→ 是空操作", () => {
+  expect(poolStepColumn(2, 1, 5, 1)).toBe(2)
+  expect(poolStepColumn(2, -1, 5, 1)).toBe(2)
+})
+
+// 4 个号请求 3 列时 poolColumns 只画 2 列,步进必须按实画列数判界,否则光标会走进一个不存在的列。
+test("U35:请求列数多于实画列数时不越到空列", () => {
+  expect(poolColumns([1, 2, 3, 4], 3)).toHaveLength(2)
+  expect(poolStepColumn(2, 1, 4, 3)).toBe(2)
+  expect(poolStepColumn(0, 1, 4, 3)).toBe(2)
 })

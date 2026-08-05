@@ -18,6 +18,7 @@ import {
   panelPages,
   poolColumns,
   poolLayout,
+  poolStepColumn,
   selectedIndex,
   unattributedOpenaiUsage,
   PAGE_LABEL,
@@ -638,7 +639,10 @@ function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView;
   )
 }
 
-const WORKER_KEYS_HINT = "↑↓ 选择 · enter 切号 · r 刷新 · esc 关闭"
+// ←→ is announced only where it does something. At one column poolStepColumn is a no-op, and a key
+// advertised as 换列 that moves nothing reads as a broken panel rather than an absent feature.
+const workerKeysHint = (columns: number): string =>
+  columns > 1 ? "↑↓ 选择 · ←→ 换列 · enter 切号 · r 刷新 · esc 关闭" : "↑↓ 选择 · enter 切号 · r 刷新 · esc 关闭"
 // Spells out the marker column, which is the one thing on this panel that cannot be inferred from
 // the row itself once a blank marker is in play (see WorkerAccountRow). Deliberately says 本机 and
 // not 空闲: `○` means THIS worker is not on that account, and says nothing about the other workers.
@@ -718,6 +722,10 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
     setSelection((current) => clampSelection(current + delta, accounts().length))
   }
 
+  function moveColumn(delta: number): void {
+    setSelection((current) => poolStepColumn(current, delta, accounts().length, layout().columns))
+  }
+
   function confirm(): void {
     const account = selected()
     if (!account) return
@@ -759,6 +767,20 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
       evt.preventDefault()
       evt.stopPropagation()
       move(1)
+      return
+    }
+    // h/l alongside ←→ to match the other two panels' vim keys. They mean 换列 here rather than 切页
+    // because this panel has no pages — the grid is the only thing there is to move across.
+    if (evt.name === "left" || evt.name === "h") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      moveColumn(-1)
+      return
+    }
+    if (evt.name === "right" || evt.name === "l") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      moveColumn(1)
       return
     }
     if (evt.name === "r") {
@@ -810,7 +832,7 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
           <text fg={theme().textMuted}>{WORKER_LEGEND}</text>
           <text fg={theme().textMuted}>{refreshing() ? "刷新中…" : `快照于 ${clockTime(view().at)}`}</text>
         </box>
-        <text fg={theme().textMuted}>{WORKER_KEYS_HINT}</text>
+        <text fg={theme().textMuted}>{workerKeysHint(layout().columns)}</text>
       </box>
     </box>
   )
