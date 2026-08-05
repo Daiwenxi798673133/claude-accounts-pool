@@ -57,6 +57,13 @@ function parseAccount(raw: unknown): UsageAccountView | undefined {
     windows.push(win)
   }
   if (r.expiresAt !== undefined && (typeof r.expiresAt !== "number" || !Number.isFinite(r.expiresAt))) return undefined
+  // ABSENT STAYS ABSENT. A master predating holder tracking sends no `holders` at all, and defaulting
+  // that to `[]` here would report "nobody is holding this" — a fact this master never computed. The
+  // panel keys its 在用 summary off the difference, so collapsing it costs the one distinction the
+  // field exists to carry. Malformed invalidates the whole account, same strictness as `windows`.
+  if (r.holders !== undefined && (!Array.isArray(r.holders) || r.holders.some((h) => typeof h !== "string"))) {
+    return undefined
+  }
   return {
     idPrefix: r.idPrefix,
     label: r.label,
@@ -65,6 +72,7 @@ function parseAccount(raw: unknown): UsageAccountView | undefined {
     coolingDown: r.coolingDown,
     excluded: r.excluded,
     needsReauth: r.needsReauth,
+    ...(r.holders === undefined ? {} : { holders: r.holders as string[] }),
     ...(r.expiresAt === undefined ? {} : { expiresAt: r.expiresAt as number }),
   }
 }

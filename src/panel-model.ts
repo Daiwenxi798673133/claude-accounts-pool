@@ -211,30 +211,40 @@ export function initialWorkerSelection(accounts: readonly { idPrefix: string }[]
 const DIALOG_WIDTH = { medium: 60, xlarge: 116 } as const
 // paddingLeft + paddingRight on the panel box.
 const PANEL_PADDING = 4
-// One account block is `▶ ● label` over up to three window lines, and the window line is the wide
-// one: 4 indent + 6 label + 16 bar + percentage + reset countdown.
-export const POOL_COLUMN_WIDTH = 45
+// The NARROWEST a column may be, i.e. what the widest line inside it needs: a window row is
+// 4 indent + 6 label + 16 bar + percentage + reset countdown. It is a floor, not the width — the
+// drawn width divides up whatever the dialog gave, so the leftovers land in the title row where the
+// holder names live rather than as dead space past the last column.
+export const POOL_COLUMN_MIN_WIDTH = 45
 export const POOL_COLUMN_GAP = 4
 // Below this, one column still fits on a normal screen without scrolling, and a single list reads
 // better than a grid.
 export const POOL_COLUMN_THRESHOLD = 6
 
-export type PoolLayout = { columns: number; size: "medium" | "xlarge"; contentWidth: number }
+export type PoolLayout = {
+  columns: number
+  size: "medium" | "xlarge"
+  contentWidth: number
+  columnWidth: number
+}
 
 // ponytail: two columns is the ceiling. A third needs 3×45 + 2×4 = 143 cells and the dialog stops
 // at 116, so it could only exist by shrinking the bar row below what it needs.
 export function poolLayout(accounts: number, terminalWidth: number): PoolLayout {
-  const single = (size: "medium" | "xlarge"): PoolLayout => ({
-    columns: 1,
-    size,
-    contentWidth: Math.max(1, Math.min(DIALOG_WIDTH[size], terminalWidth - 2) - PANEL_PADDING),
-  })
-  if (accounts <= POOL_COLUMN_THRESHOLD) return single("medium")
-  const wide = single("xlarge")
+  const fit = (size: "medium" | "xlarge", columns: number): PoolLayout => {
+    const contentWidth = Math.max(1, Math.min(DIALOG_WIDTH[size], terminalWidth - 2) - PANEL_PADDING)
+    return {
+      columns,
+      size,
+      contentWidth,
+      columnWidth: Math.max(1, Math.floor((contentWidth - POOL_COLUMN_GAP * (columns - 1)) / columns)),
+    }
+  }
+  if (accounts <= POOL_COLUMN_THRESHOLD) return fit("medium", 1)
+  const wide = fit("xlarge", 2)
   // A narrow terminal clamps the dialog below its nominal size, so the second column has to be
   // re-checked against what the dialog ACTUALLY got rather than against 116.
-  if (wide.contentWidth < POOL_COLUMN_WIDTH * 2 + POOL_COLUMN_GAP) return single("medium")
-  return { ...wide, columns: 2 }
+  return wide.columnWidth < POOL_COLUMN_MIN_WIDTH ? fit("medium", 1) : wide
 }
 
 // ←→'s counterpart to ↑↓'s ±1: the list is filled column-major, so the row at the same height one
@@ -259,6 +269,49 @@ export function poolStepColumn(index: number, delta: number, total: number, colu
   // rendered would move the cursor somewhere the operator cannot see it.
   if (target < 0 || target >= Math.ceil(total / rows)) return index
   return clampSelection(target * rows + (index % rows), total)
+}
+
+// TERMINAL CELLS, not code units. The title row's badges are Chinese — `冷却中` occupies 6 cells,
+// not 3 — so a budget measured with `.length` believes a full row still has room and the holder
+// names get clipped by the column's overflow.
+//
+// ONE RANGE is provably enough here rather than a wcwidth table, and the bound is enforced
+// elsewhere: the only wide text this panel can contain is its own Chinese literals (CJK Unified),
+// because a workerId is shape-checked to `^[A-Za-z0-9._-]{1,64}$` and an account label is an email.
+// The glyphs this panel draws from the ambiguous-width blocks — ●○▶ ░█ ─ · — measure ONE cell in a
+// terminal, which is why they must stay outside the wide set.
+export function displayWidth(text: string): number {
+  let width = 0
+  for (const char of text) {
+    const cp = char.codePointAt(0) ?? 0
+    width += cp >= 0x4e00 && cp <= 0x9fff ? 2 : 1
+  }
+  return width
+}
+
+// Names, never a count: a count is a number the operator then has to resolve into machines, and the
+// names are what they were going to ask for next anyway. `overflow` carries the ones that did not
+// fit so the row can say `+2` — holders too numerous to show is itself the anomaly worth surfacing,
+// and silent clipping would read as "those are all of them".
+export type HolderChips = { names: string[]; overflow: number }
+
+// Drops from the END until the whole thing fits, re-measuring each time because the `+N` suffix
+// appears (and widens) as names come off. Nothing fitting at all still yields the bare `+N`: the
+// operator learns the account is held even on a row too cramped to name anyone.
+export function holderChips(holders: readonly string[], budget: number): HolderChips {
+  const empty: HolderChips = { names: [], overflow: 0 }
+  if (holders.length === 0 || budget <= 0) return empty
+  for (let shown = holders.length; shown > 0; shown -= 1) {
+    const overflow = holders.length - shown
+    const names = holders.slice(0, shown)
+    // Joined by ONE space per gap, matching the flex row's gap={1}; the suffix costs its own gap.
+    const width =
+      names.reduce((sum, name) => sum + displayWidth(name), 0) +
+      (shown - 1) +
+      (overflow > 0 ? 1 + displayWidth(`+${overflow}`) : 0)
+    if (width <= budget) return { names, overflow }
+  }
+  return displayWidth(`+${holders.length}`) <= budget ? { names: [], overflow: holders.length } : empty
 }
 
 // Column-MAJOR. ↑↓ walk the flat account list, so filling each column top to bottom is what makes

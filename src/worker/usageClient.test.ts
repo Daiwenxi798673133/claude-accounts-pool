@@ -46,12 +46,13 @@ test("parseUsageSnapshotView accepts a well-formed snapshot", () => {
 // rather than treated as schema-invalid — and schema-invalid is not a soft failure here, it takes the
 // whole snapshot down to a "无法识别的响应" toast and leaves the panel with nothing to draw.
 //
-// `holders` is the field that made this concrete, but the assertion is deliberately written against
-// an arbitrary unknown key as well: what must hold is the RULE, not this one field's luck.
+// `holders` used to be the field that made this concrete; it has a rule of its own now, so the
+// assertion stands on an arbitrary unknown key instead — as its original note said, what must hold
+// is the RULE, not this one field's luck.
 test("parseUsageSnapshotView tolerates fields a newer master added, dropping them", () => {
   const fromNewerMaster = {
     ...validView,
-    accounts: [{ ...validView.accounts[0], holders: ["laptop-1", "mba-m2"], somethingNotInventedYet: 42 }],
+    accounts: [{ ...validView.accounts[0], somethingNotInventedYet: 42 }],
   }
 
   const parsed = parseUsageSnapshotView(fromNewerMaster)
@@ -60,11 +61,39 @@ test("parseUsageSnapshotView tolerates fields a newer master added, dropping the
   expect(parsed?.accounts.length).toBe(1)
   // Dropped, NOT carried through: this parser has no rule for the field, and passing an unvalidated
   // value into a view the dialog trusts is the one thing parse-don't-validate exists to prevent.
-  expect(parsed?.accounts[0].holders).toBeUndefined()
   expect((parsed?.accounts[0] as Record<string, unknown>).somethingNotInventedYet).toBeUndefined()
   // The fields it DOES know still land, so tolerating the unknown one cost nothing.
   expect(parsed?.accounts[0].idPrefix).toBe("eaaa1a79")
   expect(parsed?.accounts[0].windows[0].utilization).toBe(32)
+})
+
+test("parseUsageSnapshotView carries holders through", () => {
+  const withHolders = {
+    ...validView,
+    accounts: [{ ...validView.accounts[0], holders: ["laptop-1", "mba-m2"] }],
+  }
+  expect(parseUsageSnapshotView(withHolders)?.accounts[0].holders).toEqual(["laptop-1", "mba-m2"])
+})
+
+// THE DISTINCTION THE FIELD EXISTS FOR. A master predating holder tracking sends no `holders` at
+// all, which is not the same fact as "nobody holds this" — defaulting to `[]` here would report a
+// count that master never computed, and the panel keys its 在用 summary off exactly this difference.
+test("parseUsageSnapshotView keeps an absent holders absent, never []", () => {
+  const parsed = parseUsageSnapshotView(validView)
+  expect(parsed?.accounts[0].holders).toBeUndefined()
+  expect(parsed?.accounts[0]).not.toHaveProperty("holders")
+})
+
+// Same strictness as `windows`: a half-readable roster rendered as if complete would understate who
+// is on that account, and holder count is now a selection input, not decoration.
+test("parseUsageSnapshotView rejects a malformed holders", () => {
+  for (const holders of ["laptop-1", 42, [1, 2], ["ok", 7], {}]) {
+    const bad = { ...validView, accounts: [{ ...validView.accounts[0], holders }] }
+    expect(parseUsageSnapshotView(bad)).toBeUndefined()
+  }
+  // An empty list is VALID and means nobody — that is the whole point of it not being absent.
+  const empty = { ...validView, accounts: [{ ...validView.accounts[0], holders: [] }] }
+  expect(parseUsageSnapshotView(empty)?.accounts[0].holders).toEqual([])
 })
 
 test("parseUsageSnapshotView rejects a null or mistyped envelope", () => {

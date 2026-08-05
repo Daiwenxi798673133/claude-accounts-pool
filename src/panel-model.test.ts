@@ -9,9 +9,12 @@ import {
   moveSelection,
   openaiRows,
   panelPages,
+  displayWidth,
+  holderChips,
   poolColumns,
   poolLayout,
   poolStepColumn,
+  POOL_COLUMN_GAP,
   selectedIndex,
   unattributedOpenaiUsage,
 } from "./panel-model.ts"
@@ -297,6 +300,14 @@ test("U28:内容宽度取标称尺寸与终端上限的较小者", () => {
   expect(poolLayout(3, 40).contentWidth).toBe(34)
 })
 
+// 列宽必须把内容宽吃满 —— 之前写死 45,双列只用到 94/112,右边 18 格白扔,标题行也就没地方放持有者。
+test("U28b:列宽吃满内容宽,不留尾部死空间", () => {
+  const two = poolLayout(9, WIDE)
+  expect(two.columnWidth).toBe(54)
+  expect(two.columnWidth * two.columns + POOL_COLUMN_GAP * (two.columns - 1)).toBe(two.contentWidth)
+  expect(poolLayout(3, WIDE).columnWidth).toBe(56)
+})
+
 // 列主序:↑↓ 走的是扁平列表,所以第一列必须是前 ceil(n/cols) 个,光标才是往下走而不是左右横跳。
 test("U29:分列按列主序切分,余数落在最后一列", () => {
   expect(poolColumns([1, 2, 3, 4, 5, 6, 7, 8, 9], 2)).toEqual([
@@ -347,4 +358,41 @@ test("U35:请求列数多于实画列数时不越到空列", () => {
   expect(poolColumns([1, 2, 3, 4], 3)).toHaveLength(2)
   expect(poolStepColumn(2, 1, 4, 3)).toBe(2)
   expect(poolStepColumn(0, 1, 4, 3)).toBe(2)
+})
+
+// 按 .length 量会把 `冷却中` 算成 3 而不是 6,标题行预算就会多出 3 格,持有者名被列的 overflow 裁掉。
+// 而 ●○▶░█─ 这些"歧义宽度"字符在终端里是 1 格,一旦被算成 2,进度条和分隔线全部错位。
+test("U36:宽度按终端格数算 —— 中文双宽,方块与箭头单宽", () => {
+  expect(displayWidth("冷却中")).toBe(6)
+  expect(displayWidth("需重新登录")).toBe(10)
+  expect(displayWidth("9 个账号")).toBe(8)
+  expect(displayWidth("vince-local")).toBe(11)
+  expect(displayWidth("●○▶░█─")).toBe(6)
+})
+
+test("U37:持有者放得下就全列出,名字之间各占一格间隔", () => {
+  expect(holderChips(["vince-local"], 20)).toEqual({ names: ["vince-local"], overflow: 0 })
+  expect(holderChips(["vince-local", "mac-mini"], 20)).toEqual({
+    names: ["vince-local", "mac-mini"],
+    overflow: 0,
+  })
+  expect(holderChips([], 20)).toEqual({ names: [], overflow: 0 })
+})
+
+// 从尾部往下丢,且每丢一个都要重新量 —— `+N` 后缀是丢了名字才出现的,它自己也占宽度。
+test("U38:放不下时从尾部丢名字并补 +N", () => {
+  expect(holderChips(["vince-local", "mac-mini", "ci-01"], 20)).toEqual({
+    names: ["vince-local"],
+    overflow: 2,
+  })
+  // `aaa bbb ccc` 正好 11 格,所以 11 全放得下;10 才逼出 `aaa bbb +1`(3+1+3+1+2 = 10)。
+  expect(holderChips(["aaa", "bbb", "ccc"], 11)).toEqual({ names: ["aaa", "bbb", "ccc"], overflow: 0 })
+  expect(holderChips(["aaa", "bbb", "ccc"], 10)).toEqual({ names: ["aaa", "bbb"], overflow: 1 })
+})
+
+// 一个名字都放不下也要让运维知道这个号被占着 —— 光秃秃的 +N 比什么都不显示诚实。
+test("U39:一个名字都放不下时退化成裸 +N,再不够才彻底不显示", () => {
+  expect(holderChips(["a-very-long-worker-id", "b"], 4)).toEqual({ names: [], overflow: 2 })
+  expect(holderChips(["a-very-long-worker-id", "b"], 1)).toEqual({ names: [], overflow: 0 })
+  expect(holderChips(["vince-local"], 0)).toEqual({ names: [], overflow: 0 })
 })

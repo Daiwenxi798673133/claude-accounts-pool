@@ -16,6 +16,8 @@ import {
   moveSelection,
   openaiRows,
   panelPages,
+  displayWidth,
+  holderChips,
   poolColumns,
   poolLayout,
   poolStepColumn,
@@ -23,7 +25,6 @@ import {
   unattributedOpenaiUsage,
   PAGE_LABEL,
   POOL_COLUMN_GAP,
-  POOL_COLUMN_WIDTH,
   type OpenaiRow,
   type OpenaiRowState,
 } from "./panel-model.ts"
@@ -606,10 +607,39 @@ function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
 // first /usage; worker/install.ts now records the id with every lease and reads it back at panel
 // open.) Drawing `○` on every row while unknown would read as "I hold none of these", so the marker
 // column goes BLANK instead: absence of knowledge, rendered as absence. Keep the three states.
-function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView; selected: boolean; held?: boolean }) {
+// Measured and rendered from the SAME constants. The holder budget is the column minus whatever the
+// rest of this row prints, so a badge whose literal drifted from the one being counted would silently
+// overrun the column and get clipped.
+const IN_USE_LABEL = " In Use"
+const COOLING_LABEL = "冷却中"
+const REAUTH_LABEL = "需重新登录"
+const EXCLUDED_LABEL = "不自动切"
+
+function WorkerAccountRow(props: {
+  api: TuiPluginApi
+  account: UsageAccountView
+  selected: boolean
+  held?: boolean
+  // This machine's own self-declared label, so its name in the holder list can be told apart from
+  // the other machines'. Not an identity — nothing authenticates a workerId.
+  workerId: string
+  columnWidth: number
+}) {
   const theme = () => props.api.theme.current
   const account = () => props.account
   const marker = () => (props.held === undefined ? " " : props.held ? "●" : "○")
+  // `▶` + its gap, then the marker and its space, then the label and every badge with a gap each,
+  // and finally one more gap before the holder names begin.
+  const titleUsed = () => {
+    const badges = [
+      account().coolingDown ? COOLING_LABEL : undefined,
+      account().needsReauth ? REAUTH_LABEL : undefined,
+      account().excluded ? EXCLUDED_LABEL : undefined,
+    ].filter((badge): badge is string => badge !== undefined)
+    const head = 2 + 2 + displayWidth(account().label) + (props.held === true ? displayWidth(IN_USE_LABEL) : 0)
+    return badges.reduce((total, badge) => total + 1 + displayWidth(badge), head) + 1
+  }
+  const chips = () => holderChips(account().holders ?? [], props.columnWidth - titleUsed())
   return (
     <box flexDirection="column">
       <box flexDirection="row" justifyContent="space-between" gap={1}>
@@ -617,18 +647,29 @@ function WorkerAccountRow(props: { api: TuiPluginApi; account: UsageAccountView;
           <text fg={props.selected ? theme().primary : theme().textMuted}>{props.selected ? "▶" : " "}</text>
           <text fg={props.selected ? theme().primary : theme().text}>
             {marker()} {account().label}
-            {props.held === true ? " In Use" : ""}
+            {props.held === true ? IN_USE_LABEL : ""}
           </text>
           <Show when={account().coolingDown}>
-            <text fg={theme().warning}>冷却中</text>
+            <text fg={theme().warning}>{COOLING_LABEL}</text>
           </Show>
           <Show when={account().needsReauth}>
-            <text fg={theme().error}>需重新登录</text>
+            <text fg={theme().error}>{REAUTH_LABEL}</text>
           </Show>
         </box>
-        <Show when={account().excluded}>
-          <text fg="#22D3EE">不自动切</text>
-        </Show>
+        <box flexDirection="row" gap={1}>
+          {/* Our own name in the SAME green as `●`, every other machine muted — "the green one is me"
+              is then the same sentence the marker at the head of this row already says, rather than a
+              second convention to learn. */}
+          <For each={chips().names}>
+            {(name) => <text fg={name === props.workerId ? theme().success : theme().textMuted}>{name}</text>}
+          </For>
+          <Show when={chips().overflow > 0}>
+            <text fg={theme().textMuted}>+{chips().overflow}</text>
+          </Show>
+          <Show when={account().excluded}>
+            <text fg="#22D3EE">{EXCLUDED_LABEL}</text>
+          </Show>
+        </box>
       </box>
       <box flexDirection="column" paddingLeft={4}>
         <Show when={account().hasUsage} fallback={<text fg={theme().textMuted}>额度未知(不在本次快照)</text>}>
@@ -654,6 +695,8 @@ export type WorkerUsageDialogOptions = {
   // and undefined until the first lease lands. Matched against a row by PREFIX because the prefix is
   // all the snapshot carries (UsageAccountView.idPrefix).
   heldAccountId?: string
+  // This machine's `workerId` from tui.json, used only to pick its own name out of a holder list.
+  workerId: string
   // `enter`. The panel is CLOSED before this runs, exactly as the local panel does it, so the verdict
   // arrives as a toast rather than as a dialog that has to describe its own failure.
   onSwitch: (input: { prefix: string; label: string }) => void
@@ -713,7 +756,12 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
   // threshold — a 90%-used account is still available, it is just nearly spent.
   const summary = () => {
     const usable = accounts().filter((a) => !a.coolingDown && !a.needsReauth && !a.excluded).length
-    return `${accounts().length} 个账号 · ${usable} 可用`
+    // 在用 appears ONLY when this snapshot proves the master tracks holders at all. A master
+    // predating the field sends none, and printing `0 在用` there would state a count nobody
+    // computed — the same distinction parseAccount preserves by leaving `holders` undefined.
+    const tracked = accounts().some((a) => a.holders !== undefined)
+    const busy = accounts().filter((a) => (a.holders?.length ?? 0) > 0).length
+    return `${accounts().length} 个账号 · ${usable} 可用${tracked ? ` · ${busy} 在用` : ""}`
   }
 
   // Clamp, NOT wrap — moveSelection in panel-model.ts does the same, and the two panels must not feel
@@ -809,7 +857,7 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
         <box flexDirection="row" gap={POOL_COLUMN_GAP}>
           <For each={columns()}>
             {(column, ci) => (
-              <box flexDirection="column" gap={1} width={POOL_COLUMN_WIDTH} overflow="hidden">
+              <box flexDirection="column" gap={1} width={layout().columnWidth} overflow="hidden">
                 <For each={column}>
                   {(account, ri) => (
                     <WorkerAccountRow
@@ -817,6 +865,8 @@ function WorkerUsagePanel(props: { api: TuiPluginApi; options: WorkerUsageDialog
                       account={account}
                       selected={columnOffsets()[ci()] + ri() === index()}
                       held={heldFor(account)}
+                      workerId={props.options.workerId}
+                      columnWidth={layout().columnWidth}
                     />
                   )}
                 </For>
