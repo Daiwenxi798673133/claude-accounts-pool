@@ -169,6 +169,9 @@ export function installCloudWorker(
               // of a process used to have nothing to mark. The in-memory value is the fallback for
               // the one case the record cannot cover: a lease whose bookkeeping write failed.
               heldAccountId: (await readActiveId()) ?? leaseKeeper.heldAccountId(),
+              // The SAME label this worker sends on every lease, so the name the master reports back
+              // in `holders` is byte-identical to the one the panel highlights as this machine.
+              workerId: cfg.workerId,
               onSwitch: ({ prefix, label }) => {
                 void (async () => {
                   const switched = await manualSwitch.switchTo({ prefix, label })
