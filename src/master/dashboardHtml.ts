@@ -142,8 +142,15 @@ export function dashboardHtml(config: DashboardConfig): string {
      nowrap + overflow-x is what pins it to exactly one line: an account with more holders than fit
      scrolls instead of growing, and an account with more holders than fit is itself the anomaly this
      row exists to surface. The scrollbar is hidden because it would be taller than the row it sits in. */
+  /* The fade is ALWAYS applied, not toggled on overflow, because CSS cannot ask whether a box
+     overflows and answering it in script would mean re-measuring on every render and resize. It costs
+     nothing when it does not apply: a row whose badges end before the right edge fades empty
+     background, which is invisible. It bites exactly when content reaches the edge — the clipped case
+     — turning a badge that looked chopped off by a rendering fault into one that plainly continues. */
   .crew { display: flex; align-items: center; gap: 6px; height: 23px; flex-wrap: nowrap;
-          overflow-x: auto; scrollbar-width: none; }
+          overflow-x: auto; scrollbar-width: none;
+          -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+          mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent); }
   .crew::-webkit-scrollbar { display: none; }
   .crew .badge { flex: 0 0 auto; }
   .token { font-size: 14px; color: var(--text-2); }
