@@ -84,6 +84,33 @@ test("parseUsageSnapshotView keeps an absent holders absent, never []", () => {
   expect(parsed?.accounts[0]).not.toHaveProperty("holders")
 })
 
+// THE REGRESSION THIS FILE EXISTS TO CATCH, and it escaped once: this parser REBUILDS the row field
+// by field, so `pinnedBy` shipped end-to-end — master, wire, dashboard — while the panel still saw
+// `undefined` on every row, because nothing here copied it. A field added to UsageAccountView needs a
+// line in the constructed object AND a case here, or it silently stops at this boundary.
+test("parseUsageSnapshotView carries pinnedBy through, and keeps an absent one absent", () => {
+  const withPins = {
+    ...validView,
+    accounts: [{ ...validView.accounts[0], holders: ["laptop-1", "mba-m2"], pinnedBy: ["mba-m2"] }],
+  }
+  expect(parseUsageSnapshotView(withPins)?.accounts[0].pinnedBy).toEqual(["mba-m2"])
+
+  // A master predating pins sends none, which is not "nobody pinned it" — the panel and the page both
+  // render the two the same way, but only one of them is a fact this master computed.
+  const parsed = parseUsageSnapshotView(validView)
+  expect(parsed?.accounts[0].pinnedBy).toBeUndefined()
+  expect(parsed?.accounts[0]).not.toHaveProperty("pinnedBy")
+})
+
+test("parseUsageSnapshotView rejects a malformed pinnedBy", () => {
+  for (const pinnedBy of ["laptop-1", 42, [1, 2], ["ok", 7], {}]) {
+    const bad = { ...validView, accounts: [{ ...validView.accounts[0], pinnedBy }] }
+    expect(parseUsageSnapshotView(bad)).toBeUndefined()
+  }
+  const empty = { ...validView, accounts: [{ ...validView.accounts[0], pinnedBy: [] }] }
+  expect(parseUsageSnapshotView(empty)?.accounts[0].pinnedBy).toEqual([])
+})
+
 // Same strictness as `windows`: a half-readable roster rendered as if complete would understate who
 // is on that account, and holder count is now a selection input, not decoration.
 test("parseUsageSnapshotView rejects a malformed holders", () => {
