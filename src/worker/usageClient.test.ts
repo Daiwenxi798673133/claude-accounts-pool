@@ -40,6 +40,33 @@ test("parseUsageSnapshotView accepts a well-formed snapshot", () => {
   expect(parsed?.accounts[0].windows[1].resetsAt).toBeUndefined()
 })
 
+// THE FORWARD-COMPATIBILITY GATE, and the reason a holder-tracking master can be rolled out while
+// every worker still runs the old build. This parser IS what is deployed on those workers: it picks
+// the fields it knows and constructs from them, so a field added to the payload later is dropped
+// rather than treated as schema-invalid — and schema-invalid is not a soft failure here, it takes the
+// whole snapshot down to a "无法识别的响应" toast and leaves the panel with nothing to draw.
+//
+// `holders` is the field that made this concrete, but the assertion is deliberately written against
+// an arbitrary unknown key as well: what must hold is the RULE, not this one field's luck.
+test("parseUsageSnapshotView tolerates fields a newer master added, dropping them", () => {
+  const fromNewerMaster = {
+    ...validView,
+    accounts: [{ ...validView.accounts[0], holders: ["laptop-1", "mba-m2"], somethingNotInventedYet: 42 }],
+  }
+
+  const parsed = parseUsageSnapshotView(fromNewerMaster)
+
+  expect(parsed).toBeDefined()
+  expect(parsed?.accounts.length).toBe(1)
+  // Dropped, NOT carried through: this parser has no rule for the field, and passing an unvalidated
+  // value into a view the dialog trusts is the one thing parse-don't-validate exists to prevent.
+  expect(parsed?.accounts[0].holders).toBeUndefined()
+  expect((parsed?.accounts[0] as Record<string, unknown>).somethingNotInventedYet).toBeUndefined()
+  // The fields it DOES know still land, so tolerating the unknown one cost nothing.
+  expect(parsed?.accounts[0].idPrefix).toBe("eaaa1a79")
+  expect(parsed?.accounts[0].windows[0].utilization).toBe(32)
+})
+
 test("parseUsageSnapshotView rejects a null or mistyped envelope", () => {
   expect(parseUsageSnapshotView(null)).toBeUndefined()
   expect(parseUsageSnapshotView({ at: "x", stale: false, accounts: [] })).toBeUndefined()

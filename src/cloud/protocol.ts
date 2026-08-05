@@ -251,6 +251,15 @@ export type UsageAccountView = {
   // The stored token's own expiry — the instant the master must have refreshed by. Absent for a
   // record that has never carried one.
   expiresAt?: number
+  // The workers the master last served this account to, whose leases have not yet lapsed. Self-declared
+  // labels (nothing authenticates a workerId), so two machines configured with the same one collapse
+  // into a single entry — the count is of LEASES OUTSTANDING, not of machines proven distinct.
+  //
+  // OPTIONAL because a master predating this field does not send it, and the worker's /usage panel
+  // parses this payload: a required field would make every pre-upgrade master's answer schema-invalid.
+  // An account nobody holds carries an EMPTY array, never an absent one — absent means "this master
+  // does not track holders at all", which is a different fact from "nobody is holding it".
+  holders?: string[]
 }
 
 export type UsageSnapshotView = {

@@ -388,3 +388,94 @@ test("a named pick moves the rotation cursor but creates no affinity", () => {
   expect(scheduler.pickPreferred({ accounts, prefix: "b" })).toEqual({ ok: true, account: accounts[1] })
   expect(scheduler.pickAccount({ accounts })?.id).toBe("a")
 })
+
+test("an account someone holds loses to a free one, even when the free one is fuller", () => {
+  const at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+  const accounts = [account("a"), account("b")]
+  // `a` is far emptier, so the OLD ranking answers `a` every time. That is the distinguishing fixture:
+  // holder count must outrank utilization, or this case cannot tell the two policies apart.
+  scheduler.setUsageCache([
+    { id: "a", usage: usage(5) },
+    { id: "b", usage: usage(80) },
+  ])
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("a")
+
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
+
+  expect(scheduler.pickAccount({ accounts, workerId: "w2" })?.id).toBe("b")
+  // …while the holder itself renews back onto `a`: its own lease is discounted, so from w1's view `a`
+  // is still unheld and still the emptiest. Without that discount a renewal would bounce w1 off a
+  // perfectly good account every cycle.
+  expect(scheduler.pickAccount({ accounts, workerId: "w1" })?.id).toBe("a")
+})
+
+test("holders are ranked fewest-first, and a lapsed lease stops counting", () => {
+  let at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+  const accounts = [account("a"), account("b"), account("c")]
+  // Flat usage on purpose: with every score equal, holder count is the ONLY thing that can order these.
+  scheduler.setUsageCache([
+    { id: "a", usage: usage(50) },
+    { id: "b", usage: usage(50) },
+    { id: "c", usage: usage(50) },
+  ])
+
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w2", accountId: "a", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w3", accountId: "b", expiresAt: at + 60_000 })
+
+  expect(scheduler.holdersOf("a")).toEqual(["w1", "w2"])
+  expect(scheduler.holdersOf("c")).toEqual([])
+
+  expect(scheduler.pickAccount({ accounts, workerId: "w4" })?.id).toBe("c")
+  scheduler.recordLease({ workerId: "w4", accountId: "c", expiresAt: at + 60_000 })
+  expect(scheduler.pickAccount({ accounts, workerId: "w5" })?.id).toBe("b")
+
+  // Past every expiry the book is empty again — swept on read, so nothing had to fire a timer. A
+  // worker that vanished without a word therefore stops shrinking the pool on its own.
+  at += 60_001
+  expect(scheduler.holdersOf("a")).toEqual([])
+  expect(scheduler.pickAccount({ accounts, workerId: "w5" })?.id).toBe("a")
+})
+
+test("re-leasing moves a worker rather than adding a second hold", () => {
+  const at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w1", accountId: "b", expiresAt: at + 60_000 })
+
+  // The wire has no release verb, and does not need one: a worker writes its lease into ONE auth.json
+  // slot, so booking the new account IS releasing the old.
+  expect(scheduler.holdersOf("a")).toEqual([])
+  expect(scheduler.holdersOf("b")).toEqual(["w1"])
+})
+
+test("holder count still orders the pick when there is no usage data to rank by", () => {
+  const at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+  const accounts = [account("a"), account("b")]
+
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
+
+  // No snapshot at all, so ranking is unavailable and selection is round-robin — but the narrowing
+  // happens BEFORE that fallback, so rotation runs inside the least-held tier and cannot wander back
+  // onto the held account. Reversing those two steps would leave this case answering `a`.
+  expect(scheduler.pickAccount({ accounts, workerId: "w2" })?.id).toBe("b")
+  expect(scheduler.pickAccount({ accounts, workerId: "w2" })?.id).toBe("b")
+})
+
+test("a cooling account is still excluded outright, never merely demoted below held ones", () => {
+  const at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+  const accounts = [account("a"), account("b")]
+
+  // `b` cools, `a` is held by two workers. Ordering alone would put the cooling account first — it has
+  // no holders — so this pins that cooling remains a FILTER applied before any of that.
+  scheduler.reportRateLimit("b", at + 60_000)
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000 })
+  scheduler.recordLease({ workerId: "w2", accountId: "a", expiresAt: at + 60_000 })
+
+  expect(scheduler.pickAccount({ accounts, workerId: "w3" })?.id).toBe("a")
+})

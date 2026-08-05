@@ -19,6 +19,12 @@ import type { UsageResponse } from "../usage.ts"
 // chose maximum throughput (usage-based rotation) over prompt-cache locality. Do not add one.
 // pickPreferred is NOT an exception to that: it answers ONE request naming ONE account and remembers
 // nothing about who asked, so the very next renewal ranks by usage like every other pick.
+//
+// The lease book below is NOT the affinity that paragraph forbids — it is its OPPOSITE. It remembers
+// who holds what in order to push the next lease AWAY from an account already in use, so two workers
+// stop racing to the same "emptiest" account and burning one subscription window at double rate while
+// the rest of the pool idles. Affinity would pull a worker BACK to the account it left; this pushes
+// every worker apart. Do not let it grow into the former.
 
 const COOLDOWN_KV_KEY = "claude-accounts-usage.master.cooldown"
 
@@ -57,6 +63,10 @@ export type PickInput = {
   // The account the caller is leaving (the worker's current lease), excluded from this pick and
   // used as the rotation anchor. NOT an affinity record — nothing here remembers the worker.
   exclude?: string
+  // Whose request this is, so the holder count can DISCOUNT this worker's own outstanding lease.
+  // Without it a routine renewal reads its own hold as contention and demotes the account it already
+  // has, moving the worker off a perfectly good account roughly every four hours for no reason.
+  workerId?: string
 }
 
 // What the operator's named account resolved to. A union rather than `StoredAccount | undefined`
@@ -76,6 +86,11 @@ export type Scheduler = {
   setUsageCache: (entries: UsageSnapshotEntry[]) => void
   isCoolingDown: (accountId: string) => boolean
   getUsageSnapshot: () => UsageSnapshot
+  // Called once per lease actually SERVED, never on one merely picked: a pick that then fails to mint
+  // a token leaves the worker holding whatever it had, and booking that account would make the pool
+  // steer around a hold nobody has.
+  recordLease: (input: { workerId: string; accountId: string; expiresAt: number }) => void
+  holdersOf: (accountId: string) => string[]
 }
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
@@ -88,6 +103,17 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // deadline clamps to ~1ms and fires a FALSE recovery. Mirrors autoswitch's cooldownPending.
   const cooldownPending = new Set<string>()
   const recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  // WHO HOLDS WHAT, keyed by worker rather than by account. That direction is the whole design: a
+  // worker writes its lease into ONE auth.json slot and so can hold exactly one account, which makes
+  // a re-lease overwrite the previous entry and release the old account for free — no release verb on
+  // the wire, and nothing for a worker that dies mid-switch to leak.
+  //
+  // NOT PERSISTED, deliberately, unlike the cooldown book: a restarted master has not served any of
+  // these leases and cannot renew them, whereas the tokens themselves keep working until their own
+  // expiry. Restoring the book would make the pool steer around holds it can no longer observe; an
+  // empty one merely under-counts for at most one renewal cycle, after which every live worker has
+  // re-registered itself by asking.
+  const leases = new Map<string, { accountId: string; expiresAt: number }>()
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   // Rotation cursor for the no-usage-data path. An id, not an index, so it stays meaningful when
   // the caller's account list changes shape between picks.
@@ -152,6 +178,41 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     return until !== undefined && until > now()
   }
 
+  // Swept on read rather than by a timer, exactly as the usage poller's own cooldown map: the book is
+  // consulted nowhere else, and dropping the lapsed entry here keeps it from growing without bound
+  // over a master that runs for weeks. An expired lease is not a hold — that token is already dead by
+  // INV-CLOUD-4, and whoever held it will book its replacement by asking.
+  function activeHolders(accountId: string, at: number, ignoreWorkerId?: string): string[] {
+    const holders: string[] = []
+    for (const [workerId, hold] of leases) {
+      if (hold.expiresAt <= at) {
+        leases.delete(workerId)
+        continue
+      }
+      if (hold.accountId !== accountId || workerId === ignoreWorkerId) continue
+      holders.push(workerId)
+    }
+    return holders
+  }
+
+  // Fewest CURRENT holders wins outright, ranked ABOVE utilization rather than blended with it. So an
+  // account nobody holds beats an emptier one somebody is already on, and that ordering is the point:
+  // two workers sharing an account burn a single five-hour window at double rate while the rest of the
+  // pool idles, which costs the pool far more capacity than a few points of utilization ever does.
+  //
+  // A narrowing pass, deliberately NOT a term in `score`: holder count and utilization share no unit,
+  // so any weighted sum of them would re-order silently as one side's scale drifted.
+  function fewestHolders(candidates: StoredAccount[], at: number, workerId?: string): StoredAccount[] {
+    const counts = new Map<string, number>()
+    let fewest = Number.POSITIVE_INFINITY
+    for (const account of candidates) {
+      const count = activeHolders(account.id, at, workerId).length
+      counts.set(account.id, count)
+      if (count < fewest) fewest = count
+    }
+    return candidates.filter((account) => counts.get(account.id) === fewest)
+  }
+
   // Pinned to the anthropic normalizer, matching the anthropic-only pool in pickAccount. `undefined`
   // scores +Infinity — the honest unknown, which sorts last rather than being guessed at.
   function score(id: string): number {
@@ -206,7 +267,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       (account) => account.id !== input.exclude && !isCoolingDown(account.id) && !account.excluded && !account.needsReauth,
     )
     if (candidates.length === 0) return undefined
-    const picked = rankByUsage(candidates, at) ?? roundRobin(pool, candidates, input.exclude)
+    // Narrowed by holder count FIRST, then ranked within that tier by the existing rules. Applying the
+    // narrowing before rankByUsage rather than after is what makes it hold even with no usage data at
+    // all: holder count is always known, so the round-robin fallback rotates within the least-held
+    // tier instead of across the whole pool.
+    const leastHeld = fewestHolders(candidates, at, input.workerId)
+    const picked = rankByUsage(leastHeld, at) ?? roundRobin(pool, leastHeld, input.exclude)
     lastPickedId = picked.id
     return picked
   }
@@ -291,5 +357,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     setUsageCache,
     isCoolingDown,
     getUsageSnapshot,
+    recordLease: (input) => void leases.set(input.workerId, { accountId: input.accountId, expiresAt: input.expiresAt }),
+    holdersOf: (accountId: string) => activeHolders(accountId, now()),
   }
 }
