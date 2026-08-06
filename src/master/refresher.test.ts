@@ -205,6 +205,57 @@ test("retries a transient 5xx and returns the eventual success", async () => {
   expect(tokenPosts(deps).length).toBe(2)
 })
 
+// ---- ACCEPTANCE CRITERION (issue #56): a transport fault is only retried when the POST never left
+// Every case below asserts the POST COUNT, because a second POST here is the whole bug: it re-sends
+// a tip Anthropic may have already consumed and rotated, earns invalid_grant, and gets the account
+// branded needs-reauth — irreversibly, since Anthropic does not reissue the lost refresh token.
+// The three shapes are the ones this Bun runtime actually produces, verified against it.
+const transportFail = (cause: unknown) => (): never => {
+  throw cause
+}
+const timeoutAbort = (): DOMException => new DOMException("The operation timed out.", "TimeoutError")
+const connectionRefused = (): Error => Object.assign(new Error("Unable to connect."), { code: "ConnectionRefused" })
+const socketReset = (): Error => Object.assign(new Error("The socket connection was closed unexpectedly."), { code: "ECONNRESET" })
+
+test("never retries a NETWORK_TIMEOUT_MS abort — the request was already on the wire", async () => {
+  const deps = makeDeps({ accounts: { A: stale("A") }, reply: transportFail(timeoutAbort()), now: () => NOW })
+
+  await expect(createRefresher(deps).getFreshAccess("A")).rejects.toThrow()
+
+  // The timeout fired AFTER the request was sent, so the tip's fate is unknown rather than unspent.
+  // The account keeps its old access token until the next keeper tick — far cheaper than gambling it.
+  expect(tokenPosts(deps).length).toBe(1)
+  expect(deps.persisted.length).toBe(0)
+  // Crucially NOT flagged: a timeout is not a verdict on the chain, and flagging is irreversible.
+  expect(deps.revoked.length).toBe(0)
+})
+
+test("never retries a mid-flight socket reset — the request was already on the wire", async () => {
+  const deps = makeDeps({ accounts: { A: stale("A") }, reply: transportFail(socketReset()), now: () => NOW })
+
+  await expect(createRefresher(deps).getFreshAccess("A")).rejects.toThrow()
+
+  // ECONNRESET means the connection died after the POST went out, so it carries exactly the timeout's
+  // risk. A gate that only excluded TimeoutError would still gamble the account here.
+  expect(tokenPosts(deps).length).toBe(1)
+  expect(deps.persisted.length).toBe(0)
+})
+
+test("still retries a refused connection — that POST provably never left the machine", async () => {
+  const deps = makeDeps({
+    accounts: { A: stale("A") },
+    reply: (attempt) => (attempt === 1 ? transportFail(connectionRefused())() : jsonRes(OK)),
+    now: () => NOW,
+  })
+
+  const out = await createRefresher(deps).getFreshAccess("A")
+
+  // The narrowing must not cost the retries that were always safe: nothing reached Anthropic, so the
+  // stored tip is untouched. Bun reports DNS failure with this same code, so both classes ride here.
+  expect(out.access).toBe("fresh-A")
+  expect(tokenPosts(deps).length).toBe(2)
+})
+
 test("never retries a 429 — the token endpoint rate-limits by IP", async () => {
   const deps = makeDeps({
     accounts: { A: stale("A") },

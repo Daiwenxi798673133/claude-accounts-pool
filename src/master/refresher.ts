@@ -52,9 +52,9 @@ export type FreshAccess = { access: string; expiresAt: number }
 // a cached token that is a second away from the rotation threshold.
 export type Refresher = { getFreshAccess(accountId: string, minHorizonMs?: number): Promise<FreshAccess> }
 
-// 1 initial attempt + 2 retries, and ONLY for the two failure classes that leave the stored tip
-// unspent (5xx / transport). Fixed delay rather than exponential: the ceiling here is one keeper
-// tick, not an outage-riding budget, and jitter would make the retry count untestable.
+// 1 initial attempt + 2 retries, and ONLY for the failure classes that leave the stored tip unspent
+// (5xx / a POST that never left the machine). Fixed delay rather than exponential: the ceiling here
+// is one keeper tick, not an outage-riding budget, and jitter would make the retry count untestable.
 const MAX_ATTEMPTS = 3
 const RETRY_DELAY_MS = 200
 
@@ -86,13 +86,22 @@ class RefreshHttpError extends Error {
   }
 }
 
-// Transport-level fault (DNS/TCP/TLS, or the NETWORK_TIMEOUT_MS abort): the endpoint may never
-// have seen the request, so this is the one class where the stored tip is very likely unspent.
+// Transport-level fault: no HTTP status came back, so whether the endpoint saw the request is a
+// question only the underlying cause can answer — see requestNeverLeft.
 class RefreshNetworkError extends Error {
   constructor(cause: unknown) {
     super("token refresh transport failure", { cause })
     this.name = "RefreshNetworkError"
   }
+}
+
+// The ONLY transport faults that prove the POST never reached the wire, so the stored tip is
+// certainly unspent. Bun reports DNS failure and TCP refusal alike as `ConnectionRefused` (both
+// verified against this runtime); a timeout abort surfaces as DOMException `TimeoutError` and a
+// mid-flight drop as `ECONNRESET`, and in BOTH of those the request was already sent — Anthropic
+// may have consumed the tip and rotated the chain while the response never made it home.
+function requestNeverLeft(cause: unknown): boolean {
+  return (cause as { code?: unknown } | null | undefined)?.code === "ConnectionRefused"
 }
 
 function isInvalidGrant(body: string): boolean {
@@ -110,7 +119,8 @@ function isInvalidGrant(body: string): boolean {
 // endpoint rate-limits by IP, so a retry deepens the block for every account behind it.
 function isRetryable(error: unknown): boolean {
   if (error instanceof RefreshHttpError) return error.status >= 500
-  return error instanceof RefreshNetworkError
+  if (error instanceof RefreshNetworkError) return requestNeverLeft(error.cause)
+  return false
 }
 
 export function createRefresher(deps: RefresherDeps): Refresher {
@@ -148,7 +158,10 @@ export function createRefresher(deps: RefresherDeps): Refresher {
         signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
       })
     } catch (cause) {
-      log.warn("master-refresher:refresh-transport-fail", { accountId })
+      // Logged because it is what decides the retry, and reading it off a bare line meant timing the
+      // gap between two of them.
+      const { name, code } = (cause ?? {}) as { name?: unknown; code?: unknown }
+      log.warn("master-refresher:refresh-transport-fail", { accountId, errName: name, errCode: code })
       throw new RefreshNetworkError(cause)
     }
 
