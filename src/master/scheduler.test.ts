@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
 import { MASTER_USAGE_POLL_INTERVAL_MS } from "../constants.ts"
 import type { UsageResponse } from "../usage.ts"
-import { createScheduler, type SchedulerDeps } from "./scheduler.ts"
+import { createScheduler, RATELIMIT_ADOPTION_GRACE_MS, type SchedulerDeps } from "./scheduler.ts"
 
 const COOLDOWN_KEY = "claude-accounts-usage.master.cooldown"
 
@@ -551,4 +551,56 @@ test("re-leasing the same account overwrites its pin flag in both directions", (
   const later = createScheduler({ kv: makeKv().kv, now: () => at + 60_001 })
   later.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: true })
   expect(later.pinnersOf("a")).toEqual([])
+})
+
+// Regression for #59. The incident: four OpenCode processes on one machine share a workerId and a
+// single auth.json, so one exhausted account raised a 429 in three sessions at once; each blamed
+// whichever account a sibling had adopted in the seconds since, and two healthy accounts were cooled.
+test("a rate-limit report about an account this worker only just adopted is discarded as misattributed", () => {
+  let at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+
+  // Given: w1 moves onto `a`
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
+
+  // When: a report about `a` lands inside the grace window
+  at += RATELIMIT_ADOPTION_GRACE_MS - 1
+  scheduler.reportRateLimit("a", undefined, "w1")
+
+  // Then: nothing cooled — `a` cannot have been spent by a worker that has held it for seconds.
+  expect(scheduler.isCoolingDown("a")).toBe(false)
+  expect(scheduler.justAdopted("w1", "a")).toBe(true)
+
+  // And: a report from a DIFFERENT worker is believed — the guard is about who moved, not the account.
+  scheduler.reportRateLimit("a", undefined, "w2")
+  expect(scheduler.isCoolingDown("a")).toBe(true)
+})
+
+// The loop-termination half, and the reason `adoptedAt` survives a re-serve: an account that really
+// IS spent gets handed straight back once (leaseServer skips the rotation whose report it discarded),
+// and if that re-serve restamped the clock the next report would be discarded too — forever.
+test("re-serving the same account does not restamp adoption, so a genuinely spent account is believed on the retry", () => {
+  let at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 600_000, pinned: false })
+  at += RATELIMIT_ADOPTION_GRACE_MS - 1
+  scheduler.reportRateLimit("a", undefined, "w1")
+  // The re-serve leaseServer performs after discarding that report.
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 600_000, pinned: false })
+
+  at += 2
+  expect(scheduler.justAdopted("w1", "a")).toBe(false)
+  scheduler.reportRateLimit("a", undefined, "w1")
+  expect(scheduler.isCoolingDown("a")).toBe(true)
+})
+
+test("an expired lease adopts nothing: its token is dead, so whatever the worker hit was not this account", () => {
+  let at = 5_000_000
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => at })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 1_000, pinned: false })
+  at += 1_001
+  expect(scheduler.justAdopted("w1", "a")).toBe(false)
+  scheduler.reportRateLimit("a", undefined, "w1")
+  expect(scheduler.isCoolingDown("a")).toBe(true)
 })

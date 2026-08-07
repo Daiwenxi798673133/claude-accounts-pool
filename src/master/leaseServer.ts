@@ -55,7 +55,8 @@ export type LeaseServerDeps = {
     // Selection for a lease that NAMES its account, kept a separate verb from pickAccount so the
     // ranked path cannot accidentally inherit "excluded is servable" and vice versa.
     pickPreferred(input: PreferredInput): PreferredPick
-    reportRateLimit(accountId: string, resetsAt?: number): void
+    reportRateLimit(accountId: string, resetsAt?: number, workerId?: string): void
+    justAdopted(workerId: string, accountId: string): boolean
     // The two READ-ONLY halves of the dashboard's payload. Required, not optional: a master serving
     // leases without a usage view would answer the dashboard route with an empty page and look like
     // a pool with no accounts.
@@ -300,6 +301,28 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // the routine renewal path with nothing to avoid — handing back the same account is the
     // expected answer there, and excluding it would rotate the pool for no reason.
     const exclude = request.reason === "ratelimit" ? request.currentAccountId : undefined
+    // UNLESS the worker only just moved onto that account, in which case handleRateLimit has already
+    // discarded the report that preceded this request as misattributed (scheduler.justAdopted), and
+    // rotating would act on the very claim we refused to believe.
+    //
+    // SERVED BACK BY NAME, not merely spared the exclusion — MEASURED: dropping `exclude` alone still
+    // rotates, because the ranked path falls through to round-robin whose cursor has already moved
+    // past this account. Handing it back explicitly is what stops one exhausted account from walking
+    // a machine's sessions down the whole roster: each sibling session would otherwise still move on,
+    // and the next one would blame the account THIS one just adopted. `adoptedAt` does not advance on
+    // a re-serve, so an account that really is spent reports again outside the window and rotates
+    // then — one wasted retry, not a loop.
+    //
+    // Still subject to the two refusals that make an account UNSERVABLE: someone else's report may
+    // have cooled it in the meantime, and a broken refresh chain cannot mint. Either falls through to
+    // the ordinary rotation, which is the correct answer once staying put is no longer possible.
+    if (exclude !== undefined && deps.scheduler.justAdopted(workerId, exclude)) {
+      const stay = accounts.find((entry) => entry.id === exclude)
+      if (stay && stay.needsReauth !== true && !deps.scheduler.isCoolingDown(stay.id)) {
+        log.info("master:lease-ratelimit-misattributed", { workerId, accountId: stay.id })
+        return serveLease(workerId, stay, false)
+      }
+    }
     const account = deps.scheduler.pickAccount({ accounts, exclude, workerId })
     if (!account) {
       // 503, kept DISTINCT from the 401 above: both refuse, but the worker acts on them
@@ -368,7 +391,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     const report = parseRateLimitReport(await readJson(req))
     if (!report) return badRequest("malformed ratelimit report")
     const { workerId } = report
-    deps.scheduler.reportRateLimit(report.accountId, report.resetsAt)
+    deps.scheduler.reportRateLimit(report.accountId, report.resetsAt, workerId)
     // Header KEYS only, via redactHeaders: the worker forwards the limit response's headers
     // verbatim, and echoing values into a shared log file is how a credential-bearing header
     // ends up on disk.

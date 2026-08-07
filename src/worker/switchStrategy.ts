@@ -68,8 +68,10 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
   return {
     async onLimit(ctx: SwitchContext): Promise<boolean> {
       // THE PIN'S END CONDITION, and the only automatic one: `p` promises to hold an account until its
-      // quota is spent, and this event IS that quota being spent. Cleared BEFORE the report and the
-      // lease below, so neither can name the account we are leaving.
+      // quota is spent, and this event is USUALLY that quota being spent — usually, because only the
+      // master can tell a real exhaustion from a sibling session's failure misattributed to us, and it
+      // says so by handing the same account back. Cleared BEFORE the report and the lease below, so
+      // neither can name the account we are leaving, and restored after the master has ruled.
       //
       // UNCONDITIONAL, not "only if the pin names ctx.accountId". A worker holds exactly one account,
       // so the two agree in every reachable state; and if they ever disagreed, keeping the pin would be
@@ -77,9 +79,10 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
       // willing to hand the spent account straight back, and a pin naming it would ask for exactly
       // that, forever.
       // Guarded, not unconditional: `set` reaches a persisted store, and the overwhelmingly common
-      // rate limit is one with no pin in play at all.
-      const hadPin = deps.pin.get() !== undefined
-      if (hadPin) deps.pin.set(undefined)
+      // rate limit is one with no pin in play at all. The value is kept rather than a bare boolean
+      // because the master may yet answer that we are not leaving at all — see below.
+      const previousPin = deps.pin.get()
+      if (previousPin !== undefined) deps.pin.set(undefined)
       // FIRST, and awaited: the master must know this account is spent BEFORE it answers the lease
       // below, or it may hand the very same account straight back. The report is best-effort BY
       // CONTRACT (leaseClient never retries and never throws across that boundary, it answers a
@@ -104,13 +107,23 @@ export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {
       }
 
       await deps.writeLease({ access: lease.access, expires: lease.expiresAt, accountId: lease.accountId })
+      // THE SAME ACCOUNT BACK IS THE MASTER'S VERDICT, not a coincidence: a `ratelimit` lease
+      // excludes the account it names, so the only way to be handed it again is the master judging
+      // this report misattributed — a failure that predates our move onto it, raised by a sibling
+      // session or process sharing this machine's auth.json. Nothing was spent, so the pin was not
+      // spent either, and the clear above is undone rather than left as a silent policy change.
+      const stayed = lease.accountId === ctx.accountId
+      if (stayed && previousPin !== undefined) deps.pin.set(previousPin)
+      const unpinned = previousPin !== undefined && !stayed
       // Never the access token itself — it is a live credential.
-      log.info("switch:leased", { from: ctx.accountId, to: lease.accountId, expiresAt: lease.expiresAt, unpinned: hadPin })
+      log.info("switch:leased", { from: ctx.accountId, to: lease.accountId, expiresAt: lease.expiresAt, unpinned, stayed })
       deps.toast({
         variant: "warning",
-        message: hadPin
-          ? `钉住的账号额度已用满，已解除钉住并切到云端账号「${lease.accountId}」并自动重试`
-          : `当前账号额度已满，已切到云端账号「${lease.accountId}」并自动重试`,
+        message: stayed
+          ? "本次额度报警被云端判定为误报（本机另一个会话刚切过号），已就地续用当前账号并自动重试"
+          : unpinned
+            ? `钉住的账号额度已用满，已解除钉住并切到云端账号「${lease.accountId}」并自动重试`
+            : `当前账号额度已满，已切到云端账号「${lease.accountId}」并自动重试`,
       })
       return true
     },
