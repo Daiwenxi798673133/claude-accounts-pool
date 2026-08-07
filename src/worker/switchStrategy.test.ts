@@ -300,3 +300,32 @@ test("a rate limit spends the pin: it is cleared, said out loud, and never named
   expect(toasts.some((toast) => toast.message.includes("解除钉住"))).toBe(true)
   controller.dispose()
 })
+
+// Regression for #59. The master answers a MISATTRIBUTED rate limit by handing the same account
+// back — a `ratelimit` lease excludes the account it names, so that answer is only reachable when
+// the master judged the report to be a sibling session's failure blamed on us. Nothing was spent,
+// so the pin must not be either.
+test("a rate limit the master judged misattributed gives the pin back", async () => {
+  // Given: this worker pinned the account it holds, and the master returns THAT SAME account
+  const expiresAt = Date.now() + 3_600_000
+  const { controller, effects, toasts, fireLimit, pinOf } = setup(
+    { ok: true, lease: { accountId: SPENT_ID, access: LEASE_ACCESS, expiresAt } },
+    "acct-spe",
+  )
+
+  fireLimit()
+  await flush(() => effects.some((effect) => effect.kind === "resume"))
+
+  // Then: the pin is back where the operator put it. Still cleared first — the report below it must
+  // never be able to name a pinned account — but restored once the master has ruled.
+  expect(pinOf()).toBe("acct-spe")
+  expect(effects.filter((effect) => effect.kind === "pin-set")).toEqual([
+    { kind: "pin-set", idPrefix: undefined },
+    { kind: "pin-set", idPrefix: "acct-spe" },
+  ])
+  // And the operator is told what actually happened, not that they were switched to the account they
+  // are already on — which is what the ordinary wording would have claimed here.
+  expect(toasts.some((toast) => toast.message.includes("误报"))).toBe(true)
+  expect(toasts.some((toast) => toast.message.includes("解除钉住"))).toBe(false)
+  controller.dispose()
+})

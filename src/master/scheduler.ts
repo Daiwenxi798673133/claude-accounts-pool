@@ -1,6 +1,7 @@
 import { providerOf, type StoredAccount } from "../accounts.ts"
 import type { LeaseRefusal } from "../cloud/protocol.ts"
 import { MASTER_USAGE_POLL_INTERVAL_MS } from "../constants.ts"
+import { log } from "../logger.ts"
 import { latestMaxedReset, PROVIDERS, scoreWindows } from "../providers.ts"
 import type { UsageResponse } from "../usage.ts"
 
@@ -41,6 +42,18 @@ const COOLDOWN_KV_KEY = "claude-accounts-usage.master.cooldown"
 // this age the pick falls back to round-robin. Derived from the poll interval so changing the poll
 // cadence cannot silently invalidate this window.
 const USAGE_CACHE_TTL_MS = 2 * MASTER_USAGE_POLL_INTERVAL_MS
+
+// How long after a worker MOVES to an account this master refuses to believe that worker's
+// rate-limit report about it. A worker that has held an account for seconds cannot have spent a
+// five-hour window on it — the report is a failure that predates the move, blamed on the account
+// the worker had already adopted by the time it handled the error.
+//
+// MEASURED, not guessed: one real cascade on a machine running four OpenCode processes off a single
+// shared auth.json reported three different accounts in eight seconds (gaps of 3.0s and 4.5s), and
+// cooled two healthy ones. The window has to clear the widest observed gap with room, and it can
+// afford to: the cost of an over-long window is at most ONE wasted retry on an account that really
+// was spent, while the cost of an under-short one is a healthy account pulled out of the pool.
+export const RATELIMIT_ADOPTION_GRACE_MS = 15_000
 
 export type SchedulerDeps = {
   kv: { get: <V>(key: string, fallback?: V) => V; set: (key: string, value: unknown) => void }
@@ -89,7 +102,10 @@ export type PreferredInput = {
 export type Scheduler = {
   pickAccount: (input: PickInput) => StoredAccount | undefined
   pickPreferred: (input: PreferredInput) => PreferredPick
-  reportRateLimit: (accountId: string, resetsAt?: number) => void
+  // `workerId` names who is reporting, so a report about an account that worker adopted seconds ago
+  // can be discarded as misattributed (RATELIMIT_ADOPTION_GRACE_MS). Optional because the report is
+  // best-effort telemetry: a caller that cannot say who it is still gets its account cooled.
+  reportRateLimit: (accountId: string, resetsAt?: number, workerId?: string) => void
   setUsageCache: (entries: UsageSnapshotEntry[]) => void
   isCoolingDown: (accountId: string) => boolean
   getUsageSnapshot: () => UsageSnapshot
@@ -97,6 +113,10 @@ export type Scheduler = {
   // a token leaves the worker holding whatever it had, and booking that account would make the pool
   // steer around a hold nobody has.
   recordLease: (input: { workerId: string; accountId: string; expiresAt: number; pinned: boolean }) => void
+  // Did this worker MOVE to this account within RATELIMIT_ADOPTION_GRACE_MS? Exposed so the lease
+  // route can spare a `ratelimit` request the pointless rotation whose report it is already about
+  // to discard — one judgement, both decisions, so the two can never disagree.
+  justAdopted: (workerId: string, accountId: string) => boolean
   holdersOf: (accountId: string) => string[]
   // The subset of holdersOf that PINNED this account. A subset by construction — the flag lives on the
   // lease record — which is the invariant both renderers of UsageAccountView.pinnedBy rely on.
@@ -123,7 +143,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // expiry. Restoring the book would make the pool steer around holds it can no longer observe; an
   // empty one merely under-counts for at most one renewal cycle, after which every live worker has
   // re-registered itself by asking.
-  const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean }>()
+  //
+  // `adoptedAt` is when this worker MOVED here, NOT when it last re-leased: a renewal or a re-serve
+  // of the same account leaves it untouched. That distinction is what keeps the misattribution guard
+  // from looping — a worker whose account really IS spent gets it handed straight back once, and the
+  // second report lands outside the grace window and is believed.
+  const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean; adoptedAt: number }>()
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   // Rotation cursor for the no-usage-data path. An id, not an index, so it stays meaningful when
   // the caller's account list changes shape between picks.
@@ -203,6 +228,22 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       held.push({ workerId, pinned: hold.pinned })
     }
     return held
+  }
+
+  // THE MISATTRIBUTION GUARD. A worker reports a rate limit against whatever account it believes it
+  // holds, and that belief is a shared on-disk record every session and every OpenCode process on
+  // that machine rewrites — so a failure raised on account A can arrive blaming account B, the one a
+  // sibling adopted in the seconds between the failure and its handling. This master is the only
+  // party that knows when each worker actually moved, so it is the only one that can tell the two
+  // apart, which is why the check lives here and not on the worker.
+  //
+  // An EXPIRED lease answers false: the token is dead by INV-CLOUD-4, so whatever the worker just
+  // hit, it was not this book's account.
+  function justAdopted(workerId: string, accountId: string): boolean {
+    const held = leases.get(workerId)
+    if (!held || held.accountId !== accountId) return false
+    const at = now()
+    return held.expiresAt > at && at - held.adoptedAt < RATELIMIT_ADOPTION_GRACE_MS
   }
 
   function activeHolders(accountId: string, at: number, ignoreWorkerId?: string): string[] {
@@ -383,12 +424,27 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   return {
     pickAccount,
     pickPreferred,
-    reportRateLimit: (accountId: string, resetsAt?: number) => markCooldown(accountId, resetsAt),
+    reportRateLimit: (accountId: string, resetsAt?: number, workerId?: string) => {
+      if (workerId !== undefined && justAdopted(workerId, accountId)) {
+        log.info("master:ratelimit-misattributed", { workerId, accountId })
+        return
+      }
+      markCooldown(accountId, resetsAt)
+    },
     setUsageCache,
     isCoolingDown,
     getUsageSnapshot,
-    recordLease: (input) =>
-      void leases.set(input.workerId, { accountId: input.accountId, expiresAt: input.expiresAt, pinned: input.pinned }),
+    recordLease: (input) => {
+      const held = leases.get(input.workerId)
+      const adoptedAt = held?.accountId === input.accountId ? held.adoptedAt : now()
+      leases.set(input.workerId, {
+        accountId: input.accountId,
+        expiresAt: input.expiresAt,
+        pinned: input.pinned,
+        adoptedAt,
+      })
+    },
+    justAdopted,
     holdersOf: (accountId: string) => activeHolders(accountId, now()),
     pinnersOf: (accountId: string) =>
       activeLeases(accountId, now())

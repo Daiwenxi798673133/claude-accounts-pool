@@ -6,6 +6,7 @@ import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, Usage
 import { createAccountOnboard } from "./accountOnboard.ts"
 import { createAccountRemove } from "./accountRemove.ts"
 import { startLeaseServer, USAGE_REFRESH_MIN_INTERVAL_MS } from "./leaseServer.ts"
+import { RATELIMIT_ADOPTION_GRACE_MS } from "./scheduler.ts"
 import type { UsageSnapshot } from "./scheduler.ts"
 
 // A REAL Bun.serve on an EPHEMERAL port, driven by REAL fetch. The deliverable here is HTTP
@@ -88,7 +89,7 @@ function startHarness(options?: {
   const refreshed: string[] = []
   const picks: Harness["picks"] = []
   const preferred: Harness["preferred"] = []
-  const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean }>()
+  const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean; adoptedAt: number }>()
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
 
@@ -151,7 +152,19 @@ function startHarness(options?: {
       // A REAL book, not a spy list: these cases assert that a refused lease books nothing, which a
       // recorder that only appends could not distinguish from one that books and never releases.
       recordLease({ workerId, accountId, expiresAt, pinned }) {
-        leases.set(workerId, { accountId, expiresAt, pinned })
+        const held = leases.get(workerId)
+        leases.set(workerId, {
+          accountId,
+          expiresAt,
+          pinned,
+          adoptedAt: held?.accountId === accountId ? held.adoptedAt : clock(),
+        })
+      },
+      // Mirrors the real rule (scheduler.test.ts owns proving it) so the HTTP cases can drive the
+      // whole misattribution route — report discarded AND rotation skipped — from the outside.
+      justAdopted: (workerId, accountId) => {
+        const held = leases.get(workerId)
+        return held?.accountId === accountId && clock() - held.adoptedAt < RATELIMIT_ADOPTION_GRACE_MS
       },
       holdersOf: (accountId) => [...leases].filter(([, hold]) => hold.accountId === accountId).map(([workerId]) => workerId),
       pinnersOf: (accountId) =>
@@ -170,7 +183,11 @@ function startHarness(options?: {
         if (cooled.has(target.id)) return { ok: false, refusal: "cooling" }
         return { ok: true, account: target }
       },
-      reportRateLimit(accountId, resetsAt) {
+      reportRateLimit(accountId, resetsAt, workerId) {
+        if (workerId !== undefined) {
+          const held = leases.get(workerId)
+          if (held?.accountId === accountId && clock() - held.adoptedAt < RATELIMIT_ADOPTION_GRACE_MS) return
+        }
         reports.push({ accountId, ...(resetsAt === undefined ? {} : { resetsAt }) })
         cooled.add(accountId)
       },
@@ -583,7 +600,10 @@ test("ratelimit report cools the account and next lease picks another", async ()
     const first = (await (await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)).json()) as LeaseResponse
     expect(first.accountId).toBe("acct-a")
 
-    // When: acct-a hits its subscription limit and the worker reports it
+    // When: the worker has held acct-a long enough to actually spend it — a report arriving within
+    // RATELIMIT_ADOPTION_GRACE_MS of the lease is the MISATTRIBUTED case and gets its own test below.
+    harness.advance(RATELIMIT_ADOPTION_GRACE_MS)
+    // And: acct-a hits its subscription limit and the worker reports it
     const report: RateLimitReport = {
       workerId: WORKER_ID,
       accountId: "acct-a",
@@ -682,6 +702,9 @@ test("one anonymous caller reaches the read route and the two that move pool sta
     // exception carved into an otherwise gated port — the port has ONE tier, and this is what
     // "the bind address is the entire access control" costs when it is written down as a test.
     const lease = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
+    // Past the misattribution window, so what this case proves is the ABSENT gate and not the guard
+    // that would have discarded a report landing in the same instant as its lease.
+    harness.advance(RATELIMIT_ADOPTION_GRACE_MS)
     const ratelimit = await post(harness.base, CLOUD_ROUTES.ratelimit, {
       workerId: WORKER_ID,
       accountId: "acct-live",
@@ -1465,6 +1488,53 @@ test("a pinned lease reaches the dashboard as pinnedBy, and an un-pin removes it
     const unpinnedRow = await rowOf()
     expect(unpinnedRow?.holders).toEqual(["laptop-1"])
     expect(unpinnedRow?.pinnedBy).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+// Regression for #59, at the level the incident actually happened: three sessions of one machine —
+// same workerId, one shared auth.json, therefore one shared token — each hit the wall on `acct-a`
+// within seconds, but each read its "current account" from a record a sibling had already rewritten.
+// Unguarded, that walked the worker down the whole roster and cooled two healthy accounts.
+test("a machine's sibling sessions cannot cascade one exhausted account into the whole roster", async () => {
+  const harness = startHarness({ accounts: [account("acct-a"), account("acct-b"), account("acct-c")] })
+  try {
+    // Given: the worker has been on acct-a long enough to spend it
+    const first = (await (await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)).json()) as LeaseResponse
+    expect(first.accountId).toBe("acct-a")
+    harness.advance(RATELIMIT_ADOPTION_GRACE_MS)
+
+    // When: session 1 reports the real exhaustion and is moved off
+    await post(harness.base, CLOUD_ROUTES.ratelimit, { workerId: WORKER_ID, accountId: "acct-a", headers: {} } satisfies RateLimitReport)
+    const second = (await (
+      await post(harness.base, CLOUD_ROUTES.lease, { workerId: WORKER_ID, reason: "ratelimit", currentAccountId: "acct-a" } satisfies LeaseRequest)
+    ).json()) as LeaseResponse
+    expect(second.accountId).toBe("acct-b")
+
+    // And: three seconds later session 2 handles ITS copy of the same failure, by which time the
+    // shared record already names acct-b — the misattribution this guard exists to catch.
+    harness.advance(3_000)
+    const ack = await post(harness.base, CLOUD_ROUTES.ratelimit, { workerId: WORKER_ID, accountId: "acct-b", headers: {} } satisfies RateLimitReport)
+    const third = await post(
+      harness.base,
+      CLOUD_ROUTES.lease,
+      { workerId: WORKER_ID, reason: "ratelimit", currentAccountId: "acct-b" } satisfies LeaseRequest,
+    )
+
+    // Then: the report is still ACKED — it is best-effort telemetry and the worker must not retry it —
+    // but only the genuine exhaustion reached the cooldown book.
+    expect(ack.status).toBe(204)
+    expect(harness.reports).toEqual([{ accountId: "acct-a" }])
+
+    // And: no rotation either — acct-b comes straight back and acct-c, untouched by any of this, is
+    // not dragged in. Ranked selection is not consulted AT ALL, which is the assertion that would
+    // have caught the first attempt at this fix: merely dropping the exclusion still rotates, because
+    // round-robin's cursor has already moved past acct-b.
+    expect(third.status).toBe(200)
+    expect(((await third.json()) as LeaseResponse).accountId).toBe("acct-b")
+    expect(harness.book()).toEqual([[WORKER_ID, "acct-b"]])
+    expect(harness.picks.length).toBe(2)
   } finally {
     harness.stop()
   }
