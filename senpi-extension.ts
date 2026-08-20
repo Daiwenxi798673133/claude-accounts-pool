@@ -41,8 +41,9 @@
 //
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
-import { createEnvSlot } from "./src/senpi/envSlot.ts"
+import { createEnvSlot, parseSlotCount, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
+import { createSlotRoster } from "./src/senpi/slotRoster.ts"
 import { log } from "./src/logger.ts"
 import { createLeaseClient } from "./src/worker/leaseClient.ts"
 import { installLeaseKeeper } from "./src/worker/leaseKeeper.ts"
@@ -51,6 +52,8 @@ import { installLeaseKeeper } from "./src/worker/leaseKeeper.ts"
 const MASTER_URL_VAR = "CAP_MASTER_URL"
 /** This machine's stable identity in the master's lease book. Absent = not a cloud worker. */
 const WORKER_ID_VAR = "CAP_WORKER_ID"
+/** How many token slots to fill, 1..16. Absent or unreadable = 1, the single-slot behaviour. */
+const SLOTS_VAR = "CAP_SENPI_SLOTS"
 
 // Only the two verbs this entry uses, declared structurally rather than imported: senpi is not a
 // dependency of this package, and taking one on to name a single event would tie the plugin's
@@ -75,7 +78,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function install(masterUrl: string, workerId: string): Installed {
+function install(masterUrl: string, workerId: string, slots: number): Installed {
   const client = createLeaseClient({
     // The real global fetch: this is the composition root for the senpi lane, and the master lives
     // on the internal network. Tests inject their own transport.
@@ -85,28 +88,57 @@ function install(masterUrl: string, workerId: string): Installed {
     workerId,
   })
 
-  const slot = createEnvSlot({ env: process.env })
+  // ONE ROSTER FOR EVERY SLOT. Each slot below runs its own keeper — that reuse is what makes the
+  // fail-safe, the backoff, the stale-lease refusal and the dispose race come for free, and it gives
+  // every slot an independent failure counter so one dead account cannot throttle the others. The
+  // price is that K keepers install K intervals which fire at nearly the same instant, so the
+  // exclusion set and the claim have to be one section owned in a single place. See slotRoster.ts.
+  const roster = createSlotRoster()
+  const joiners: Array<() => Promise<void>> = []
 
-  const keeper = installLeaseKeeper({
-    // The RAW client, unlike src/worker/install.ts which wraps it in createPinnedLease. Pins are
-    // stored in opencode's TuiKV and surfaced through its /usage panel, neither of which exists
-    // here; senpi carries its own `pinnedAccount` setting instead.
-    // ponytail: unpinned leases only. Wire pins in when the senpi panel can express one.
-    client,
-    readAuth: slot.readAuth,
-    writeLease: slot.writeLease,
-    // ponytail: log-only. The keeper's fail-safe message is user-facing in opencode
-    // (api.ui.toast); senpi's equivalent surface is not wired yet, so a stranded worker is
-    // visible in the log bundle but not on screen. Upgrade path: pass pi.ui.notify once the
-    // structural type above is widened to include it.
-    toast: ({ variant, message }) => {
-      if (variant === "error") log.error("senpi:lease-toast", { message })
-      else log.warn("senpi:lease-toast", { message })
-    },
-    sleep,
-  })
+  for (let index = 0; index < slots; index++) {
+    const { slotName, varName } = senpiEnvSlot(index)
+    const envSlot = createEnvSlot({ env: process.env, varName })
+    const keeper = installLeaseKeeper({
+      // The RAW client wrapped in the roster's section, unlike src/worker/install.ts which wraps it
+      // in createPinnedLease. Pins are stored in opencode's TuiKV and surfaced through its /usage
+      // panel, neither of which exists here; senpi carries its own `pinnedAccount` setting instead.
+      // ponytail: unpinned leases only. Wire pins in when the senpi panel can express one.
+      client: {
+        lease: (input) =>
+          roster.withSlot(slotName, async (ctx) => {
+            const outcome = await client.lease({ ...input, excludeAccountIds: ctx.excludeAccountIds })
+            // Claimed only on success, and inside the section: a pick that failed to mint leaves this
+            // slot on whatever it had, and recording it would make every other slot steer around a
+            // hold that does not exist.
+            if (outcome.ok) ctx.claim(outcome.lease.accountId)
+            return outcome
+          }),
+      },
+      readAuth: envSlot.readAuth,
+      writeLease: envSlot.writeLease,
+      // ponytail: log-only. The keeper's fail-safe message is user-facing in opencode
+      // (api.ui.toast); senpi's equivalent surface is not wired yet, so a stranded worker is
+      // visible in the log bundle but not on screen. Upgrade path: pass pi.ui.notify once the
+      // structural type above is widened to include it.
+      toast: ({ variant, message }) => {
+        if (variant === "error") log.error("senpi:lease-toast", { slotName, message })
+        else log.warn("senpi:lease-toast", { slotName, message })
+      },
+      sleep,
+    })
+    joiners.push(createLeaseJoiner(keeper.tickOnce))
+  }
 
-  const ensureLeased = createLeaseJoiner(keeper.tickOnce)
+  // allSettled, NOT all: senpi selects among whatever slots currently carry a token, so one slot's
+  // transport fault must not fail the turn for the slots that did renew. A rejection here would also
+  // reach turn_start, where the only available response is to log — so the partial count is recorded
+  // at the one place that still knows how many slots there were.
+  const ensureLeased = async (): Promise<void> => {
+    const settled = await Promise.allSettled(joiners.map((join) => join()))
+    const failed = settled.filter((result) => result.status === "rejected").length
+    if (failed > 0) log.warn("senpi:slot-lease-partial", { failed, slots: joiners.length })
+  }
 
   // THE STARTUP LEASE, which installLeaseKeeper deliberately leaves to its caller. Nothing is
   // adopted first, unlike the opencode worker: that path inherits a previous process's auth.json
@@ -114,7 +146,7 @@ function install(masterUrl: string, workerId: string): Installed {
   // Registered through ensureLeased so the first turn JOINS this lease instead of skipping past it.
   void ensureLeased().catch((error: unknown) => log.warn("senpi:startup-lease-fail", { error: errorMessage(error) }))
 
-  log.info("senpi:lease-keeper-installed", { workerId })
+  log.info("senpi:lease-keeper-installed", { workerId, slots })
   return { ensureLeased }
 }
 
@@ -127,7 +159,7 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
 
   const registry = globalThis as Record<PropertyKey, unknown>
   const existing = registry[KEEPER_KEY] as Installed | undefined
-  const installed = existing ?? install(masterUrl, workerId)
+  const installed = existing ?? install(masterUrl, workerId, parseSlotCount(process.env[SLOTS_VAR]))
   registry[KEEPER_KEY] = installed
 
   // AWAITED, NOT FIRE-AND-FORGET — this is the whole reason the lane works. managedPool() reads
