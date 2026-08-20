@@ -38,7 +38,7 @@ type Harness = {
   abort: () => void
   reports: Array<{ accountId: string; resetsAt?: number }>
   refreshed: string[]
-  picks: Array<{ ids: string[]; exclude?: string; workerId?: string }>
+  picks: Array<{ ids: string[]; exclude?: string; workerId?: string; excludeIds?: readonly string[] }>
   // One entry per NAMED pick. Kept apart from `picks` because the whole claim of the preference path
   // is that ranked selection is not consulted at all, and one shared log could not show that.
   preferred: Array<{ ids: string[]; prefix: string }>
@@ -141,13 +141,14 @@ function startHarness(options?: {
 
   const server = startLeaseServer({
     scheduler: {
-      pickAccount({ accounts: pool, exclude, workerId }) {
+      pickAccount({ accounts: pool, exclude, workerId, excludeIds }) {
         picks.push({
           ids: pool.map((a) => a.id),
           ...(exclude === undefined ? {} : { exclude }),
           ...(workerId === undefined ? {} : { workerId }),
+          ...(excludeIds === undefined ? {} : { excludeIds }),
         })
-        return pool.find((a) => a.id !== exclude && !cooled.has(a.id))
+        return pool.find((a) => a.id !== exclude && excludeIds?.includes(a.id) !== true && !cooled.has(a.id))
       },
       // A REAL book, not a spy list: these cases assert that a refused lease books nothing, which a
       // recorder that only appends could not distinguish from one that books and never releases.
@@ -1535,6 +1536,58 @@ test("a machine's sibling sessions cannot cascade one exhausted account into the
     expect(((await third.json()) as LeaseResponse).accountId).toBe("acct-b")
     expect(harness.book()).toEqual([[WORKER_ID, "acct-b"]])
     expect(harness.picks.length).toBe(2)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("excludeAccountIds reaches the pick, so a second lease serves a DIFFERENT account", async () => {
+  const harness = startHarness()
+  try {
+    // Given: the worker already holds acct-a and asks for one more slot
+    const res = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      excludeAccountIds: ["acct-a"],
+    })
+
+    // Then: served, and it is the OTHER account — the whole point of a multi-slot worker
+    expect(res.status).toBe(200)
+    expect((await res.json()).accountId).toBe("acct-b")
+    // AND the list arrived at the scheduler rather than being dropped at the boundary, which a
+    // status-only assertion could not tell apart on a two-account pool.
+    expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"], workerId: WORKER_ID, excludeIds: ["acct-a"] }])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("a malformed excludeAccountIds is refused 400 before anything is picked or minted", async () => {
+  const harness = startHarness()
+  try {
+    // Given/When: the right container, a member of the wrong type
+    const res = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      excludeAccountIds: ["acct-a", 7],
+    })
+
+    // Then: 400 rather than a sanitised list. Dropping the bad member would let the pick hand back
+    // an account this worker already holds, so one subscription would fill two token slots while
+    // the dashboard reported two independent holds.
+    expect(res.status).toBe(400)
+    expect(harness.picks).toEqual([])
+    expect(harness.refreshed).toEqual([])
+
+    // AND the container itself must be an array: a bare string is the shape a hand-written client
+    // reaches for first, and `"acct-a".includes(id)` would silently match substrings.
+    const notArray = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      excludeAccountIds: "acct-a",
+    })
+    expect(notArray.status).toBe(400)
+    expect(harness.picks).toEqual([])
   } finally {
     harness.stop()
   }

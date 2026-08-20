@@ -90,6 +90,15 @@ export type LeaseRequest = {
   workerId: string
   reason: LeaseReason
   currentAccountId?: string
+  // ACCOUNTS THIS WORKER ALREADY HOLDS AND WANTS A DIFFERENT ONE FROM. A senpi worker fills several
+  // token slots so the harness can rotate between them locally, and it collects them by leasing
+  // repeatedly with this list growing by one each time. Without it every call in that loop ranks the
+  // same pool and hands back the same account.
+  //
+  // FILTER ONLY, never the rotation anchor: `currentAccountId` still names the account being LEFT,
+  // which is a different question from "these are taken". Exhausting the pool is answered with the
+  // ordinary 503, so a worker asking for more slots than the pool can fill simply stops early.
+  excludeAccountIds?: string[]
   // THE OPERATOR NAMED AN ACCOUNT — they pressed enter on a row of a worker's `/usage` panel, so
   // serve that account instead of whatever the scheduler would have ranked or rotated to.
   //

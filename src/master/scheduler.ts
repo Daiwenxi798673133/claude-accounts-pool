@@ -87,6 +87,10 @@ export type PickInput = {
   // Without it a routine renewal reads its own hold as contention and demotes the account it already
   // has, moving the worker off a perfectly good account roughly every four hours for no reason.
   workerId?: string
+  // Accounts the caller already holds. Narrows the candidate list and NOTHING else — `exclude` stays
+  // the rotation anchor, because "I am leaving A" and "A is already taken" are different claims and
+  // conflating them would re-anchor the walk on an arbitrary member of this list.
+  excludeIds?: readonly string[]
 }
 
 // What the operator's named account resolved to. A union rather than `StoredAccount | undefined`
@@ -335,7 +339,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     // record written before multi-provider support lacks the field and would be dropped.
     const pool = input.accounts.filter((account) => providerOf(account) === "anthropic")
     const candidates = pool.filter(
-      (account) => account.id !== input.exclude && !isCoolingDown(account.id) && !account.excluded && !account.needsReauth,
+      (account) =>
+        account.id !== input.exclude &&
+        input.excludeIds?.includes(account.id) !== true &&
+        !isCoolingDown(account.id) &&
+        !account.excluded &&
+        !account.needsReauth,
     )
     if (candidates.length === 0) return undefined
     // Narrowed by holder count FIRST, then ranked within that tier by the existing rules. Applying the
