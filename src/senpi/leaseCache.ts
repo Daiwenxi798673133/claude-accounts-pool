@@ -25,15 +25,19 @@ export type CachedLease = { accountId: string; access: string; expires: number }
 const CACHE_FILE = "senpi-lease-cache.json"
 const CACHE_VERSION = 1
 
-// omo's launcher exports both of these into senpi's environment, so a worker started through `omo`
-// lands next to the engine state it belongs to. The explicit override comes first for a worker that
-// keeps pool state somewhere else, and the home-directory fallback is what a bare `senpi` gets.
-function cacheDir(env: NodeJS.ProcessEnv): string {
-  return env.CAP_LEASE_CACHE_DIR ?? env.SENPI_CODING_AGENT_DIR ?? env.OMO_CODING_AGENT_DIR ?? join(homedir(), ".claude-accounts-pool")
+// ONE DIRECTORY, OWNED BY THE POOL, RESOLVED THE SAME WAY FROM EVERYWHERE. An earlier version
+// preferred senpi's agent dir (omo's launcher exports it) so state would sit beside the engine's.
+// That split the feature in half: the CLI runs OUTSIDE omo and never sees those variables, so it
+// wrote the config to the home directory while the extension — running inside senpi, where the
+// launcher does export them — looked in the agent dir and found nothing. "Configure once" silently
+// did nothing. Tidiness is not worth a split brain; the override stays for a worker that really does
+// keep pool state elsewhere, and it applies to both sides equally.
+export function leaseCacheDir(env: NodeJS.ProcessEnv): string {
+  return env.CAP_LEASE_CACHE_DIR ?? join(homedir(), ".claude-accounts-pool")
 }
 
 export function leaseCachePath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(cacheDir(env), CACHE_FILE)
+  return join(leaseCacheDir(env), CACHE_FILE)
 }
 
 function isCachedLease(value: unknown, at: number): value is CachedLease {

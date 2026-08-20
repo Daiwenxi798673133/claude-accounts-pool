@@ -84,6 +84,17 @@ export const CLOUD_ROUTES = Object.freeze({
 // Why the worker is asking. `prelease` is the routine path (startup or renewal before the
 // current lease expires); `ratelimit` says the leased account is spent and the master must
 // hand out a DIFFERENT one rather than re-issuing the same account's token.
+// The only shape a workerId may take on this wire. It lives HERE rather than in the server because
+// both ends need it: the master refuses anything else, and a worker that learns the rule only from a
+// 400 has already been configured wrong. Deliberately wider than a hostname (case is kept) so an
+// existing worker's configured id is not refused by a narrowing it never agreed to — and narrow
+// enough that a control character cannot forge a line break in the master's log file.
+export const WORKER_LABEL_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
+
+export function isWorkerLabel(value: unknown): value is string {
+  return typeof value === "string" && WORKER_LABEL_PATTERN.test(value)
+}
+
 export type LeaseReason = "prelease" | "ratelimit"
 
 export type LeaseRequest = {

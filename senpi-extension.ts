@@ -41,20 +41,14 @@
 //
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
-import { createEnvSlot, parseSlotCount, senpiEnvSlot } from "./src/senpi/envSlot.ts"
+import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
+import { resolveWorkerConfig } from "./src/senpi/workerConfig.ts"
 import { log } from "./src/logger.ts"
 import { createLeaseClient } from "./src/worker/leaseClient.ts"
 import { installLeaseKeeper } from "./src/worker/leaseKeeper.ts"
-
-/** Master endpoint, e.g. `http://10.0.0.5:8787`. Absent = this box is not a cloud worker. */
-const MASTER_URL_VAR = "CAP_MASTER_URL"
-/** This machine's stable identity in the master's lease book. Absent = not a cloud worker. */
-const WORKER_ID_VAR = "CAP_WORKER_ID"
-/** How many token slots to fill, 1..16. Absent or unreadable = 1, the single-slot behaviour. */
-const SLOTS_VAR = "CAP_SENPI_SLOTS"
 
 // Only the two verbs this entry uses, declared structurally rather than imported: senpi is not a
 // dependency of this package, and taking one on to name a single event would tie the plugin's
@@ -177,15 +171,18 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
 }
 
 export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi): void {
-  const masterUrl = process.env[MASTER_URL_VAR]
-  const workerId = process.env[WORKER_ID_VAR]
+  // Stored config with CAP_* taking precedence, so a plain `omo` works on a machine that was
+  // configured once and an environment variable still overrides it for a single run. Reading the
+  // environment alone is what made a bare `omo` return here and leave the warm lease on disk
+  // unpublished — the pool was full and the run died with "No models available".
+  const config = resolveWorkerConfig(process.env)
   // Silent, not a warning: this same file is a no-op on a developer's laptop and on the master
   // itself, and an extension that complained on every unrelated senpi start would be uninstalled.
-  if (!masterUrl || !workerId) return
+  if (!config) return
 
   const registry = globalThis as Record<PropertyKey, unknown>
   const existing = registry[KEEPER_KEY] as Installed | undefined
-  const installed = existing ?? install(masterUrl, workerId, parseSlotCount(process.env[SLOTS_VAR]))
+  const installed = existing ?? install(config.masterUrl, config.workerId, config.slots ?? 1)
   registry[KEEPER_KEY] = installed
 
   // AWAITED, NOT FIRE-AND-FORGET — this is the whole reason the lane works. managedPool() reads
