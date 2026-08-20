@@ -15,13 +15,21 @@
 //   SENPI_CLAUDE_SDK_OAUTH_TOKEN_INJECTION=oauth-slots
 //   SENPI_NO_FALLBACK=1
 //
-// Neither is sufficient on its own, and the reason is the bug this file had on its first draft: a
-// turn that starts before the first lease lands finds no token, so managedPool() falls to its
-// `ambient` branch and the spawned `claude` quietly uses the machine's own credential. Measured on
-// senpi 2026.8.19 against a stub master serving an invalid token: the turn completed normally with a
-// real upstream response, `provider: "claude-sdk-oauth"`, `willRetry: false`, no error event — a
-// turn charged to an account the pool never leased. See the turn_start handler for the fix and for
-// the one hazard that survives it.
+// AN INVALID LEASE IS REPORTED AS A SUCCESSFUL TURN, AND THAT IS UPSTREAM OF THIS FILE.
+// Traced on senpi 2026.8.19 by instrumenting its own prepareSlot(): the lane resolves to
+// `oauth-slots`, the slot selected is ours (`{slot:"env",source:"env"}`), and the invalid token IS
+// handed to the child. The Agent SDK then rejects it — isolated against
+// @anthropic-ai/claude-agent-sdk directly, an invalid CLAUDE_CODE_OAUTH_TOKEN throws
+// `401 OAuth access token is invalid`. But it delivers that failure as a `result` message carrying
+// `subtype: "success"` with `is_error: true`, and senpi's classifier only treats a result as a
+// failure when `subtype !== "success"` — so an auth failure is scored as a completed turn: no error,
+// no failover, no account block.
+//
+// CONSEQUENCE FOR THE POOL: a dead lease does not take the account out of rotation, and the turn is
+// reported against an account that never served it. Attribution on this lane is therefore only as
+// trustworthy as the leases themselves until senpi's classifier learns about `is_error`.
+// The race that this file DID own — a turn starting before the first lease landed — is fixed in the
+// turn_start handler below.
 import { createEnvSlot } from "./src/senpi/envSlot.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { log } from "./src/logger.ts"
