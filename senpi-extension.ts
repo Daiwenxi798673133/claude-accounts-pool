@@ -42,6 +42,7 @@
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
 import { createEnvSlot, parseSlotCount, senpiEnvSlot } from "./src/senpi/envSlot.ts"
+import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
 import { log } from "./src/logger.ts"
@@ -95,10 +96,28 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
   // exclusion set and the claim have to be one section owned in a single place. See slotRoster.ts.
   const roster = createSlotRoster()
   const joiners: Array<() => Promise<void>> = []
+  // READ BEFORE THE FIRST AWAIT, and published below without one. senpi decides whether this
+  // provider is usable while starting a turn, which is earlier than any hook an extension can wait
+  // on — so a token that only arrives when the startup lease returns is too late, and the run dies
+  // with "No API key found" against a pool that is full. Measured: a master on loopback landed in
+  // time, the same master across a VPN did not.
+  const cached = readLeaseCache(process.env)
+  const live = new Map<string, CachedLease>(cached)
 
   for (let index = 0; index < slots; index++) {
     const { slotName, varName } = senpiEnvSlot(index)
     const envSlot = createEnvSlot({ env: process.env, varName })
+
+    // writeLease mutates the environment SYNCHRONOUSLY and only then resolves, so the variable is
+    // already visible to senpi's availability check by the time this loop moves on. The promise
+    // carries nothing worth waiting for.
+    const warm = cached.get(slotName)
+    if (warm) {
+      void envSlot.writeLease(warm)
+      // Recorded so the first renewal of a DIFFERENT slot excludes this account instead of being
+      // handed the one this slot is already publishing.
+      roster.seed(slotName, warm.accountId)
+    }
     const keeper = installLeaseKeeper({
       // The RAW client wrapped in the roster's section, unlike src/worker/install.ts which wraps it
       // in createPinnedLease. Pins are stored in opencode's TuiKV and surfaced through its /usage
@@ -116,7 +135,14 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
           }),
       },
       readAuth: envSlot.readAuth,
-      writeLease: envSlot.writeLease,
+      // Published first, persisted second. The cache is an optimisation for the NEXT process and
+      // writeLeaseCache swallows its own failures, so a disk fault can never cost this process the
+      // lease it just landed.
+      writeLease: async (input) => {
+        await envSlot.writeLease(input)
+        live.set(slotName, { accountId: input.accountId, access: input.access, expires: input.expires })
+        await writeLeaseCache(live)
+      },
       // ponytail: log-only. The keeper's fail-safe message is user-facing in opencode
       // (api.ui.toast); senpi's equivalent surface is not wired yet, so a stranded worker is
       // visible in the log bundle but not on screen. Upgrade path: pass pi.ui.notify once the

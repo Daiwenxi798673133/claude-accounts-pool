@@ -24,6 +24,11 @@ export type SlotClaimContext = {
 
 export type SlotRoster = {
   withSlot: <T>(slotName: string, fn: (ctx: SlotClaimContext) => Promise<T>) => Promise<T>
+  // Adopts a claim this process did not make — a lease restored from the warm cache at startup.
+  // Outside the queue on purpose: it runs before any section exists, and a slot whose cached lease
+  // is unrecorded would let the first renewal of ANOTHER slot be handed the account it is already
+  // publishing.
+  seed: (slotName: string, accountId: string) => void
   heldAccountIds: () => string[]
 }
 
@@ -59,6 +64,9 @@ export function createSlotRoster(): SlotRoster {
         () => undefined,
       )
       return run
+    },
+    seed(slotName, accountId) {
+      bySlot.set(slotName, accountId)
     },
     heldAccountIds: () => [...bySlot.values()],
   }
