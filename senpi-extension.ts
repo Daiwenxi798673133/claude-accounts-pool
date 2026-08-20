@@ -11,15 +11,18 @@
 //   senpi -e /path/to/claude-accounts-pool/senpi-extension.ts
 //   # or drop a built copy into <agentDir>/extensions/
 //
-// The worker MUST also be started with these, or the pool's bookkeeping is fiction:
-//   SENPI_CLAUDE_SDK_OAUTH_TOKEN_INJECTION=oauth-slots   # pin the lane; never fall to ambient
-//   SENPI_NO_FALLBACK=1                                  # see the note on silent reroute below
+// Start the worker with both of these. Neither is proven sufficient — see below.
+//   SENPI_CLAUDE_SDK_OAUTH_TOKEN_INJECTION=oauth-slots
+//   SENPI_NO_FALLBACK=1
 //
-// WHY SENPI_NO_FALLBACK IS NOT OPTIONAL. senpi expands a bare model selector across providers in
-// PROVIDER_PRECEDENCE = ["claude-sdk-oauth", "anthropic", "kimi-coding"]. With fallback on, a
-// rejected lease does not surface as an error — the turn silently completes on a DIFFERENT provider
-// and a different credential. Measured: injecting two invalid tokens still produced a normal answer.
-// For an accounting system that is worse than an outage, because the numbers keep looking fine.
+// OPEN — AN INVALID LEASE DOES NOT FAIL LOUDLY. Measured on senpi 2026.8.19, both vars set, a stub
+// master serving a deliberately invalid access token: the turn completed normally against a real
+// upstream (non-zero cacheRead), reporting `provider: "claude-sdk-oauth"`, `willRetry: false`, no
+// error event. Two candidate explanations are ruled OUT by that trace — the provider never changed,
+// so it was not a cross-provider reroute, and bare `claude` does 401 on an invalid
+// CLAUDE_CODE_OAUTH_TOKEN, so the CLI is not ignoring the variable. Which credential served the
+// turn is unidentified, so this lane cannot yet be trusted for billing attribution: it can report
+// "account X served this turn" while the usage was charged elsewhere.
 import { createEnvSlot } from "./src/senpi/envSlot.ts"
 import { log } from "./src/logger.ts"
 import { createLeaseClient } from "./src/worker/leaseClient.ts"
