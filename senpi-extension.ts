@@ -11,19 +11,19 @@
 //   senpi -e /path/to/claude-accounts-pool/senpi-extension.ts
 //   # or drop a built copy into <agentDir>/extensions/
 //
-// Start the worker with both of these. Neither is proven sufficient — see below.
+// Start the worker with both of these:
 //   SENPI_CLAUDE_SDK_OAUTH_TOKEN_INJECTION=oauth-slots
 //   SENPI_NO_FALLBACK=1
 //
-// OPEN — AN INVALID LEASE DOES NOT FAIL LOUDLY. Measured on senpi 2026.8.19, both vars set, a stub
-// master serving a deliberately invalid access token: the turn completed normally against a real
-// upstream (non-zero cacheRead), reporting `provider: "claude-sdk-oauth"`, `willRetry: false`, no
-// error event. Two candidate explanations are ruled OUT by that trace — the provider never changed,
-// so it was not a cross-provider reroute, and bare `claude` does 401 on an invalid
-// CLAUDE_CODE_OAUTH_TOKEN, so the CLI is not ignoring the variable. Which credential served the
-// turn is unidentified, so this lane cannot yet be trusted for billing attribution: it can report
-// "account X served this turn" while the usage was charged elsewhere.
+// Neither is sufficient on its own, and the reason is the bug this file had on its first draft: a
+// turn that starts before the first lease lands finds no token, so managedPool() falls to its
+// `ambient` branch and the spawned `claude` quietly uses the machine's own credential. Measured on
+// senpi 2026.8.19 against a stub master serving an invalid token: the turn completed normally with a
+// real upstream response, `provider: "claude-sdk-oauth"`, `willRetry: false`, no error event — a
+// turn charged to an account the pool never leased. See the turn_start handler for the fix and for
+// the one hazard that survives it.
 import { createEnvSlot } from "./src/senpi/envSlot.ts"
+import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { log } from "./src/logger.ts"
 import { createLeaseClient } from "./src/worker/leaseClient.ts"
 import { installLeaseKeeper } from "./src/worker/leaseKeeper.ts"
@@ -37,7 +37,9 @@ const WORKER_ID_VAR = "CAP_WORKER_ID"
 // dependency of this package, and taking one on to name a single event would tie the plugin's
 // install to a senpi version for no gain.
 type SenpiExtensionApi = {
-  on: (event: "turn_start", handler: () => void) => void
+  // The handler's promise MATTERS: senpi's runner awaits it (`await handler(event, ctx)`), which is
+  // the only thing that lets a turn wait for a lease instead of racing it.
+  on: (event: "turn_start", handler: () => Promise<void>) => void
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -48,7 +50,7 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 // survives both, because it hangs off the realm rather than the module.
 const KEEPER_KEY = Symbol.for("claude-accounts-pool/senpi-lease-keeper")
 
-type Installed = { tickOnce: () => Promise<void> }
+type Installed = { ensureLeased: () => Promise<void> }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -85,13 +87,16 @@ function install(masterUrl: string, workerId: string): Installed {
     sleep,
   })
 
+  const ensureLeased = createLeaseJoiner(keeper.tickOnce)
+
   // THE STARTUP LEASE, which installLeaseKeeper deliberately leaves to its caller. Nothing is
   // adopted first, unlike the opencode worker: that path inherits a previous process's auth.json
   // and must name the account it already holds, whereas an environment starts every process empty.
-  void keeper.tickOnce().catch((error: unknown) => log.warn("senpi:startup-lease-fail", { error: errorMessage(error) }))
+  // Registered through ensureLeased so the first turn JOINS this lease instead of skipping past it.
+  void ensureLeased().catch((error: unknown) => log.warn("senpi:startup-lease-fail", { error: errorMessage(error) }))
 
   log.info("senpi:lease-keeper-installed", { workerId })
-  return { tickOnce: keeper.tickOnce }
+  return { ensureLeased }
 }
 
 export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi): void {
@@ -106,15 +111,25 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   const installed = existing ?? install(masterUrl, workerId)
   registry[KEEPER_KEY] = installed
 
-  // PULL, on top of the keeper's own interval. The interval is the correctness floor; this is the
-  // latency cut that matters, because a turn is the exact moment senpi is about to spawn a
-  // subprocess and read the variable. tickOnce() is a no-op when the lease is not yet due, and it
-  // re-entrancy-guards itself, so firing it per turn costs nothing when nothing is needed.
+  // AWAITED, NOT FIRE-AND-FORGET — this is the whole reason the lane works. managedPool() reads
+  // CLAUDE_CODE_OAUTH_TOKEN at the top of every query and, finding none, returns undefined; the
+  // provider then takes its `ambient` branch, which passes the parent environment straight through
+  // and lets the spawned `claude` fall back to whatever credential the machine itself holds. The
+  // turn succeeds, reports `provider: "claude-sdk-oauth"`, raises no error — and was charged to an
+  // account the pool never leased. Returning this promise is what makes the turn wait for the token
+  // instead of overtaking it. `SENPI_CLAUDE_SDK_OAUTH_TOKEN_INJECTION=oauth-slots` cannot cover for
+  // it: the ambient fallback is gated on `accounts.length === 0`, not on the configured lane.
   //
   // `pi` IS NOT CAPTURED. senpi invalidates a captured extension ctx after a session replacement or
   // /reload and then throws from every method on it — so anything that outlives this call (the
   // keeper, its interval) must never hold one. Renewal needs only the environment and the master.
-  pi.on("turn_start", () => {
-    void installed.tickOnce().catch((error: unknown) => log.warn("senpi:turn-lease-fail", { error: errorMessage(error) }))
-  })
+  //
+  // The catch is deliberate and its consequence is the residual hazard: a turn is never failed on
+  // this extension's behalf, because no supported hook can abort one. A worker that cannot lease
+  // therefore still runs — on ambient credentials — and only the log says so.
+  pi.on("turn_start", () =>
+    installed
+      .ensureLeased()
+      .catch((error: unknown) => log.error("senpi:turn-lease-fail", { error: errorMessage(error) })),
+  )
 }
