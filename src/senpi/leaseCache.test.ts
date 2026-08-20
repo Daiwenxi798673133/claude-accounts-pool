@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { type CachedLease, leaseCachePath, readLeaseCache, writeLeaseCache } from "./leaseCache.ts"
 
@@ -15,12 +15,13 @@ function lease(accountId: string, expires: number): CachedLease {
   return { accountId, access: `access-${accountId}`, expires }
 }
 
-test("the override wins over omo's exported agent dir", () => {
+// senpi's agent dir is NOT consulted, and that is the point: omo's launcher exports it only into
+// senpi's own environment, so honouring it would resolve one directory inside the extension and a
+// different one in the CLI — which is exactly how "configure once" came to silently do nothing.
+test("one pool-owned directory, resolved identically from inside and outside omo", () => {
   expect(leaseCachePath({ CAP_LEASE_CACHE_DIR: "/a", SENPI_CODING_AGENT_DIR: "/b" })).toBe("/a/senpi-lease-cache.json")
-  // What a worker launched through `omo` actually gets: the launcher exports this, so the cache
-  // lands beside the engine state rather than in a second home-directory dot-folder.
-  expect(leaseCachePath({ SENPI_CODING_AGENT_DIR: "/b" })).toBe("/b/senpi-lease-cache.json")
-  expect(leaseCachePath({ OMO_CODING_AGENT_DIR: "/c" })).toBe("/c/senpi-lease-cache.json")
+  expect(leaseCachePath({ SENPI_CODING_AGENT_DIR: "/b" })).toBe(join(homedir(), ".claude-accounts-pool", "senpi-lease-cache.json"))
+  expect(leaseCachePath({ OMO_CODING_AGENT_DIR: "/c" })).toBe(join(homedir(), ".claude-accounts-pool", "senpi-lease-cache.json"))
 })
 
 test("a missing file is a cold start, not a fault", () => {

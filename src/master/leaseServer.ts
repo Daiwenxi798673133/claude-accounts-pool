@@ -35,7 +35,7 @@ import type {
   ThrottledBody,
   UsageSnapshotView,
 } from "../cloud/protocol.ts"
-import { CLOUD_ROUTES } from "../cloud/protocol.ts"
+import { CLOUD_ROUTES, isWorkerLabel } from "../cloud/protocol.ts"
 import { LEASE_CHECK_INTERVAL_MS, LEASE_RENEW_BUFFER_MS, MASTER_REFRESH_THRESHOLD_MS } from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
 import type { AccountOnboard } from "./accountOnboard.ts"
@@ -264,15 +264,6 @@ const DELETE_REFUSAL_DETAIL: Record<AccountDeleteRefusal, string> = {
 
 // `workerId` is a SELF-DECLARED label — nothing authenticates it, so it names the machine only as
 // well as that machine cares to be named honestly. It is narrowed here because it is the one field
-// on this wire that reaches the LOG FILE: a control character would forge a line break and let a
-// caller write arbitrary fake entries into the operator's log, and an unbounded string would let one
-// request fill the disk. The character class is deliberately wider than a hostname's (case is kept)
-// so an existing worker's configured id is not refused by a narrowing it never agreed to.
-const WORKER_LABEL_PATTERN = /^[A-Za-z0-9._-]{1,64}$/
-
-function isWorkerLabel(value: unknown): value is string {
-  return typeof value === "string" && WORKER_LABEL_PATTERN.test(value)
-}
 
 // One forced sweep per this window, server-wide. NOT per caller: what it protects is the master's
 // single egress IP, and `/api/oauth/usage` answers a burst with a 429 that lasts minutes and applies
