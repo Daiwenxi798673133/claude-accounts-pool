@@ -46,7 +46,12 @@ import { buildUsageView } from "./usageView.ts"
 
 export type LeaseServerDeps = {
   scheduler: {
-    pickAccount(input: { accounts: StoredAccount[]; exclude?: string; workerId?: string }): StoredAccount | undefined
+    pickAccount(input: {
+      accounts: StoredAccount[]
+      exclude?: string
+      workerId?: string
+      excludeIds?: readonly string[]
+    }): StoredAccount | undefined
     // Booked only by serveLease, only after a token was actually minted. Both lease paths share that
     // tail, which is what keeps the named-account route from silently escaping the book.
     recordLease(input: { workerId: string; accountId: string; expiresAt: number; pinned: boolean }): void
@@ -141,13 +146,26 @@ async function readJson(req: Request): Promise<unknown> {
 
 function parseLeaseRequest(raw: unknown): LeaseRequest | undefined {
   if (typeof raw !== "object" || raw === null) return undefined
-  const { workerId, reason, currentAccountId, preferredAccountIdPrefix, pinned } = raw as Record<string, unknown>
+  const { workerId, reason, currentAccountId, excludeAccountIds, preferredAccountIdPrefix, pinned } = raw as Record<
+    string,
+    unknown
+  >
   if (!isWorkerLabel(workerId)) return undefined
   // Strict, because this field decides whether an account is excluded from the pick. An unknown
   // reason silently defaulting to `prelease` would re-issue the spent account to a worker that
   // just hit its limit — the one outcome the ratelimit path exists to prevent.
   if (!isLeaseReason(reason)) return undefined
   if (currentAccountId !== undefined && typeof currentAccountId !== "string") return undefined
+  // Refused rather than sanitised. A malformed member would be silently dropped from the exclusion
+  // list, and the pick would then hand back an account the worker is already holding — which it would
+  // write into a SECOND token slot, so the same subscription would serve two slots while the
+  // dashboard shows two distinct holds.
+  if (
+    excludeAccountIds !== undefined &&
+    (!Array.isArray(excludeAccountIds) || excludeAccountIds.some((id) => typeof id !== "string" || id.length === 0))
+  ) {
+    return undefined
+  }
   // An EMPTY prefix is malformed, not a match-anything wildcard: it would resolve to `ambiguous` on
   // a multi-account pool but succeed by luck on a single-account one, so a request that names nothing
   // must be refused at the boundary rather than behave differently per pool size.
@@ -163,6 +181,7 @@ function parseLeaseRequest(raw: unknown): LeaseRequest | undefined {
     workerId,
     reason,
     ...(currentAccountId === undefined ? {} : { currentAccountId }),
+    ...(excludeAccountIds === undefined ? {} : { excludeAccountIds: excludeAccountIds as string[] }),
     ...(preferredAccountIdPrefix === undefined ? {} : { preferredAccountIdPrefix }),
     ...(pinned === undefined ? {} : { pinned }),
   }
@@ -323,7 +342,12 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
         return serveLease(workerId, stay, false)
       }
     }
-    const account = deps.scheduler.pickAccount({ accounts, exclude, workerId })
+    const account = deps.scheduler.pickAccount({
+      accounts,
+      exclude,
+      workerId,
+      ...(request.excludeAccountIds === undefined ? {} : { excludeIds: request.excludeAccountIds }),
+    })
     if (!account) {
       // 503, kept DISTINCT from the 401 above: both refuse, but the worker acts on them
       // differently. A 401 says "this key will never work, stop"; a 503 says "the pool is

@@ -90,6 +90,10 @@ export function createLeaseClient(deps: LeaseClientDeps): {
   lease(input: {
     reason: LeaseReason
     currentAccountId?: string
+    // Accounts this worker already holds in OTHER token slots, so the master picks a different one.
+    // Only a multi-slot caller sends it; a single-slot worker leaves it undefined and the master's
+    // behaviour is byte-for-byte what it was before the field existed.
+    excludeAccountIds?: readonly string[]
     // The account the operator named in a worker's /usage panel, as the prefix that panel showed.
     preferredAccountIdPrefix?: string
     // Whether that named account is a PIN this worker will keep re-naming, or a one-off switch.
@@ -178,6 +182,11 @@ export function createLeaseClient(deps: LeaseClientDeps): {
         workerId: deps.workerId,
         reason: input.reason,
         ...(input.currentAccountId === undefined ? {} : { currentAccountId: input.currentAccountId }),
+        // Omitted when empty, not sent as `[]`: an empty exclusion is the same request a single-slot
+        // worker makes, and the wire should say so rather than making the master prove it.
+        ...(input.excludeAccountIds === undefined || input.excludeAccountIds.length === 0
+          ? {}
+          : { excludeAccountIds: [...input.excludeAccountIds] }),
         ...(input.preferredAccountIdPrefix === undefined ? {} : { preferredAccountIdPrefix: input.preferredAccountIdPrefix }),
         ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
       }

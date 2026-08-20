@@ -604,3 +604,37 @@ test("an expired lease adopts nothing: its token is dead, so whatever the worker
   scheduler.reportRateLimit("a", undefined, "w1")
   expect(scheduler.isCoolingDown("a")).toBe(true)
 })
+
+test("excludeIds narrows the candidates so a repeated lease can fill several slots", () => {
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => 1_000 })
+  const accounts = [account("a"), account("b"), account("c")]
+  scheduler.setUsageCache([
+    { id: "a", usage: usage(90) },
+    { id: "b", usage: usage(12) },
+    { id: "c", usage: usage(55) },
+  ])
+
+  // The loop a multi-slot worker runs: lease, then re-lease naming everything already held. Without
+  // excludeIds every call ranks the same pool and returns "b" three times.
+  const held: string[] = []
+  for (let slot = 0; slot < 3; slot++) {
+    const picked = scheduler.pickAccount({ accounts, workerId: "w1", excludeIds: held })
+    if (picked) held.push(picked.id)
+  }
+  expect(held).toEqual(["b", "c", "a"])
+
+  // Pool exhausted — answered as "nothing available", the same shape the lease route already turns
+  // into a 503, so a worker asking for more slots than exist simply stops.
+  expect(scheduler.pickAccount({ accounts, workerId: "w1", excludeIds: held })).toBeUndefined()
+})
+
+test("excludeIds is a filter, never the rotation anchor", () => {
+  const scheduler = createScheduler({ kv: makeKv().kv, now: () => 1_000 })
+  const accounts = [account("a"), account("b"), account("c")]
+
+  // No usage cache, so selection falls to round-robin, whose anchor is `exclude` — NOT a member of
+  // excludeIds. Anchored on "a" the walk reaches "b"; excluding "b" as held leaves "c". If
+  // excludeIds fed the anchor instead, the walk would start from "b" and hand back "c" for the
+  // wrong reason, which this asserts apart by pinning the anchor and the filter to different ids.
+  expect(scheduler.pickAccount({ accounts, exclude: "a", excludeIds: ["b"] })?.id).toBe("c")
+})

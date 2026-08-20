@@ -29,6 +29,35 @@ import { log } from "../logger.ts"
 /** The variable senpi's `envSlots()` reads for its first (unnumbered) env account slot. */
 export const SENPI_OAUTH_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 
+// senpi's own ceiling, not ours: its envSlots() walks suffixes 2..16 and stops, so a seventeenth
+// variable is read by nobody. Asking for more slots than this would silently hold leases that can
+// never be selected — accounts booked out of the pool for nothing.
+export const SENPI_MAX_ENV_SLOTS = 16
+
+// The slot name senpi synthesises alongside each variable (`env`, `env-2`, … `env-16`). Both halves
+// come from one place because they must agree: the roster keys its claims by slot name while the
+// writer publishes by variable name, and a mismatch would let one account be claimed under a slot
+// whose token lives somewhere else.
+// Clamped rather than refused. An operator who typed a bigger number than senpi can read gets the
+// largest workable count instead of a worker that silently declines to start, and the ceiling matters
+// because slots past it would hold leases nothing ever selects — accounts booked out of the pool for
+// no one.
+export function parseSlotCount(raw: string | undefined): number {
+  if (raw === undefined) return 1
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed < 1) return 1
+  return Math.min(parsed, SENPI_MAX_ENV_SLOTS)
+}
+
+export function senpiEnvSlot(index: number): { slotName: string; varName: string } {
+  if (!Number.isInteger(index) || index < 0 || index >= SENPI_MAX_ENV_SLOTS) {
+    throw new Error(`senpi env slot index out of range: ${index}`)
+  }
+  return index === 0
+    ? { slotName: "env", varName: SENPI_OAUTH_TOKEN_VAR }
+    : { slotName: `env-${index + 1}`, varName: `${SENPI_OAUTH_TOKEN_VAR}_${index + 1}` }
+}
+
 export type EnvSlotDeps = {
   // Injected, never defaulted to the global: a slot built against the real process.env in a test
   // would leak a token into the runner's own environment and into every later test file.
