@@ -25,9 +25,20 @@
 // failure when `subtype !== "success"` — so an auth failure is scored as a completed turn: no error,
 // no failover, no account block.
 //
-// CONSEQUENCE FOR THE POOL: a dead lease does not take the account out of rotation, and the turn is
-// reported against an account that never served it. Attribution on this lane is therefore only as
-// trustworthy as the leases themselves until senpi's classifier learns about `is_error`.
+// CONSEQUENCE, BOUNDED. The blind spot is only failures shaped that way, and a rate limit is NOT
+// one: those arrive as `subtype: "error_during_execution"` carrying `terminal_reason` (senpi's own
+// comment in sdkFailure says so), are classified, and do block the account — so rotation and
+// rate-limit attribution keep working. A missed auth failure also costs nothing: the isolated SDK
+// run reported `total_cost_usd: 0`, `input_tokens: 0`, `output_tokens: 0`, because the request never
+// reached a model. What it does cost is progress — the account is not blocked, so the next turn
+// retries the same dead lease. Treat this as a stuck-worker defect, not a billing one.
+//
+// STILL UNRECONCILED, and the only route by which attribution COULD be wrong: in the senpi probe
+// the turn returned real content (non-zero cacheRead) even though prepareSlot reported handing over
+// the invalid token, whereas the same token isolated against the SDK returned 401 with zero usage.
+// senpi passes many more options than that isolation did; none were ruled out. Do not build
+// attribution guarantees on this lane until that is explained.
+//
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
 import { createEnvSlot } from "./src/senpi/envSlot.ts"
