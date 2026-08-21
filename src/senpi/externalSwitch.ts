@@ -3,8 +3,8 @@
 // THE ONLY CROSS-PROCESS SIGNAL THERE IS. A lease lives in two places: the environment variable this
 // process publishes (invisible to everyone else — a child's environment cannot be written from
 // outside) and the warm cache on disk, which every holder of this pool's state directory writes.
-// So the cache is the one place a switch performed by the CLI, by a second senpi, or by hand can
-// become visible here at all. There is no event, no socket and no inotify watch: the extension reads
+// So the cache is the one place a switch performed by a second senpi, or by hand, can become visible
+// here at all. There is no event, no socket and no inotify watch: the extension reads
 // the cache at the top of each turn and compares.
 //
 // WHY ADOPT RATHER THAN MERELY WARN. The account this process still publishes may have been handed

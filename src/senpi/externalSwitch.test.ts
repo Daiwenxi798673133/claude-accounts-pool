@@ -6,8 +6,8 @@ function lease(accountId: string): CachedLease {
   return { accountId, access: `access-for-${accountId}`, expires: 1_800_000_000_000 }
 }
 
-// THE WHOLE POINT OF THE MODULE. A second process (the CLI, another senpi, the master's own
-// dashboard driving a lease) writes the cache; this process still publishes the old token. Without
+// THE WHOLE POINT OF THE MODULE. A second process (another senpi, the master's own dashboard driving
+// a lease, a hand-edited file) writes the cache; this process still publishes the old token. Without
 // a detection the operator switches "successfully" somewhere else and this omo keeps billing the
 // account it was left on.
 test("a cache naming a different account than the slot holds is an external switch", () => {

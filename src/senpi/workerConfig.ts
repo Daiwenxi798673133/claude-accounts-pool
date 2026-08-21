@@ -79,29 +79,3 @@ export function resolveWorkerConfig(env: NodeJS.ProcessEnv = process.env): Worke
   const slots = env.CAP_SENPI_SLOTS !== undefined ? parseSlotCount(env.CAP_SENPI_SLOTS) : stored?.slots
   return { masterUrl, workerId, ...(slots === undefined ? {} : { slots }) }
 }
-
-/**
- * Checks raw CLI strings before anything is written. Refusing here is the whole point: the master
- * answers a bad workerId with a 400 the operator only meets much later, at lease time.
- */
-export function validateWorkerConfig(input: {
-  masterUrl?: string
-  workerId?: string
-  slots?: string
-}): { ok: true; config: WorkerConfig } | { ok: false; error: string } {
-  if (!isMasterUrl(input.masterUrl)) {
-    return { ok: false, error: `masterUrl must be an http(s) URL, got ${JSON.stringify(input.masterUrl ?? null)}` }
-  }
-  if (!isWorkerLabel(input.workerId)) {
-    return {
-      ok: false,
-      error: `workerId must match ${WORKER_LABEL_PATTERN.source} (a colon is not allowed), got ${JSON.stringify(input.workerId ?? null)}`,
-    }
-  }
-  // Junk is REFUSED here while parseSlotCount silently defaults it: a typed `--slots abc` is a
-  // person's mistake to correct now, not a worker that quietly runs on one slot forever.
-  if (input.slots !== undefined && !/^\d+$/.test(input.slots)) {
-    return { ok: false, error: `slots must be a positive integer, got ${JSON.stringify(input.slots)}` }
-  }
-  return { ok: true, config: { masterUrl: input.masterUrl, workerId: input.workerId, slots: parseSlotCount(input.slots) } }
-}

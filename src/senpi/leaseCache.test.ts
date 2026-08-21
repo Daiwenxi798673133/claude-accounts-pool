@@ -17,7 +17,8 @@ function lease(accountId: string, expires: number): CachedLease {
 
 // senpi's agent dir is NOT consulted, and that is the point: omo's launcher exports it only into
 // senpi's own environment, so honouring it would resolve one directory inside the extension and a
-// different one in the CLI — which is exactly how "configure once" came to silently do nothing.
+// different one for anything running outside it — which is exactly how "configure once" came to
+// silently do nothing.
 test("one pool-owned directory, resolved identically from inside and outside omo", () => {
   expect(leaseCachePath({ CAP_LEASE_CACHE_DIR: "/a", SENPI_CODING_AGENT_DIR: "/b" })).toBe("/a/senpi-lease-cache.json")
   expect(leaseCachePath({ SENPI_CODING_AGENT_DIR: "/b" })).toBe(join(homedir(), ".claude-accounts-pool", "senpi-lease-cache.json"))

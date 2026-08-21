@@ -5,7 +5,6 @@ import { join } from "node:path"
 import {
   readWorkerConfig,
   resolveWorkerConfig,
-  validateWorkerConfig,
   workerConfigPath,
   writeWorkerConfig,
 } from "./workerConfig.ts"
@@ -19,8 +18,8 @@ function sandbox(): { env: NodeJS.ProcessEnv; dir: string; cleanup: () => void }
 
 test("the config sits beside the lease cache, in the pool's own directory", () => {
   expect(workerConfigPath({ CAP_LEASE_CACHE_DIR: "/a" })).toBe("/a/senpi-worker.json")
-  // The CLI writes this file from OUTSIDE omo and the extension reads it from INSIDE senpi, so the
-  // path must not depend on anything omo's launcher exports.
+  // This file is written from OUTSIDE omo (by hand, or by whatever sets a machine up) and read from
+  // INSIDE senpi, so the path must not depend on anything omo's launcher exports.
   expect(workerConfigPath({ SENPI_CODING_AGENT_DIR: "/b" })).toBe(join(homedir(), ".claude-accounts-pool", "senpi-worker.json"))
 })
 
@@ -91,36 +90,39 @@ test("a malformed or wrong-version file reads as no config", () => {
   }
 })
 
-// CAUGHT AT CONFIGURE TIME, NOT BY A 400. The master refuses anything outside
+// THE COLON RULE, now enforced only at READ time. The master refuses anything outside
 // /^[A-Za-z0-9._-]{1,64}$/, and a colon is the separator a person reaches for first when naming a
-// harness — it cost one real debugging round before this check existed.
-test("validate refuses a workerId the master would reject", () => {
-  const bad = validateWorkerConfig({ masterUrl: MASTER, workerId: "vince-local:senpi" })
-  expect(bad.ok).toBe(false)
-  if (!bad.ok) expect(bad.error).toContain("workerId")
-
-  const good = validateWorkerConfig({ masterUrl: MASTER, workerId: "vince-local.senpi" })
-  expect(good.ok).toBe(true)
-  if (good.ok) expect(good.config.workerId).toBe("vince-local.senpi")
-})
-
-test("validate refuses a masterUrl that is not http(s)", () => {
-  for (const masterUrl of ["", "not a url", "ftp://host", "100.64.0.36:8787"]) {
-    const outcome = validateWorkerConfig({ masterUrl, workerId: "w" })
-    expect(outcome.ok).toBe(false)
-    if (!outcome.ok) expect(outcome.error).toContain("masterUrl")
+// harness — it cost one real debugging round. A CLI used to reject it before writing the file; with
+// that CLI gone, resolveWorkerConfig declining to resolve it IS the whole guard, so the rule is
+// pinned here instead of losing its only coverage along with the command.
+test("a workerId the master would reject does not resolve", () => {
+  const box = sandbox()
+  try {
+    // Written by hand, which is the only way this file gets created now.
+    writeFileSync(
+      workerConfigPath(box.env),
+      JSON.stringify({ version: 1, masterUrl: MASTER, workerId: "vince-local:senpi" }),
+    )
+    expect(resolveWorkerConfig(box.env)).toBeUndefined()
+    // An environment override is refused by the same rule, so neither route can smuggle one in.
+    expect(resolveWorkerConfig({ ...box.env, CAP_WORKER_ID: "vince-local:senpi", CAP_MASTER_URL: MASTER })).toBeUndefined()
+  } finally {
+    box.cleanup()
   }
-  expect(validateWorkerConfig({ masterUrl: "https://master.internal:8443", workerId: "w" }).ok).toBe(true)
 })
 
-test("validate clamps slots to senpi's ceiling and defaults to one", () => {
-  const one = validateWorkerConfig({ masterUrl: MASTER, workerId: "w" })
-  expect(one.ok && one.config.slots).toBe(1)
-
-  const clamped = validateWorkerConfig({ masterUrl: MASTER, workerId: "w", slots: "99" })
-  expect(clamped.ok && clamped.config.slots).toBe(16)
-
-  const junk = validateWorkerConfig({ masterUrl: MASTER, workerId: "w", slots: "abc" })
-  expect(junk.ok).toBe(false)
-  if (!junk.ok) expect(junk.error).toContain("slots")
+// A bare `host:port` parses as a URL whose protocol is `host:`, which is exactly the shape that used
+// to sail through and fail much later as an unreachable master.
+test("a masterUrl that is not http(s) does not resolve", () => {
+  const box = sandbox()
+  try {
+    for (const masterUrl of ["", "not a url", "ftp://host", "100.64.0.36:8787"]) {
+      expect(resolveWorkerConfig({ ...box.env, CAP_MASTER_URL: masterUrl, CAP_WORKER_ID: "w" })).toBeUndefined()
+    }
+    expect(resolveWorkerConfig({ ...box.env, CAP_MASTER_URL: "https://master.internal:8443", CAP_WORKER_ID: "w" })).toEqual(
+      { masterUrl: "https://master.internal:8443", workerId: "w" },
+    )
+  } finally {
+    box.cleanup()
+  }
 })

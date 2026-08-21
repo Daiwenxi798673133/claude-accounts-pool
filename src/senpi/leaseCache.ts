@@ -27,11 +27,12 @@ const CACHE_VERSION = 1
 
 // ONE DIRECTORY, OWNED BY THE POOL, RESOLVED THE SAME WAY FROM EVERYWHERE. An earlier version
 // preferred senpi's agent dir (omo's launcher exports it) so state would sit beside the engine's.
-// That split the feature in half: the CLI runs OUTSIDE omo and never sees those variables, so it
-// wrote the config to the home directory while the extension — running inside senpi, where the
-// launcher does export them — looked in the agent dir and found nothing. "Configure once" silently
-// did nothing. Tidiness is not worth a split brain; the override stays for a worker that really does
-// keep pool state elsewhere, and it applies to both sides equally.
+// That split the feature in half: the setup command of the day ran OUTSIDE omo and never saw those
+// variables, so it wrote the config to the home directory while the extension — running inside senpi,
+// where the launcher does export them — looked in the agent dir and found nothing. "Configure once"
+// silently did nothing. That command is gone, but the rule outlives it: anything reading or writing
+// this state from outside a senpi process hits the same wall. Tidiness is not worth a split brain;
+// the override stays for a worker that really does keep pool state elsewhere.
 export function leaseCacheDir(env: NodeJS.ProcessEnv): string {
   return env.CAP_LEASE_CACHE_DIR ?? join(homedir(), ".claude-accounts-pool")
 }
