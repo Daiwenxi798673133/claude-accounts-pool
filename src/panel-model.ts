@@ -233,6 +233,30 @@ const PANEL_PADDING = 4
 // its own 16-cell row, while senpi's panel packs three of them onto one selectable line.
 export const POOL_BAR_WIDTH = 16
 
+// The widest form this produces ("23h 59m"), which is the column budget every caller reserves.
+export const RESET_WIDTH = 7
+
+// How long until this window's quota comes back, as a human duration rather than a timestamp: the
+// operator's question is "how long do I wait", and answering it with an ISO instant makes them do
+// the subtraction.
+//
+// `now` IS A PARAMETER, not Date.now(). Here beside blockBar for the same reason it is — both panels
+// draw this and the senpi one cannot import dialogs.tsx — but also because the senpi row formatter is
+// documented pure and clock-free, and a hidden clock would make every one of its tests depend on
+// wall time.
+export function resetIn(iso: string, now: number): string {
+  const ms = new Date(iso).getTime() - now
+  // Already elapsed is the ordinary state BETWEEN master sweeps, not an error: the snapshot is a
+  // cache, so its horizon routinely passes before the next poll refreshes it. A negative duration
+  // would be the only wrong thing to print.
+  if (ms <= 0) return "now"
+  const hours = Math.floor(ms / 3_600_000)
+  const minutes = Math.floor((ms % 3_600_000) / 60_000)
+  if (hours >= 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
+}
+
 export function blockBar(util: number, width: number = POOL_BAR_WIDTH): string {
   // CLAMPED, and not defensively for its own sake: `repeat` throws on a negative count, so a
   // utilization the master reported out of range would take down the whole panel rather than draw

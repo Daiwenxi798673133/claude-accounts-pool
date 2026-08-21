@@ -12,6 +12,7 @@ import {
   clampSelection,
   heldStateFor,
   blockBar,
+  resetIn,
   initialPageSelection,
   initialWorkerSelection,
   moveSelection,
@@ -60,16 +61,6 @@ function tone(api: TuiPluginApi, util: number) {
   return theme.success
 }
 
-function resetIn(iso: string): string {
-  const ms = new Date(iso).getTime() - Date.now()
-  if (ms <= 0) return "now"
-  const hours = Math.floor(ms / 3_600_000)
-  const minutes = Math.floor((ms % 3_600_000) / 60_000)
-  if (hours >= 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`
-  if (hours > 0) return `${hours}h ${minutes}m`
-  return `${minutes}m`
-}
-
 function clockTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
@@ -108,7 +99,7 @@ function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow |
             {bar(win().utilization)} {percent(win().utilization)}
           </text>
           <Show when={win().resets_at}>
-            <text fg={theme().textMuted}>重置 {resetIn(win().resets_at!)}</text>
+            <text fg={theme().textMuted}>重置 {resetIn(win().resets_at!, Date.now())}</text>
           </Show>
         </box>
       )}
@@ -586,7 +577,7 @@ function WorkerWindowRow(props: { api: TuiPluginApi; win: UsageWindowView }) {
       <text fg={poolTone(props.api, util())}>{blockBar(util())}</text>
       <text fg={poolTone(props.api, util())}>{percent(util()).padStart(4)}</text>
       <Show when={props.win.resetsAt}>
-        <text fg={theme().textMuted}>重置 {resetIn(props.win.resetsAt!).padStart(7)}</text>
+        <text fg={theme().textMuted}>重置 {resetIn(props.win.resetsAt!, Date.now()).padStart(7)}</text>
       </Show>
     </box>
   )

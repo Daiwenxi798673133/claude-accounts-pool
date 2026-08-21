@@ -3,6 +3,7 @@ import type { StoredAccount } from "./accounts.ts"
 import type { OpenaiUsage } from "./openai-usage.ts"
 import {
   blockBar,
+  resetIn,
   clampSelection,
   heldStateFor,
   pinnedStateFor,
@@ -432,4 +433,33 @@ test("the bar clamps a utilization it should never have been given", () => {
 // what it did.
 test("the default width is the opencode panel's", () => {
   expect(blockBar(100)).toHaveLength(16)
+})
+
+// MOVED HERE FROM dialogs.tsx alongside blockBar, and the clock became a PARAMETER on the way: the
+// senpi row formatter is documented pure and clock-free, so a function reading Date.now() inside
+// would make every one of its tests depend on wall time.
+test("the countdown shortens as the horizon nears", () => {
+  const now = Date.parse("2026-08-21T00:00:00Z")
+  const inMs = (ms: number) => new Date(now + ms).toISOString()
+
+  expect(resetIn(inMs(45 * 60_000), now)).toBe("45m")
+  expect(resetIn(inMs(2 * 3_600_000 + 13 * 60_000), now)).toBe("2h 13m")
+  expect(resetIn(inMs(6 * 86_400_000 + 23 * 3_600_000), now)).toBe("6d 23h")
+})
+
+// A window whose reset has already passed but which the master has not re-swept is the ordinary
+// state between sweeps — it must read as "any moment now", never as a negative duration.
+test("a reset in the past reads as now", () => {
+  const now = Date.parse("2026-08-21T00:00:00Z")
+  expect(resetIn(new Date(now - 60_000).toISOString(), now)).toBe("now")
+  expect(resetIn(new Date(now).toISOString(), now)).toBe("now")
+})
+
+// Seven cells is the widest form ("23h 59m"), and the senpi panel reserves exactly that so a column
+// of countdowns lines up. A form wider than its budget would push the next row's columns out.
+test("no countdown is wider than the column reserved for it", () => {
+  const now = Date.parse("2026-08-21T00:00:00Z")
+  for (const ms of [0, 1, 59_000, 60_000, 3_599_000, 3_600_000, 86_399_000, 86_400_000, 30 * 86_400_000]) {
+    expect(resetIn(new Date(now + ms).toISOString(), now).length).toBeLessThanOrEqual(7)
+  }
 })
