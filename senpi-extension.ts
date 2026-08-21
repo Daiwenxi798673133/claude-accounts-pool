@@ -42,21 +42,53 @@
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
+import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
 import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
+import { createUsagePanel, type PanelUi } from "./src/senpi/usagePanel.ts"
+import { formatStatusText, type SlotHold } from "./src/senpi/usageRows.ts"
 import { resolveWorkerConfig } from "./src/senpi/workerConfig.ts"
 import { log } from "./src/logger.ts"
 import { createLeaseClient } from "./src/worker/leaseClient.ts"
 import { installLeaseKeeper } from "./src/worker/leaseKeeper.ts"
+import { createManualSwitch } from "./src/worker/manualSwitch.ts"
+import { createUsageClient } from "./src/worker/usageClient.ts"
 
-// Only the two verbs this entry uses, declared structurally rather than imported: senpi is not a
-// dependency of this package, and taking one on to name a single event would tie the plugin's
-// install to a senpi version for no gain.
+// Only the verbs this entry uses, declared structurally rather than imported: senpi is not a
+// dependency of this package, and taking one on to name a few members would tie the plugin's install
+// to a senpi version for no gain. Widened from `on` alone when the panel arrived — the members below
+// are the ones traced in senpi 2026.8.19's own types.d.ts, and nothing here relies on the rest.
+type SenpiCtx = {
+  // False in `-p` and other non-interactive runs. senpi's own builtins branch on it rather than
+  // opening a dialog that has nowhere to draw.
+  hasUI: boolean
+  ui: {
+    select: (title: string, options: string[]) => Promise<string | undefined>
+    notify: (message: string, type?: "info" | "warning" | "error") => void
+    // Footer text, persistent until called again. There is no clearStatus in senpi's API: passing
+    // undefined for the same key IS the clear.
+    setStatus: (key: string, text: string | undefined) => void
+  }
+}
+
 type SenpiExtensionApi = {
   // The handler's promise MATTERS: senpi's runner awaits it (`await handler(event, ctx)`), which is
   // the only thing that lets a turn wait for a lease instead of racing it.
-  on: (event: "turn_start", handler: () => Promise<void>) => void
+  on: (event: "turn_start", handler: (event: unknown, ctx: SenpiCtx) => Promise<void>) => void
+  // The name is registered BARE. senpi's dispatcher strips the leading slash off the typed line and
+  // matches what remains, so "usage" is what makes `/usage` work — writing "/usage" here would
+  // require the operator to type `//usage`.
+  registerCommand: (
+    name: string,
+    options: { description?: string; handler: (args: string, ctx: SenpiCtx) => Promise<void> },
+  ) => void
+  // Lowercase, `+`-joined ("ctrl+shift+u"), NOT emacs notation — senpi's KeyId union spells it that
+  // way and an unparsed key silently never fires.
+  registerShortcut: (
+    shortcut: string,
+    options: { description?: string; handler: (ctx: SenpiCtx) => Promise<void> | void },
+  ) => void
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -67,10 +99,44 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 // survives both, because it hangs off the realm rather than the module.
 const KEEPER_KEY = Symbol.for("claude-accounts-pool/senpi-lease-keeper")
 
-type Installed = { ensureLeased: () => Promise<void> }
+// The footer key. One key for this whole extension, so the status line replaces itself instead of
+// stacking a second entry per turn.
+const STATUS_KEY = "claude-accounts-pool"
+
+// Not any of ctrl+{a,c,d,f,g,l,n,o,p,r,s,t,u,v,x,z}: senpi's interactive mode already binds every one
+// of those, and registering over one would shadow a working key rather than add a new one. Whether a
+// terminal can even DELIVER ctrl+shift+u distinguishably from ctrl+u depends on its keyboard protocol
+// — `/usage` is the surface that always works, and this is the accelerator for terminals that can.
+const PANEL_SHORTCUT = "ctrl+shift+u"
+
+type QueuedToast = { variant: "warning" | "error"; message: string }
+
+// Everything the registered surfaces need from one installed worker. `ensureLeased` is the turn gate;
+// the rest is what the panel, the status line and the external-switch notice read.
+type Installed = {
+  ensureLeased: () => Promise<void>
+  statusText: () => string
+  openPanel: (ui: PanelUi) => Promise<void>
+  // Keeper warnings that arrived with NO ctx to show them on. The keeper renews on an interval that
+  // fires between turns, and a ctx captured to serve it would be invalidated by the next /reload and
+  // then throw from every method — so the message waits here for a turn to bring a live one.
+  drainToasts: () => QueuedToast[]
+  followExternal: () => Promise<string[]>
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+// A stage that must never fail a turn. senpi has no hook an extension can abort a turn from, so the
+// only options are "log it" and "let it propagate and break the session" — and the second is never
+// the right trade for a status line or a notice.
+async function guard(event: string, run: () => Promise<void>): Promise<void> {
+  try {
+    await run()
+  } catch (error) {
+    log.warn(event, { error: errorMessage(error) })
+  }
 }
 
 function install(masterUrl: string, workerId: string, slots: number): Installed {
@@ -90,6 +156,20 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
   // exclusion set and the claim have to be one section owned in a single place. See slotRoster.ts.
   const roster = createSlotRoster()
   const joiners: Array<() => Promise<void>> = []
+  // RETAINED, where this loop used to drop them on the floor. `heldAccountId()` is the only thing in
+  // the process that knows which account a slot is on — a lease writes access and expiry and nothing
+  // else — so the panel cannot mark a row, and the status line cannot name an account, without these.
+  const slotUnits: {
+    slotName: string
+    keeper: { heldAccountId: () => string | undefined; adoptAccount: (accountId: string) => void }
+    writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
+  }[] = []
+  const toasts: QueuedToast[] = []
+  // Filled from a switch the operator performed, which is the one moment the label and the prefix are
+  // both in hand. NOT from a background fetch: resolving a label for the status line would otherwise
+  // cost a master round trip on every single turn, to render a nicety. Until the first switch the
+  // status shows the prefix alone, which is what the panel's own id column shows anyway.
+  const labelByPrefix = new Map<string, string>()
   // READ BEFORE THE FIRST AWAIT, and published below without one. senpi decides whether this
   // provider is usable while starting a turn, which is earlier than any hook an extension can wait
   // on — so a token that only arrives when the startup lease returns is too late, and the run dies
@@ -112,11 +192,25 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       // handed the one this slot is already publishing.
       roster.seed(slotName, warm.accountId)
     }
+    // ONE WRITE SHAPE for this slot, shared by the renewal loop and by the panel's manual switch.
+    // Hoisted out of the keeper's dep object for exactly that reason: a switch that published the
+    // token but forgot the cache would leave the next process cold, and a switch that forgot `live`
+    // would make the NEXT renewal persist a map still naming the account we left.
+    //
+    // Published first, persisted second. The cache is an optimisation for the NEXT process and
+    // writeLeaseCache swallows its own failures, so a disk fault can never cost this process the
+    // lease it just landed.
+    const writeSlotLease = async (input: { access: string; expires: number; accountId: string }): Promise<void> => {
+      await envSlot.writeLease(input)
+      live.set(slotName, { accountId: input.accountId, access: input.access, expires: input.expires })
+      await writeLeaseCache(live)
+    }
+
     const keeper = installLeaseKeeper({
       // The RAW client wrapped in the roster's section, unlike src/worker/install.ts which wraps it
-      // in createPinnedLease. Pins are stored in opencode's TuiKV and surfaced through its /usage
-      // panel, neither of which exists here; senpi carries its own `pinnedAccount` setting instead.
-      // ponytail: unpinned leases only. Wire pins in when the senpi panel can express one.
+      // in createPinnedLease. A pin there is local state in opencode's TuiKV; here the master's own
+      // `pinnedBy` is the record and the panel sends `pinned` on the lease that sets it, so this
+      // background loop has no pin to re-assert and stays the plain rotation path.
       client: {
         lease: (input) =>
           roster.withSlot(slotName, async (ctx) => {
@@ -129,25 +223,20 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
           }),
       },
       readAuth: envSlot.readAuth,
-      // Published first, persisted second. The cache is an optimisation for the NEXT process and
-      // writeLeaseCache swallows its own failures, so a disk fault can never cost this process the
-      // lease it just landed.
-      writeLease: async (input) => {
-        await envSlot.writeLease(input)
-        live.set(slotName, { accountId: input.accountId, access: input.access, expires: input.expires })
-        await writeLeaseCache(live)
-      },
-      // ponytail: log-only. The keeper's fail-safe message is user-facing in opencode
-      // (api.ui.toast); senpi's equivalent surface is not wired yet, so a stranded worker is
-      // visible in the log bundle but not on screen. Upgrade path: pass pi.ui.notify once the
-      // structural type above is widened to include it.
+      writeLease: writeSlotLease,
+      // QUEUED, not shown, and not dropped either — which is what it used to be. The keeper's
+      // fail-safe message ("this worker is stranded") is user-facing in opencode via api.ui.toast,
+      // but it is raised from an interval tick that owns no ctx, and senpi throws from a ctx captured
+      // past its session. So it is logged AND parked for the next turn to render on a live one.
       toast: ({ variant, message }) => {
+        toasts.push({ variant, message })
         if (variant === "error") log.error("senpi:lease-toast", { slotName, message })
         else log.warn("senpi:lease-toast", { slotName, message })
       },
       sleep,
     })
     joiners.push(createLeaseJoiner(keeper.tickOnce))
+    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease })
   }
 
   // allSettled, NOT all: senpi selects among whatever slots currently carry a token, so one slot's
@@ -166,8 +255,85 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
   // Registered through ensureLeased so the first turn JOINS this lease instead of skipping past it.
   void ensureLeased().catch((error: unknown) => log.warn("senpi:startup-lease-fail", { error: errorMessage(error) }))
 
-  log.info("senpi:lease-keeper-installed", { workerId, slots })
-  return { ensureLeased }
+  // Asked fresh every time rather than cached: a renewal or a switch moves an account between two
+  // reads, and a panel drawn from a stale copy marks the row the operator just left as the one in use.
+  const held = (): SlotHold[] =>
+    slotUnits.map((slot) => {
+      const accountId = slot.keeper.heldAccountId()
+      return accountId === undefined ? { slotName: slot.slotName } : { slotName: slot.slotName, accountId }
+    })
+
+  // The panel's `enter`, for ONE slot. Everything about it is per-invocation: `ui` because a ctx must
+  // never outlive its call, and createManualSwitch because its `toast` is that ctx's notify.
+  //
+  // THE SAME ROSTER SECTION A RENEWAL USES, and that is the whole reason this lives here rather than
+  // in usagePanel.ts. K keepers renew on K intervals that fire at nearly the same instant; a switch
+  // performed outside the section would compute its claim against an exclusion set another slot is
+  // mid-way through changing, and two slots would end up booked on one account.
+  const switchTo =
+    (ui: PanelUi) =>
+    async (input: { slotName: string; prefix: string; label: string; pin: boolean }): Promise<void> => {
+      const unit = slotUnits.find((slot) => slot.slotName === input.slotName)
+      if (unit === undefined) return
+      const manual = createManualSwitch({
+        client: {
+          // No excludeAccountIds: this request NAMES an account, and the master short-circuits its
+          // ranking for a named one — an exclusion it does not consult would be noise on the wire.
+          lease: (leaseInput) =>
+            roster.withSlot(input.slotName, async (section) => {
+              const outcome = await client.lease(leaseInput)
+              if (outcome.ok) section.claim(outcome.lease.accountId)
+              return outcome
+            }),
+        },
+        writeLease: unit.writeLease,
+        // manualSwitch owns every sentence this path can produce — success, each refusal, the
+        // version-skew guard — so mapping variants is all that is left. `success` becomes `info`
+        // because senpi has no success level.
+        toast: ({ variant, message }) => ui.notify(message, variant === "success" ? "info" : variant),
+      })
+      const switched = await manual.switchTo({ prefix: input.prefix, label: input.label, pin: input.pin })
+      if (!switched.ok) return
+      // The renewal loop performed no lease, so it would otherwise keep naming the account we just
+      // left as the one we hold — and that id is the master's rotation anchor.
+      unit.keeper.adoptAccount(switched.accountId)
+      labelByPrefix.set(input.prefix, input.label)
+    }
+
+  const usage = createUsageClient({ fetchImpl: fetch, masterUrl })
+
+  return {
+    ensureLeased,
+    statusText: () => formatStatusText({ held: held(), labelByPrefix }),
+    drainToasts: () => toasts.splice(0, toasts.length),
+    openPanel: (ui) =>
+      createUsagePanel({
+        usage,
+        switchTo: switchTo(ui),
+        slots: slotUnits.map((slot) => slot.slotName),
+        held,
+        workerId,
+      }).open(ui),
+    // ADOPT, not merely announce. The account this process still publishes may already have been
+    // handed to somebody else, and the master's rotation anchor for this workerId has moved with the
+    // lease that did it — so staying put means renewing against an anchor the master has left behind.
+    // Inside the roster section for the same reason a switch is.
+    followExternal: async (): Promise<string[]> => {
+      const moved = detectExternalSwitches({ cached: readLeaseCache(process.env), held: held() })
+      const notices: string[] = []
+      for (const change of moved) {
+        const unit = slotUnits.find((slot) => slot.slotName === change.slotName)
+        if (unit === undefined) continue
+        await roster.withSlot(change.slotName, async (section) => {
+          section.claim(change.to.accountId)
+          await unit.writeLease(change.to)
+          unit.keeper.adoptAccount(change.to.accountId)
+        })
+        notices.push(externalSwitchNotice(change))
+      }
+      return notices
+    },
+  }
 }
 
 export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi): void {
@@ -201,9 +367,45 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   // The catch is deliberate and its consequence is the residual hazard: a turn is never failed on
   // this extension's behalf, because no supported hook can abort one. A worker that cannot lease
   // therefore still runs — on ambient credentials — and only the log says so.
-  pi.on("turn_start", () =>
-    installed
+  pi.on("turn_start", async (_event, ctx) => {
+    // BEFORE the lease, not after. Adopting first is what makes the renewal below name the account we
+    // actually hold as `currentAccountId` — the master's rotation anchor — instead of the one another
+    // process moved us off.
+    await guard("senpi:turn-prelude", async () => {
+      for (const parked of installed.drainToasts()) ctx.ui.notify(parked.message, parked.variant)
+      for (const notice of await installed.followExternal()) ctx.ui.notify(notice, "warning")
+    })
+    await installed
       .ensureLeased()
-      .catch((error: unknown) => log.error("senpi:turn-lease-fail", { error: errorMessage(error) })),
-  )
+      .catch((error: unknown) => log.error("senpi:turn-lease-fail", { error: errorMessage(error) }))
+    // LAST, so it reports the lease this turn actually got. Its own stage because a footer is never
+    // worth failing a turn over, and a lease failure must still leave the line truthful.
+    await guard("senpi:turn-status", () => {
+      ctx.ui.setStatus(STATUS_KEY, installed.statusText())
+      return Promise.resolve()
+    })
+  })
+
+  // The methods are re-wrapped rather than passed as references. `ctx.ui.select` detached from `ctx.ui`
+  // loses its receiver, and senpi's implementation is a method on a live TUI object — an unbound call
+  // is the kind of failure that only appears in the real terminal.
+  const openPanel = (ctx: SenpiCtx): Promise<void> =>
+    installed.openPanel({
+      hasUI: ctx.hasUI,
+      select: (title, options) => ctx.ui.select(title, options),
+      notify: (message, type) => ctx.ui.notify(message, type),
+    })
+
+  // Registered per factory call, unlike the keeper above: senpi builds a fresh extension instance per
+  // session and its command map lives on that instance, so this is a registration into this session
+  // rather than process-wide state to guard against duplicating.
+  pi.registerCommand("usage", {
+    description: "账号池用量：查看池内账号、切换或钉住当前账号",
+    handler: (_args, ctx) => guard("senpi:usage-command", () => openPanel(ctx)),
+  })
+
+  pi.registerShortcut(PANEL_SHORTCUT, {
+    description: "打开账号池用量面板",
+    handler: (ctx) => guard("senpi:usage-shortcut", () => openPanel(ctx)),
+  })
 }
