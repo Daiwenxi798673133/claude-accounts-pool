@@ -110,16 +110,56 @@ function pinColumn(account: UsageAccountView, workerId: string): string {
   return account.pinnedBy.includes(workerId) ? "pin" : ""
 }
 
-function windowsColumn(account: UsageAccountView): string {
+// `100%` is the widest a utilization can be, and every percentage is right-aligned into that width.
+// Ragged numbers are what made the block a staircase: `5h 3%` and `5h 76%` put the NEXT label on two
+// different cells, so one account crossing into three digits shifted every other row.
+const WINDOW_PCT_WIDTH = 4
+
+// The window columns THIS SNAPSHOT needs, keyed by label in first-seen order.
+//
+// A PROPERTY OF THE TABLE, NOT OF A ROW. Accounts do not all carry the same windows — the five-hour
+// and seven-day pair is fixed but the per-model weekly ones are dynamic, so one row has `Fable` and
+// the next has nothing there. Sizing each row against its own windows is what let two rows disagree
+// about where a column starts; deciding once for the whole snapshot is what makes them agree.
+//
+// Keyed by LABEL rather than by index, which is the stricter of the two: an account whose windows
+// arrive in a different order would otherwise put its second window under the first one's heading.
+function windowColumns(accounts: readonly UsageAccountView[]): { label: string; width: number }[] {
+  const columns: { label: string; width: number }[] = []
+  for (const account of accounts) {
+    if (!account.hasUsage) continue
+    for (const window of account.windows) {
+      const label = shortLabel(window)
+      const existing = columns.find((column) => column.label === label)
+      if (existing === undefined) columns.push({ label, width: displayWidth(label) })
+      // A dynamic model name can be wider than the first one seen under the same heading only if the
+      // labels differ, which would make it a different column — so the max is defensive, not load-bearing.
+      else existing.width = Math.max(existing.width, displayWidth(label))
+    }
+  }
+  return columns
+}
+
+function shortLabel(window: UsageWindowView): string {
+  return WINDOW_SHORT_LABEL[window.label] ?? window.label
+}
+
+function windowsColumn(account: UsageAccountView, columns: readonly { label: string; width: number }[]): string {
   // 未采集 ≠ 用量为零。Keyed off `hasUsage`, never off `windows.length`, because the two differ: an
   // account the poller reached but which reported no window is also `--`, and `0%` on either would
   // rank the pool's least-known account as its emptiest and send the operator straight at it.
   if (!account.hasUsage || account.windows.length === 0) return "--"
-  return account.windows.map(oneWindow).join("  ")
-}
-
-function oneWindow(window: UsageWindowView): string {
-  return `${WINDOW_SHORT_LABEL[window.label] ?? window.label} ${window.utilization}%`
+  const cells = columns.map((column) => {
+    const width = column.width + 1 + WINDOW_PCT_WIDTH
+    const window = account.windows.find((candidate) => shortLabel(candidate) === column.label)
+    // A BLANK OF THE SAME WIDTH, not a skipped column: an account missing this window must leave the
+    // hole where it is so the columns after it still line up with everybody else's.
+    if (window === undefined) return " ".repeat(width)
+    return `${padCell(column.label, column.width)} ${`${window.utilization}%`.padStart(WINDOW_PCT_WIDTH)}`
+  })
+  // trimEnd, so a row whose last columns are blank does not carry a phantom one on its end — `ui.select`
+  // prints the line raw and the flags column, when there is one, follows immediately after this.
+  return cells.join(" ".repeat(COLUMN_GAP)).trimEnd()
 }
 
 // Only the ones that HOLD. A fixed slate of three markers would put three pieces of noise on every
@@ -140,13 +180,15 @@ export function formatAccountRows(input: {
 }): { rows: string[]; accountByRow: Map<string, UsageAccountView> } {
   const accountByRow = new Map<string, UsageAccountView>()
   const rows: string[] = []
+  // Decided ONCE, before any row is built: this is the layout every row shares.
+  const windows = windowColumns(input.view.accounts)
   for (const account of input.view.accounts) {
     const columns = [
       padCell(account.idPrefix, COLUMN_WIDTH.id),
       padCell(truncateCell(account.label, COLUMN_WIDTH.label), COLUMN_WIDTH.label),
       padCell(heldColumn(account, input.held, input.workerId), COLUMN_WIDTH.held),
       padCell(pinColumn(account, input.workerId), COLUMN_WIDTH.pin),
-      windowsColumn(account),
+      windowsColumn(account, windows),
     ]
     // Omitted rather than emptied: an empty trailing column would leave two stray spaces on every
     // healthy row, and `ui.select` prints the line raw.

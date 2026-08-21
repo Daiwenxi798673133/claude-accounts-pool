@@ -104,8 +104,55 @@ test("columns land on identical cell offsets even when a label is CJK", () => {
   expect(cells(cjk ?? "", LABEL_CELL).startsWith("测试账号@")).toBe(true)
   expect(cells(ascii ?? "", PIN_CELL).startsWith("pin")).toBe(true)
   expect(cells(cjk ?? "", PIN_CELL).startsWith("pin")).toBe(true)
-  expect(cells(ascii ?? "", WINDOWS_CELL)).toBe("5h 2%")
-  expect(cells(cjk ?? "", WINDOWS_CELL)).toBe("5h 7%")
+  // The percentage is right-aligned into its own fixed width, so a 1-digit and a 3-digit utilization
+  // put the next column on the same cell — see the window-alignment test below.
+  expect(cells(ascii ?? "", WINDOWS_CELL)).toBe("5h   2%")
+  expect(cells(cjk ?? "", WINDOWS_CELL)).toBe("5h   7%")
+})
+
+// THE WINDOWS HAVE TO BE A TABLE, not three strings joined per row. A percentage is 1–3 digits, so
+// joining `5h 3%` and `5h 76%` with a fixed separator puts `7d` on a different cell in every row and
+// the whole block reads as a staircase — which is what it did. Alignment is therefore a property of
+// the SNAPSHOT (every row shares one column layout), never of the row being rendered.
+test("window columns line up across rows regardless of digit count", () => {
+  const at = (row: string, needle: string): number => displayWidth(row.slice(0, row.indexOf(needle)))
+  const { rows } = rowsOf([
+    account({
+      idPrefix: "aaaaaaaa",
+      hasUsage: true,
+      windows: [
+        { label: "five_hour", utilization: 76 },
+        { label: "seven_day", utilization: 11 },
+        { label: "Fable", utilization: 3 },
+      ],
+    }),
+    account({
+      idPrefix: "bbbbbbbb",
+      hasUsage: true,
+      windows: [
+        { label: "five_hour", utilization: 3 },
+        { label: "seven_day", utilization: 0 },
+        { label: "Fable", utilization: 0 },
+      ],
+    }),
+    // Three digits, the widest a utilization can be — the column has to have been sized for it all
+    // along, or a single account at 100% shifts every other row's later columns.
+    account({
+      idPrefix: "cccccccc",
+      hasUsage: true,
+      windows: [
+        { label: "five_hour", utilization: 100 },
+        { label: "seven_day", utilization: 64 },
+      ],
+    }),
+  ])
+  const [wide, narrow, full] = rows as [string, string, string]
+
+  expect(at(wide, "7d")).toBe(at(narrow, "7d"))
+  expect(at(full, "7d")).toBe(at(narrow, "7d"))
+  expect(at(wide, "Fable")).toBe(at(narrow, "Fable"))
+  // The row missing the third window must not pad a phantom column onto its end.
+  expect(full.endsWith(" ")).toBe(false)
 })
 
 // 未采集 ≠ 用量为零。An account the poller failed on (or never reached) has NO number we are entitled
