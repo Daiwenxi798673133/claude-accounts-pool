@@ -83,14 +83,28 @@ export function panelTitle(view: UsageSnapshotView): string {
   return `账号池用量 · ${taken}${view.stale ? " · 数据可能过期" : ""}`
 }
 
+// EVERY OTHER VALUE IN THIS COLUMN IS A WORKER NAME, so ours has to read as one thing that is not a
+// name at all. It used to print the senpi SLOT (`env`), which put a token-variable's internal label
+// in a list of machines — reported straight off the live panel as "并没有 env 这个用户".
+//
+// Not `本机` either, and that is the non-obvious part: the operator's opencode worker (`vince-local`)
+// runs on the same machine and appears in this very column, so "本机" would describe two different
+// rows. `在用` says what is actually true and unambiguous — the omo drawing this panel is on it.
+const IN_USE_LABEL = "在用"
+
 // WHO holds this account, in the one column the operator scans to answer "can I take it".
 function heldColumn(account: UsageAccountView, held: readonly SlotHold[], workerId: string): string {
-  // THIS MACHINE FIRST, and named by SLOT rather than by workerId: a slot is what the operator would
-  // switch, and our own name in the holder chips would print this machine twice under two names.
-  // Through heldStateFor so the prefix rule lives in exactly one place — `=== true` because its third
-  // state (undefined, "no lease recorded") is not a match.
+  // THIS MACHINE FIRST, and never as our own workerId: it would print this machine twice under two
+  // names, once here and once in the holder chips below. Through heldStateFor so the prefix rule
+  // lives in exactly one place — `=== true` because its third state (undefined, "no lease
+  // recorded") is not a match.
   const mine = held.filter((slot) => heldStateFor(account.idPrefix, slot.accountId) === true)
-  if (mine.length > 0) return mine.map((slot) => slot.slotName).join(",")
+  if (mine.length > 0) {
+    // The slot is named only when this worker runs more than one, because only then can it vary. A
+    // single-slot worker is the default, and `在用 env` there is a word that never says anything.
+    if (held.length === 1) return IN_USE_LABEL
+    return `${IN_USE_LABEL} ${mine.map((slot) => slot.slotName).join(",")}`
+  }
   // `undefined` is a master too old to compute holders — NOT an account nobody holds. Rendering it as
   // blank is honest ("nothing said"); defaulting it to `[]` would assert a fact never computed.
   if (account.holders === undefined) return ""

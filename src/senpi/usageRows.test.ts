@@ -201,21 +201,38 @@ test("holder chips name the other machines and drop us", () => {
 // A lease names the FULL uuid while the row carries an 8-char prefix, so this is a prefix test and
 // cannot be an equality one. Two slots on one account is legal (senpi runs numbered token slots), and
 // the operator has to see both or a switch will look like it did nothing to the other slot.
-test("slots this machine holds are named by slot, one row per account", () => {
+test("the account this worker holds reads as a state, not as a slot name", () => {
   const full = "af008f89-1111-2222-3333-444455556666"
   const one = rowsOf([account({ idPrefix: "af008f89" })], [{ slotName: "env", accountId: full }])
-  const two = rowsOf(
+  const heldCell = (row?: string) => cells(row ?? "", HELD_CELL, HELD_CELL + COLUMN_WIDTH.held).trimEnd()
+
+  expect(heldCell(one.rows[0])).toBe("在用")
+  // NEVER the raw slot name. Every other value in this column is a workerId, so `env` read as a
+  // machine called "env" — reported from the live panel as "并没有 env 这个用户". A slot is senpi's
+  // internal name for a token variable and has no business in a column of holders.
+  expect(one.rows[0]).not.toContain("env")
+})
+
+// The slot is named ONLY when there is more than one, because only then does it tell the operator
+// something: with a single slot `在用 env` adds a word that can never vary.
+test("the slot is named only when this worker runs more than one", () => {
+  const full = "af008f89-1111-2222-3333-444455556666"
+  const heldCell = (row?: string) => cells(row ?? "", HELD_CELL, HELD_CELL + COLUMN_WIDTH.held).trimEnd()
+  const both = rowsOf(
     [account({ idPrefix: "af008f89" })],
     [
       { slotName: "env", accountId: full },
       { slotName: "env-2", accountId: full },
     ],
   )
-  const heldCell = (row?: string) => cells(row ?? "", HELD_CELL, HELD_CELL + COLUMN_WIDTH.held).trimEnd()
+  // Two slots configured, only one of them on this account.
+  const one = rowsOf(
+    [account({ idPrefix: "af008f89" })],
+    [{ slotName: "env", accountId: full }, { slotName: "env-2" }],
+  )
 
-  expect(heldCell(one.rows[0])).toBe("env")
-  expect(heldCell(two.rows[0])).toBe("env,env-2")
-  expect(two.rows).toHaveLength(2)
+  expect(heldCell(both.rows[0])).toBe("在用 env,env-2")
+  expect(heldCell(one.rows[0])).toBe("在用 env")
 })
 
 // `ui.select` renders an option as ONE raw line with no truncation, so a label wider than its column
