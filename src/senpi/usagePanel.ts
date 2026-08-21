@@ -42,6 +42,9 @@ export type UsagePanelDeps = {
   // The terminal's column count, or undefined when it cannot be read (a pipe, a non-tty). Decides
   // whether the usage bars fit; see formatAccountRows.
   terminalWidth: () => number | undefined
+  // Wall clock for the reset countdowns. A dependency rather than a direct Date.now() so the panel's
+  // own tests can pin it, same as every other edge in this module.
+  now: () => number
   // A GETTER, not a snapshot: the held set changes when a switch lands, and a panel that kept its
   // opening value would redraw the row the operator just left as the one still in use.
   held: () => readonly SlotHold[]
@@ -69,6 +72,7 @@ export function createUsagePanel(deps: UsagePanelDeps): { open: (ui: PanelUi) =>
         held: deps.held(),
         workerId: deps.workerId,
         ...(deps.terminalWidth() === undefined ? {} : { terminalWidth: deps.terminalWidth() }),
+        now: deps.now(),
       })
       const title = panelTitle(view)
       if (!ui.hasUI) {

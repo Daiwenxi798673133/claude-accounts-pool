@@ -384,6 +384,7 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         // process.stdout IS the terminal senpi renders into, so its column count is the real budget.
         // Undefined on a pipe or a non-tty, which formatAccountRows reads as "no constraint".
         terminalWidth: () => process.stdout.columns,
+        now: () => Date.now(),
         workerId,
       }).open(ui),
     // ADOPT, not merely announce. The account this process still publishes may already have been

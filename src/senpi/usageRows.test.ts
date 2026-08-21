@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import type { UsageAccountView, UsageSnapshotView } from "../cloud/protocol.ts"
-import { displayWidth } from "../panel-model.ts"
+import { displayWidth, RESET_WIDTH } from "../panel-model.ts"
 import {
   COLUMN_GAP,
   COLUMN_WIDTH,
@@ -444,4 +444,115 @@ test("an unknown terminal width keeps the bars", () => {
   ])
 
   expect(rows[0]).toContain("█")
+})
+
+const NOW = Date.parse("2026-08-21T00:00:00Z")
+const resetAt = (ms: number) => new Date(NOW + ms).toISOString()
+
+// "还剩多少额度" 和 "什么时候回血" 是两个问题，满格的那一行尤其只关心后者。The countdown answers it
+// without making the operator subtract an ISO instant from the current time.
+test("a window with a reset horizon shows how long until it comes back", () => {
+  const { rows } = formatAccountRows({
+    view: snapshot([
+      account({
+        idPrefix: "aaaaaaaa",
+        hasUsage: true,
+        windows: [
+          { label: "five_hour", utilization: 100, resetsAt: resetAt(2 * 3_600_000 + 13 * 60_000) },
+          { label: "seven_day", utilization: 63, resetsAt: resetAt(3 * 86_400_000) },
+        ],
+      }),
+    ]),
+    held: [],
+    workerId: WORKER,
+    terminalWidth: 300,
+    now: NOW,
+  })
+
+  expect(rows[0]).toContain("2h 13m")
+  expect(rows[0]).toContain("3d 0h")
+})
+
+// A window the master gave no horizon for (Fable at 0% routinely has none) must leave the column
+// EMPTY and STILL PADDED — the slot was reserved for the accounts that do have one, so swallowing it
+// here would pull every later column of this row left. Two window columns, because the bug only
+// shows when something has to line up AFTER the blank.
+test("a window with no reset horizon leaves its countdown blank but keeps the column", () => {
+  const cellOf = (row: string, needle: string): number => displayWidth(row.slice(0, row.indexOf(needle, 40)))
+  const { rows } = formatAccountRows({
+    view: snapshot([
+      account({
+        idPrefix: "aaaaaaaa",
+        hasUsage: true,
+        windows: [
+          { label: "five_hour", utilization: 10, resetsAt: resetAt(60 * 60_000) },
+          { label: "seven_day", utilization: 50, resetsAt: resetAt(3 * 86_400_000) },
+        ],
+      }),
+      account({
+        idPrefix: "bbbbbbbb",
+        hasUsage: true,
+        windows: [
+          { label: "five_hour", utilization: 20 },
+          { label: "seven_day", utilization: 60, resetsAt: resetAt(2 * 86_400_000) },
+        ],
+      }),
+    ]),
+    held: [],
+    workerId: WORKER,
+    terminalWidth: 300,
+    now: NOW,
+  })
+  const [withHorizon, without] = rows as [string, string]
+
+  expect(withHorizon).toContain("1h 0m")
+  expect(without).toContain("2d 0h")
+  // Nothing invented for the missing one.
+  expect(without).not.toContain("now")
+  // And the column after the blank starts on the same cell in both rows, which is the actual point.
+  expect(cellOf(without, "7d")).toBe(cellOf(withHorizon, "7d"))
+})
+
+// THREE TIERS, DROPPED IN PRIORITY ORDER. The countdown goes first because the bar answers the
+// question asked far more often ("how loaded is this account"); the bar goes second; the numbers
+// never go. Measured widths: countdown+bars needs ~136 columns, bars ~116, numbers ~89.
+test("decorations are dropped in priority order as the terminal narrows", () => {
+  const accounts = [
+    account({
+      idPrefix: "aaaaaaaa",
+      label: "vince.dai2@potentia.ai",
+      hasUsage: true,
+      windows: [
+        { label: "five_hour", utilization: 42, resetsAt: resetAt(2 * 3_600_000) },
+        { label: "seven_day", utilization: 63, resetsAt: resetAt(3 * 86_400_000) },
+        { label: "Fable", utilization: 3, resetsAt: resetAt(4 * 3_600_000) },
+      ],
+    }),
+  ]
+  const at = (terminalWidth: number) =>
+    formatAccountRows({ view: snapshot(accounts), held: [], workerId: WORKER, terminalWidth, now: NOW }).rows[0] ?? ""
+
+  const roomy = at(300)
+  expect(roomy).toContain("█")
+  expect(roomy).toContain("2h 0m")
+
+  const medium = at(120)
+  expect(medium).toContain("█")
+  expect(medium).not.toContain("2h 0m")
+
+  const tight = at(95)
+  expect(tight).not.toContain("█")
+  expect(tight).not.toContain("2h 0m")
+  expect(tight).toContain("42%")
+
+  // Every tier fits the width it was chosen for — that is the whole contract.
+  expect(displayWidth(roomy)).toBeLessThanOrEqual(300)
+  expect(displayWidth(medium)).toBeLessThanOrEqual(120)
+  expect(displayWidth(tight)).toBeLessThanOrEqual(95)
+})
+
+// The reserved slot must match the widest thing that can land in it, or one account crossing into
+// "23h 59m" shifts every other row's later columns.
+test("the reserved countdown column is the widest countdown", () => {
+  expect(RESET_WIDTH).toBe(7)
 })

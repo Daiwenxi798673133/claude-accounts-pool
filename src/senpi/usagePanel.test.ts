@@ -94,6 +94,7 @@ function panelWith(input: {
     held: () => input.held ?? slots.map((slotName) => ({ slotName })),
     pinnedSlots: input.pinnedSlots ?? (() => []),
     terminalWidth: () => 200,
+    now: () => Date.parse("2026-08-21T00:00:00Z"),
     workerId: WORKER_ID,
   })
   return { open: panel.open, switched }
