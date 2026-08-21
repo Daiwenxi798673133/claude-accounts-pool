@@ -21,6 +21,36 @@ export type UsageFetchFailure =
 
 export type UsageFetchOutcome = { ok: true; view: UsageSnapshotView } | { ok: false; failure: UsageFetchFailure }
 
+// A switch rather than accounts.ts's Record table, for ONE reason: `throttled` carries a number, and
+// a table of static strings has nowhere to put it. Exhaustiveness survives the change — the declared
+// `string` return means a kind added to UsageFetchFailure stops compiling here (the function would
+// fall through to an implicit undefined) until someone decides what the user is told.
+//
+// HERE RATHER THAN IN A PANEL, and that placement is the point: two front-ends now render this
+// transport — opencode's dialog and senpi's /usage — and a copy in each is how the same fault ends
+// up with two different sentences. Keeping the table beside the union it switches on is also what
+// makes a new failure kind a compile error in exactly one place.
+export function usageFailureMessage(failure: UsageFetchFailure): string {
+  switch (failure.kind) {
+    case "unreachable":
+      return "连不上云端账号池 master，无法获取用量，请检查网络或 master 状态"
+    case "http":
+      return "云端账号池暂时无法返回用量，请稍后重试"
+    case "bad-response":
+      return "云端账号池返回了无法识别的用量数据"
+    case "throttled":
+      // NOT phrased as an error: the master is working exactly as designed. The countdown is what makes
+      // that legible — without it a throttled refresh reads as a broken refresh control.
+      //
+      // SURFACE-NEUTRAL WORDING, deliberately: this sentence used to name opencode's `r` key, which is
+      // a keypress senpi's panel does not have (its refresh is a row you select). Both dialogs already
+      // render their own control, so naming one here could only ever be wrong on the other surface.
+      return failure.retryAfterMs === undefined
+        ? "master 刚刷新过用量，请稍后再刷新"
+        : `master 刚刷新过用量，${Math.ceil(failure.retryAfterMs / 1000)} 秒后可再刷新`
+  }
+}
+
 export type UsageClientDeps = {
   // Injected, never defaulted to the global: a client built without an explicit transport would
   // silently talk to the real network in tests.

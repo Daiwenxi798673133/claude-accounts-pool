@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { createUsageClient, parseUsageSnapshotView } from "./usageClient.ts"
+import { createUsageClient, parseUsageSnapshotView, usageFailureMessage } from "./usageClient.ts"
 
 const validView = {
   at: 1785500000000,
@@ -237,4 +237,24 @@ test("refreshSnapshot rejects a 200 whose body is not a snapshot", async () => {
   const outcome = await client.refreshSnapshot()
   expect(outcome.ok).toBe(false)
   if (!outcome.ok) expect(outcome.failure.kind).toBe("bad-response")
+})
+
+// THE WORDING LIVES WITH THE UNION so both panels say the same thing. The opencode dialog and the
+// senpi /usage panel are two front-ends over one transport, and a machine's operator may well use
+// both — the same fault answering with two different Chinese sentences reads as two different bugs.
+test("every usage failure kind has a message", () => {
+  expect(usageFailureMessage({ kind: "unreachable", detail: "boom" })).toContain("连不上")
+  expect(usageFailureMessage({ kind: "http", detail: "HTTP 500" })).toContain("稍后重试")
+  expect(usageFailureMessage({ kind: "bad-response", detail: "junk" })).toContain("无法识别")
+})
+
+// NOT PHRASED AS AN ERROR: the master's refresh throttle exists because a forced sweep calls
+// Anthropic once per account, so a 429 means the guard is working. The countdown is what makes that
+// legible — without it a throttled refresh reads as a broken refresh key.
+test("a throttled refresh reports the countdown when the master sent one", () => {
+  expect(usageFailureMessage({ kind: "throttled", retryAfterMs: 12_000 })).toContain("12")
+  // Rounded UP: telling the operator to wait 12 seconds when 12.4 remain sends them back too early.
+  expect(usageFailureMessage({ kind: "throttled", retryAfterMs: 11_200 })).toContain("12")
+  // A throttle we cannot put a number on is still a throttle, and must not claim "0 秒".
+  expect(usageFailureMessage({ kind: "throttled" })).not.toContain("0 秒")
 })

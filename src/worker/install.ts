@@ -20,7 +20,7 @@ import { installLeaseKeeper } from "./leaseKeeper.ts"
 import { createManualSwitch } from "./manualSwitch.ts"
 import { createPinnedLease, type PinStore } from "./pin.ts"
 import { createSwitchStrategy } from "./switchStrategy.ts"
-import { createUsageClient, type UsageFetchFailure } from "./usageClient.ts"
+import { createUsageClient, usageFailureMessage } from "./usageClient.ts"
 import { openWorkerUsageDialog } from "../dialogs.tsx"
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -33,27 +33,6 @@ const ID = "claude-accounts-usage"
 // book in, chosen for the same reason: it is the one place this plugin can write per-machine state that
 // outlives the process without inventing a file and a lock for it.
 const PIN_KV_KEY = "claude-accounts-usage.worker.pin"
-
-// A switch rather than accounts.ts's Record table, for ONE reason: `throttled` carries a number, and
-// a table of static strings has nowhere to put it. Exhaustiveness survives the change — the declared
-// `string` return means a kind added to UsageFetchFailure stops compiling here (the function would
-// fall through to an implicit undefined) until someone decides what the user is told.
-function usageFailureMessage(failure: UsageFetchFailure): string {
-  switch (failure.kind) {
-    case "unreachable":
-      return "连不上云端账号池 master，无法获取用量，请检查网络或 master 状态"
-    case "http":
-      return "云端账号池暂时无法返回用量，请稍后重试"
-    case "bad-response":
-      return "云端账号池返回了无法识别的用量数据"
-    case "throttled":
-      // NOT phrased as an error: the master is working exactly as designed. The countdown is what makes
-      // that legible — without it a throttled refresh reads as a broken `r` key.
-      return failure.retryAfterMs === undefined
-        ? "master 刚刷新过用量，请稍后再按 r"
-        : `master 刚刷新过用量，${Math.ceil(failure.retryAfterMs / 1000)} 秒后可再刷新`
-  }
-}
 
 // The SOLE credential-write seam on a worker, shared by the renewal loop, the rate-limit switch and
 // the panel's manual switch, so there is exactly one shape a worker can produce. `{kind:"lease"}`
