@@ -34,8 +34,11 @@ export type UsagePanelDeps = {
   // Performs the lease and reports its own outcome. NOT a function of this module: a switch has to
   // happen inside the slot roster's critical section and write three places in a fixed order, all of
   // which belong to the extension's composition root.
-  switchTo: (input: { slotName: string; prefix: string; label: string; pin: boolean }) => Promise<void>
+  switchTo: (input: { slotName: string; prefix: string; label: string; pin: "none" | "on" | "off" }) => Promise<void>
   slots: readonly string[]
+  // Which of our slots pin a given account, asked per render so an un-pin performed in this same
+  // panel session flips the verb the next time round.
+  pinnedSlots: (idPrefix: string) => readonly string[]
   // A GETTER, not a snapshot: the held set changes when a switch lands, and a panel that kept its
   // opening value would redraw the row the operator just left as the one still in use.
   held: () => readonly SlotHold[]
@@ -86,7 +89,11 @@ export function createUsagePanel(deps: UsagePanelDeps): { open: (ui: PanelUi) =>
       // string the operator cannot have typed.
       if (account === undefined) return
 
-      const { options, actionByOption } = formatSwitchActions({ account, slots: deps.slots })
+      const { options, actionByOption } = formatSwitchActions({
+        account,
+        slots: deps.slots,
+        pinnedSlots: deps.pinnedSlots(account.idPrefix),
+      })
       const picked = await ui.select(`${account.idPrefix} ${account.label}`, options)
       if (picked === undefined) return
       const action = actionByOption.get(picked)

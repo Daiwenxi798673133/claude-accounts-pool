@@ -162,11 +162,19 @@ export function formatAccountRows(input: {
   return { rows, accountByRow }
 }
 
-export type SwitchAction = { slotName: string; pin: boolean } | "back"
+// THREE STATES, MIRRORING manualSwitch's, because that module reads a bare `false` as UNPIN — an
+// instruction of its own — and `undefined` as "switch, no opinion about pinning". A boolean here
+// cannot tell those apart, and the one it silently picked reported every plain switch to the operator
+// as "已取消钉住". Naming the third state is what makes the wrong one unrepresentable.
+export type SwitchAction = { slotName: string; pin: "none" | "on" | "off" } | "back"
 
 export function formatSwitchActions(input: {
   account: UsageAccountView
   slots: readonly string[]
+  // Which of OUR slots currently pin THIS account. Drives the second verb, per slot: a slot already
+  // pinned here is offered the un-pin, because offering it "钉住" again is a no-op dressed as an
+  // action — and while the pin lives in this process, that would leave no way out of one.
+  pinnedSlots?: readonly string[]
 }): { options: string[]; actionByOption: Map<string, SwitchAction> } {
   const actionByOption = new Map<string, SwitchAction>()
   const options: string[] = []
@@ -174,17 +182,20 @@ export function formatSwitchActions(input: {
     options.push(option)
     actionByOption.set(option, action)
   }
+  const pinnedHere = (slotName: string): boolean => input.pinnedSlots?.includes(slotName) === true
   // One slot needs no slot name: there is nothing to disambiguate, and `（槽位 env）` on a
   // single-slot worker is pure noise. Several slots need one on EVERY option, or the operator has no
   // way to say which token slot the account should land in.
   const single = input.slots.length === 1 ? input.slots[0] : undefined
   if (single !== undefined) {
-    add("切换到此账号", { slotName: single, pin: false })
-    add("切换并钉住此账号", { slotName: single, pin: true })
+    add("切换到此账号", { slotName: single, pin: "none" })
+    if (pinnedHere(single)) add("取消钉住此账号", { slotName: single, pin: "off" })
+    else add("切换并钉住此账号", { slotName: single, pin: "on" })
   } else {
     for (const slotName of input.slots) {
-      add(`切换到此账号（槽位 ${slotName}）`, { slotName, pin: false })
-      add(`切换并钉住此账号（槽位 ${slotName}）`, { slotName, pin: true })
+      add(`切换到此账号（槽位 ${slotName}）`, { slotName, pin: "none" })
+      if (pinnedHere(slotName)) add(`取消钉住此账号（槽位 ${slotName}）`, { slotName, pin: "off" })
+      else add(`切换并钉住此账号（槽位 ${slotName}）`, { slotName, pin: "on" })
     }
   }
   add("返回", "back")

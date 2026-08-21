@@ -74,12 +74,13 @@ function usageStub(outcomes: { fetch: UsageFetchOutcome; refresh?: UsageFetchOut
   }
 }
 
-type Switched = { slotName: string; prefix: string; label: string; pin: boolean }
+type Switched = { slotName: string; prefix: string; label: string; pin: "none" | "on" | "off" }
 
 function panelWith(input: {
   usage: { fetchSnapshot: () => Promise<UsageFetchOutcome>; refreshSnapshot: () => Promise<UsageFetchOutcome> }
   slots?: string[]
   held?: { slotName: string; accountId?: string }[]
+  pinnedSlots?: (idPrefix: string) => readonly string[]
 }): { open: (ui: PanelUi) => Promise<void>; switched: Switched[] } {
   const switched: Switched[] = []
   const slots = input.slots ?? ["env"]
@@ -91,6 +92,7 @@ function panelWith(input: {
     },
     slots,
     held: () => input.held ?? slots.map((slotName) => ({ slotName })),
+    pinnedSlots: input.pinnedSlots ?? (() => []),
     workerId: WORKER_ID,
   })
   return { open: panel.open, switched }
@@ -163,7 +165,7 @@ test("picking a row then 切换 switches to that row's account", async () => {
 
   await open(run.ui)
 
-  expect(switched).toEqual([{ slotName: "env", prefix: "eaaa1a79", label: "vince.dai3@potentia.ai", pin: false }])
+  expect(switched).toEqual([{ slotName: "env", prefix: "eaaa1a79", label: "vince.dai3@potentia.ai", pin: "none" }])
   // Two dialogs: the account list, then the action list titled with the chosen account.
   expect(run.shown).toHaveLength(2)
   expect(run.shown[1]?.title).toContain("eaaa1a79")
@@ -179,7 +181,22 @@ test("切换并钉住 sends the pin flag", async () => {
 
   await open(run.ui)
 
-  expect(switched).toEqual([{ slotName: "env", prefix: "af008f89", label: "vince.dai2@potentia.ai", pin: true }])
+  expect(switched).toEqual([{ slotName: "env", prefix: "af008f89", label: "vince.dai2@potentia.ai", pin: "on" }])
+})
+
+// The way BACK OUT of a pin. The pin lives in this process, so if the panel only ever offered "钉住"
+// there would be no way to release one short of restarting omo — and the plain switch must stay
+// distinguishable from the un-pin, because manualSwitch says a different sentence for each.
+test("an already-pinned slot is offered the un-pin and reports it as one", async () => {
+  const { usage } = usageStub({ fetch: { ok: true, view: TWO_ACCOUNTS } })
+  const { open, switched } = panelWith({ usage, pinnedSlots: (idPrefix) => (idPrefix === "af008f89" ? ["env"] : []) })
+  const rows = await rowsOf(open)
+  const run = scriptedUi([accountRow(rows, "af008f89"), "取消钉住此账号"])
+
+  await open(run.ui)
+
+  expect(run.shown[1]?.options).toEqual(["切换到此账号", "取消钉住此账号", "返回"])
+  expect(switched).toEqual([{ slotName: "env", prefix: "af008f89", label: "vince.dai2@potentia.ai", pin: "off" }])
 })
 
 // Escape resolves undefined rather than throwing, and the ONLY correct response is silence: a toast
@@ -283,5 +300,5 @@ test("two slots offer a switch per slot", async () => {
   await open(run.ui)
 
   expect(run.shown[1]?.options.some((option) => option.includes("槽位 env"))).toBe(true)
-  expect(switched).toEqual([{ slotName: "env-2", prefix: "af008f89", label: "vince.dai2@potentia.ai", pin: false }])
+  expect(switched).toEqual([{ slotName: "env-2", prefix: "af008f89", label: "vince.dai2@potentia.ai", pin: "none" }])
 })

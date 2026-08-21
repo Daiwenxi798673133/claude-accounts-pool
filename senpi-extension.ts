@@ -53,6 +53,7 @@ import { log } from "./src/logger.ts"
 import { createLeaseClient } from "./src/worker/leaseClient.ts"
 import { installLeaseKeeper } from "./src/worker/leaseKeeper.ts"
 import { createManualSwitch } from "./src/worker/manualSwitch.ts"
+import { createPinnedLease, type PinStore } from "./src/worker/pin.ts"
 import { createUsageClient } from "./src/worker/usageClient.ts"
 
 // Only the verbs this entry uses, declared structurally rather than imported: senpi is not a
@@ -163,6 +164,7 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     slotName: string
     keeper: { heldAccountId: () => string | undefined; adoptAccount: (accountId: string) => void }
     writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
+    pin: PinStore
   }[] = []
   const toasts: QueuedToast[] = []
   // Filled from a switch the operator performed, which is the one moment the label and the prefix are
@@ -206,22 +208,55 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       await writeLeaseCache(live)
     }
 
-    const keeper = installLeaseKeeper({
-      // The RAW client wrapped in the roster's section, unlike src/worker/install.ts which wraps it
-      // in createPinnedLease. A pin there is local state in opencode's TuiKV; here the master's own
-      // `pinnedBy` is the record and the panel sends `pinned` on the lease that sets it, so this
-      // background loop has no pin to re-assert and stays the plain rotation path.
-      client: {
-        lease: (input) =>
-          roster.withSlot(slotName, async (ctx) => {
-            const outcome = await client.lease({ ...input, excludeAccountIds: ctx.excludeAccountIds })
-            // Claimed only on success, and inside the section: a pick that failed to mint leaves this
-            // slot on whatever it had, and recording it would make every other slot steer around a
-            // hold that does not exist.
-            if (outcome.ok) ctx.claim(outcome.lease.accountId)
-            return outcome
-          }),
+    // THE PIN, IN MEMORY, PER SLOT. opencode persists it in TuiKV so a pin survives a restart; there
+    // is no equivalent store on this side, and inventing a file for it would make a pin a standing
+    // instruction that outlives every process that could report it. Per slot rather than per worker
+    // because with K slots one may be pinned while the others keep rotating.
+    let pinnedPrefix: string | undefined
+    const pin: PinStore = {
+      get: () => pinnedPrefix,
+      set: (idPrefix) => {
+        pinnedPrefix = idPrefix
       },
+    }
+
+    // The roster's section: the ONLY place a lease for this slot may be minted.
+    const rosterLease = (input: {
+      reason: "prelease" | "ratelimit"
+      currentAccountId?: string
+      preferredAccountIdPrefix?: string
+      pinned?: boolean
+    }) =>
+      roster.withSlot(slotName, async (section) => {
+        const outcome = await client.lease({ ...input, excludeAccountIds: section.excludeAccountIds })
+        // Claimed only on success, and inside the section: a pick that failed to mint leaves this
+        // slot on whatever it had, and recording it would make every other slot steer around a
+        // hold that does not exist.
+        if (outcome.ok) section.claim(outcome.lease.accountId)
+        return outcome
+      })
+
+    // Its toast is queued like the keeper's, and for the same reason: dropping a pin reverses an
+    // instruction the operator gave by hand, so it must be said out loud — but it happens on an
+    // interval tick that holds no ctx.
+    const pinnedLease = createPinnedLease({
+      client: { lease: rosterLease },
+      pin,
+      toast: ({ variant, message }) => {
+        toasts.push({ variant, message })
+        log.warn("senpi:pin-toast", { slotName, message })
+      },
+    })
+
+    const keeper = installLeaseKeeper({
+      // PIN-AWARE, exactly as src/worker/install.ts's renewal loop is — and it has to be. The master's
+      // `pinnedBy` is a property of the LEASE, so the next renewal, sending no `pinned`, overwrites
+      // the record and the operator's pin is gone within one renewal cycle (≤5 min before expiry)
+      // while the panel promised it would hold until the quota was spent. This wrapper re-names the
+      // pinned account on every renewal, and gives the pin up on a refusal — the one path allowed to
+      // abandon it, because a worker that keeps naming an account the master keeps refusing never
+      // renews again. See pin.ts.
+      client: { lease: pinnedLease },
       readAuth: envSlot.readAuth,
       writeLease: writeSlotLease,
       // QUEUED, not shown, and not dropped either — which is what it used to be. The keeper's
@@ -235,8 +270,15 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       },
       sleep,
     })
+    // ADOPT THE WARM LEASE, and this is not bookkeeping — it is the only thing that makes the first
+    // /usage able to mark a row. `heldAccountId` is set by a successful renewal, and when the cached
+    // lease is still fresh there IS no renewal: renewalDue() says no, the keeper stays quiet, and the
+    // panel then draws the account this worker is publishing as one it does not hold. Measured exactly
+    // that way — the held row showed the other holders' `+1` instead of `env`. The opencode worker
+    // avoids it by adopting the recorded id before its first tick (see src/worker/install.ts).
+    if (warm) keeper.adoptAccount(warm.accountId)
     joiners.push(createLeaseJoiner(keeper.tickOnce))
-    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease })
+    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease, pin })
   }
 
   // allSettled, NOT all: senpi selects among whatever slots currently carry a token, so one slot's
@@ -272,9 +314,22 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
   // mid-way through changing, and two slots would end up booked on one account.
   const switchTo =
     (ui: PanelUi) =>
-    async (input: { slotName: string; prefix: string; label: string; pin: boolean }): Promise<void> => {
+    async (input: {
+      slotName: string
+      prefix: string
+      label: string
+      pin: "none" | "on" | "off"
+    }): Promise<void> => {
       const unit = slotUnits.find((slot) => slot.slotName === input.slotName)
       if (unit === undefined) return
+      // THE LOCAL WRITE COMES FIRST, and the order is the point twice over. A renewal firing while
+      // this request is in flight must already see the new intent — otherwise it asks for a ranked
+      // pick and rotates the operator off the row they just pinned. And on an un-pin, clearing first
+      // is what makes the local state correct even if the master never answers.
+      //
+      // A PLAIN SWITCH CLEARS THE PIN TOO, which is not cosmetic: leaving a pin on the account being
+      // left would have the next renewal re-name it and drag the operator straight back.
+      unit.pin.set(input.pin === "on" ? input.prefix : undefined)
       const manual = createManualSwitch({
         client: {
           // No excludeAccountIds: this request NAMES an account, and the master short-circuits its
@@ -292,8 +347,21 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         // because senpi has no success level.
         toast: ({ variant, message }) => ui.notify(message, variant === "success" ? "info" : variant),
       })
-      const switched = await manual.switchTo({ prefix: input.prefix, label: input.label, pin: input.pin })
-      if (!switched.ok) return
+      const switched = await manual.switchTo({
+        prefix: input.prefix,
+        label: input.label,
+        // OMITTED for a plain switch. manualSwitch's `pin` is three-state and a bare `false` is an
+        // UNPIN there — passing it for every switch is what made the panel announce "已取消钉住"
+        // to somebody who had never pinned anything.
+        ...(input.pin === "none" ? {} : { pin: input.pin === "on" }),
+      })
+      if (!switched.ok) {
+        // A pin the master would not serve must not survive as a standing instruction: every renewal
+        // from here would name it, be refused, and fall back — one wasted round trip per cycle for an
+        // account the operator has already been told is unavailable.
+        if (input.pin === "on") unit.pin.set(undefined)
+        return
+      }
       // The renewal loop performed no lease, so it would otherwise keep naming the account we just
       // left as the one we hold — and that id is the master's rotation anchor.
       unit.keeper.adoptAccount(switched.accountId)
@@ -312,6 +380,7 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         switchTo: switchTo(ui),
         slots: slotUnits.map((slot) => slot.slotName),
         held,
+        pinnedSlots: (idPrefix) => slotUnits.filter((slot) => slot.pin.get() === idPrefix).map((slot) => slot.slotName),
         workerId,
       }).open(ui),
     // ADOPT, not merely announce. The account this process still publishes may already have been
@@ -389,12 +458,18 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   // The methods are re-wrapped rather than passed as references. `ctx.ui.select` detached from `ctx.ui`
   // loses its receiver, and senpi's implementation is a method on a live TUI object — an unbound call
   // is the kind of failure that only appears in the real terminal.
-  const openPanel = (ctx: SenpiCtx): Promise<void> =>
-    installed.openPanel({
+  const openPanel = async (ctx: SenpiCtx): Promise<void> => {
+    await installed.openPanel({
       hasUI: ctx.hasUI,
       select: (title, options) => ctx.ui.select(title, options),
       notify: (message, type) => ctx.ui.notify(message, type),
     })
+    // Refreshed on the way OUT, so a switch the operator just made is on the footer before the dialog
+    // has finished closing. It also covers the case turn_start alone cannot: a session where nobody
+    // has sent a message yet has run no turn, so opening the panel is the first moment this line can
+    // exist at all — and "which account am I on" is exactly the question that opened it.
+    ctx.ui.setStatus(STATUS_KEY, installed.statusText())
+  }
 
   // Registered per factory call, unlike the keeper above: senpi builds a fresh extension instance per
   // session and its command map lives on that instance, so this is a registration into this session

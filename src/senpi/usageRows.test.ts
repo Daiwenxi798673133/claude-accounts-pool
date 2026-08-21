@@ -206,16 +206,49 @@ test("switch actions name the slot only when there is a choice of slot", () => {
   const multi = formatSwitchActions({ account: target, slots: ["env", "env-2"] })
 
   expect(single.options).toEqual(["切换到此账号", "切换并钉住此账号", "返回"])
-  expect(single.actionByOption.get("切换到此账号")).toEqual({ slotName: "env", pin: false })
-  expect(single.actionByOption.get("切换并钉住此账号")).toEqual({ slotName: "env", pin: true })
+  expect(single.actionByOption.get("切换到此账号")).toEqual({ slotName: "env", pin: "none" })
+  expect(single.actionByOption.get("切换并钉住此账号")).toEqual({ slotName: "env", pin: "on" })
   expect(single.actionByOption.get("返回")).toBe("back")
 
   expect(multi.options).toHaveLength(5)
   expect(multi.options[4]).toBe("返回")
-  expect(multi.actionByOption.get(multi.options[0] ?? "")).toEqual({ slotName: "env", pin: false })
-  expect(multi.actionByOption.get(multi.options[3] ?? "")).toEqual({ slotName: "env-2", pin: true })
+  expect(multi.actionByOption.get(multi.options[0] ?? "")).toEqual({ slotName: "env", pin: "none" })
+  expect(multi.actionByOption.get(multi.options[3] ?? "")).toEqual({ slotName: "env-2", pin: "on" })
   // Every option must resolve: an unmapped one is a dead keypress.
   for (const option of multi.options) expect(multi.actionByOption.has(option)).toBe(true)
+})
+
+// THREE STATES, NOT A BOOLEAN, and the panel is where the third one becomes visible. manualSwitch
+// reads `pin: false` as "UNPIN" and `undefined` as "just switch" — so a plain switch modelled as
+// `false` gets reported to the operator as "已取消钉住", which is what it did before this test.
+// Measured in the live TUI: 切换到此账号 announced an un-pin nobody asked for.
+test("a plain switch is not an un-pin", () => {
+  const { actionByOption } = formatSwitchActions({ account: account({ idPrefix: "af008f89" }), slots: ["env"] })
+
+  expect(actionByOption.get("切换到此账号")).toEqual({ slotName: "env", pin: "none" })
+})
+
+// A slot already pinned here needs the OPPOSITE verb: offering "切换并钉住" to somebody who is
+// already pinned is a no-op dressed as an action, and with the pin held in this process it would also
+// be the only way out of a pin — i.e. none.
+test("a slot already pinned to this account is offered the un-pin instead", () => {
+  const target = account({ idPrefix: "af008f89" })
+  const { options, actionByOption } = formatSwitchActions({ account: target, slots: ["env"], pinnedSlots: ["env"] })
+
+  expect(options).toEqual(["切换到此账号", "取消钉住此账号", "返回"])
+  expect(actionByOption.get("取消钉住此账号")).toEqual({ slotName: "env", pin: "off" })
+  expect(actionByOption.has("切换并钉住此账号")).toBe(false)
+})
+
+// Per SLOT, not per account: with K slots one may be pinned here while another is free, and collapsing
+// them would offer an un-pin for a slot that was never pinned.
+test("only the pinned slot gets the un-pin verb", () => {
+  const target = account({ idPrefix: "af008f89" })
+  const { options } = formatSwitchActions({ account: target, slots: ["env", "env-2"], pinnedSlots: ["env-2"] })
+
+  expect(options).toContain("切换并钉住此账号（槽位 env）")
+  expect(options).toContain("取消钉住此账号（槽位 env-2）")
+  expect(options).not.toContain("取消钉住此账号（槽位 env）")
 })
 
 // The prefix is the IDENTITY (it is what the master's log lines name) and the label's local part is
