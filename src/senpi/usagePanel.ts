@@ -39,6 +39,9 @@ export type UsagePanelDeps = {
   // Which of our slots pin a given account, asked per render so an un-pin performed in this same
   // panel session flips the verb the next time round.
   pinnedSlots: (idPrefix: string) => readonly string[]
+  // The terminal's column count, or undefined when it cannot be read (a pipe, a non-tty). Decides
+  // whether the usage bars fit; see formatAccountRows.
+  terminalWidth: () => number | undefined
   // A GETTER, not a snapshot: the held set changes when a switch lands, and a panel that kept its
   // opening value would redraw the row the operator just left as the one still in use.
   held: () => readonly SlotHold[]
@@ -59,7 +62,14 @@ export function createUsagePanel(deps: UsagePanelDeps): { open: (ui: PanelUi) =>
     // Unbounded on purpose — every iteration is gated on a human answering a dialog, and the two exits
     // that are not a switch (cancel at either level) both return. `返回` and a refresh continue.
     for (;;) {
-      const { rows, accountByRow } = formatAccountRows({ view, held: deps.held(), workerId: deps.workerId })
+      // Read per render, not captured at install: the operator resizes the window, and a width
+      // remembered from startup would keep drawing bars that no longer fit.
+      const { rows, accountByRow } = formatAccountRows({
+        view,
+        held: deps.held(),
+        workerId: deps.workerId,
+        ...(deps.terminalWidth() === undefined ? {} : { terminalWidth: deps.terminalWidth() }),
+      })
       const title = panelTitle(view)
       if (!ui.hasUI) {
         // The refresh row is dropped: it is a control, and printing it where nothing can be selected

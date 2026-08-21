@@ -381,6 +381,9 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         slots: slotUnits.map((slot) => slot.slotName),
         held,
         pinnedSlots: (idPrefix) => slotUnits.filter((slot) => slot.pin.get() === idPrefix).map((slot) => slot.slotName),
+        // process.stdout IS the terminal senpi renders into, so its column count is the real budget.
+        // Undefined on a pipe or a non-tty, which formatAccountRows reads as "no constraint".
+        terminalWidth: () => process.stdout.columns,
         workerId,
       }).open(ui),
     // ADOPT, not merely announce. The account this process still publishes may already have been

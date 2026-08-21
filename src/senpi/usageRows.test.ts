@@ -9,6 +9,7 @@ import {
   formatSwitchActions,
   panelTitle,
   REFRESH_ROW,
+  SENPI_BAR_WIDTH,
   type SlotHold,
 } from "./usageRows.ts"
 
@@ -106,8 +107,8 @@ test("columns land on identical cell offsets even when a label is CJK", () => {
   expect(cells(cjk ?? "", PIN_CELL).startsWith("pin")).toBe(true)
   // The percentage is right-aligned into its own fixed width, so a 1-digit and a 3-digit utilization
   // put the next column on the same cell — see the window-alignment test below.
-  expect(cells(ascii ?? "", WINDOWS_CELL)).toBe("5h   2%")
-  expect(cells(cjk ?? "", WINDOWS_CELL)).toBe("5h   7%")
+  expect(cells(ascii ?? "", WINDOWS_CELL)).toBe("5h ░░░░░░   2%")
+  expect(cells(cjk ?? "", WINDOWS_CELL)).toBe("5h ░░░░░░   7%")
 })
 
 // THE WINDOWS HAVE TO BE A TABLE, not three strings joined per row. A percentage is 1–3 digits, so
@@ -370,4 +371,77 @@ test("only the flags that hold are appended", () => {
   expect((rows[0] ?? "").endsWith("冷却 重登 排除")).toBe(true)
   expect(rows[1] ?? "").not.toContain("冷却")
   expect((rows[1] ?? "").trimEnd().endsWith("--")).toBe(true)
+})
+
+// THE BAR IS THE POINT OF THE COLUMN: eleven accounts of three percentages each is 33 numbers, and
+// nobody scans 33 numbers. A filled shape is read at a glance, which is the whole reason the opencode
+// panel draws one — this shares that exact function so the two views cannot disagree about 50%.
+test("each window carries a proportional bar of constant width", () => {
+  const { rows } = rowsOf([
+    account({
+      idPrefix: "aaaaaaaa",
+      hasUsage: true,
+      windows: [
+        { label: "five_hour", utilization: 100 },
+        { label: "seven_day", utilization: 50 },
+        { label: "Fable", utilization: 0 },
+      ],
+    }),
+  ])
+  const row = rows[0] ?? ""
+
+  expect(row).toContain(`5h ${"█".repeat(SENPI_BAR_WIDTH)} 100%`)
+  expect(row).toContain("7d ███░░░  50%")
+  expect(row).toContain(`Fable ${"░".repeat(SENPI_BAR_WIDTH)}   0%`)
+})
+
+// An account with no snapshot must not draw an EMPTY bar: a full-width `░░░░░░` is exactly what 0%
+// looks like, so the one row whose usage is unknown would read as the pool's idlest account.
+test("an unknown account draws no bar at all", () => {
+  const { rows } = rowsOf([account({ idPrefix: "954fd7d5", hasUsage: false })])
+
+  expect(cells(rows[0] ?? "", WINDOWS_CELL)).toBe("--")
+  expect(rows[0]).not.toContain("░")
+  expect(rows[0]).not.toContain("█")
+})
+
+// senpi's selector prints an option RAW — no truncation, no ellipsis — so a row wider than the
+// terminal wraps and takes the whole grid's alignment with it. Measured at 95 columns: the `Fable`
+// column fell off and ten wrapped lines appeared under the list. Dropping the bars is the graceful
+// degradation, because the numbers alone are the form this panel had before them and it fits.
+test("bars are dropped rather than clipped when the terminal is too narrow", () => {
+  const accounts = [
+    account({
+      idPrefix: "aaaaaaaa",
+      label: "vince.dai2@potentia.ai",
+      hasUsage: true,
+      windows: [
+        { label: "five_hour", utilization: 42 },
+        { label: "seven_day", utilization: 63 },
+        { label: "Fable", utilization: 3 },
+      ],
+    }),
+  ]
+  const wide = formatAccountRows({ view: snapshot(accounts), held: [], workerId: WORKER, terminalWidth: 200 })
+  const narrow = formatAccountRows({ view: snapshot(accounts), held: [], workerId: WORKER, terminalWidth: 95 })
+
+  expect(wide.rows[0]).toContain("█")
+  expect(narrow.rows[0]).not.toContain("█")
+  expect(narrow.rows[0]).not.toContain("░")
+  // The numbers survive the loss of the bar — that is what makes dropping it acceptable.
+  expect(narrow.rows[0]).toContain("42%")
+  expect(narrow.rows[0]).toContain("63%")
+  // And the fallback actually fits, which is the entire point.
+  expect(displayWidth(narrow.rows[0] ?? "")).toBeLessThanOrEqual(95)
+})
+
+// An unknown width must not silently strip the bars: this panel runs in a real terminal far more
+// often than not, and defaulting to the degraded form would cost every user the feature to serve a
+// case that may never occur.
+test("an unknown terminal width keeps the bars", () => {
+  const { rows } = rowsOf([
+    account({ idPrefix: "aaaaaaaa", hasUsage: true, windows: [{ label: "five_hour", utilization: 50 }] }),
+  ])
+
+  expect(rows[0]).toContain("█")
 })

@@ -1,5 +1,5 @@
 import type { UsageAccountView, UsageSnapshotView, UsageWindowView } from "../cloud/protocol.ts"
-import { displayWidth, heldStateFor, holderChips } from "../panel-model.ts"
+import { blockBar, displayWidth, heldStateFor, holderChips } from "../panel-model.ts"
 
 // The 账号池用量 panel, rendered for senpi instead of for the TUI's own dialog. senpi gives us exactly
 // one primitive — `ctx.ui.select(title, options: string[])` — which draws each option as ONE raw line
@@ -129,6 +129,12 @@ function pinColumn(account: UsageAccountView, workerId: string): string {
 // different cells, so one account crossing into three digits shifted every other row.
 const WINDOW_PCT_WIDTH = 4
 
+// SIX, not the opencode dialog's sixteen. That panel gives each window its own row and can spend the
+// width; here three windows share ONE selectable line, and the line already carries an id, a label, a
+// holder and a pin before the first bar starts. Six cells is one glyph per ~17% — coarse, but the bar
+// is for scanning a column of eleven accounts as a shape, and the exact number is printed beside it.
+export const SENPI_BAR_WIDTH = 6
+
 // The window columns THIS SNAPSHOT needs, keyed by label in first-seen order.
 //
 // A PROPERTY OF THE TABLE, NOT OF A ROW. Accounts do not all carry the same windows — the five-hour
@@ -158,18 +164,29 @@ function shortLabel(window: UsageWindowView): string {
   return WINDOW_SHORT_LABEL[window.label] ?? window.label
 }
 
-function windowsColumn(account: UsageAccountView, columns: readonly { label: string; width: number }[]): string {
+// What the selector itself puts in front of every option (`→ ` or two spaces), plus a cell of slack
+// so a row never ends flush against the right edge.
+const SELECTOR_CHROME = 4
+
+function windowsColumn(
+  account: UsageAccountView,
+  columns: readonly { label: string; width: number }[],
+  withBars: boolean,
+): string {
   // 未采集 ≠ 用量为零。Keyed off `hasUsage`, never off `windows.length`, because the two differ: an
   // account the poller reached but which reported no window is also `--`, and `0%` on either would
   // rank the pool's least-known account as its emptiest and send the operator straight at it.
   if (!account.hasUsage || account.windows.length === 0) return "--"
+  const bar = withBars ? 1 + SENPI_BAR_WIDTH : 0
   const cells = columns.map((column) => {
-    const width = column.width + 1 + WINDOW_PCT_WIDTH
+    const width = column.width + bar + 1 + WINDOW_PCT_WIDTH
     const window = account.windows.find((candidate) => shortLabel(candidate) === column.label)
     // A BLANK OF THE SAME WIDTH, not a skipped column: an account missing this window must leave the
     // hole where it is so the columns after it still line up with everybody else's.
     if (window === undefined) return " ".repeat(width)
-    return `${padCell(column.label, column.width)} ${`${window.utilization}%`.padStart(WINDOW_PCT_WIDTH)}`
+    const pct = `${window.utilization}%`.padStart(WINDOW_PCT_WIDTH)
+    const drawn = withBars ? ` ${blockBar(window.utilization, SENPI_BAR_WIDTH)}` : ""
+    return `${padCell(column.label, column.width)}${drawn} ${pct}`
   })
   // trimEnd, so a row whose last columns are blank does not carry a phantom one on its end — `ui.select`
   // prints the line raw and the flags column, when there is one, follows immediately after this.
@@ -191,18 +208,43 @@ export function formatAccountRows(input: {
   view: UsageSnapshotView
   held: readonly SlotHold[]
   workerId: string
+  // The terminal's column count when it can be read. senpi's selector prints an option raw, so a row
+  // wider than this wraps and destroys the grid rather than being cut short — measured at 95 columns,
+  // where the `Fable` column fell off and ten wrapped lines appeared beneath the list.
+  terminalWidth?: number
 }): { rows: string[]; accountByRow: Map<string, UsageAccountView> } {
-  const accountByRow = new Map<string, UsageAccountView>()
-  const rows: string[] = []
   // Decided ONCE, before any row is built: this is the layout every row shares.
   const windows = windowColumns(input.view.accounts)
+  // Built with bars, measured, and rebuilt WITHOUT them if the widest row would not fit. All rows or
+  // none — a list where only the short rows kept their bars would read as missing data rather than as
+  // a narrow window. Two passes over eleven rows is not worth avoiding.
+  const withBars = fits(build(input, windows, true), input.terminalWidth)
+  return build(input, windows, withBars)
+}
+
+function fits(built: { rows: string[] }, terminalWidth?: number): boolean {
+  // Unknown width keeps the bars: this panel runs in a real terminal far more often than not, and
+  // defaulting to the degraded form would cost every user the feature to serve a case that may
+  // never happen.
+  if (terminalWidth === undefined) return true
+  const widest = built.rows.reduce((max, row) => Math.max(max, displayWidth(row)), 0)
+  return widest + SELECTOR_CHROME <= terminalWidth
+}
+
+function build(
+  input: { view: UsageSnapshotView; held: readonly SlotHold[]; workerId: string },
+  windows: readonly { label: string; width: number }[],
+  withBars: boolean,
+): { rows: string[]; accountByRow: Map<string, UsageAccountView> } {
+  const accountByRow = new Map<string, UsageAccountView>()
+  const rows: string[] = []
   for (const account of input.view.accounts) {
     const columns = [
       padCell(account.idPrefix, COLUMN_WIDTH.id),
       padCell(truncateCell(account.label, COLUMN_WIDTH.label), COLUMN_WIDTH.label),
       padCell(heldColumn(account, input.held, input.workerId), COLUMN_WIDTH.held),
       padCell(pinColumn(account, input.workerId), COLUMN_WIDTH.pin),
-      windowsColumn(account, windows),
+      windowsColumn(account, windows, withBars),
     ]
     // Omitted rather than emptied: an empty trailing column would leave two stray spaces on every
     // healthy row, and `ui.select` prints the line raw.

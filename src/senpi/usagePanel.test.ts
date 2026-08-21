@@ -93,6 +93,7 @@ function panelWith(input: {
     slots,
     held: () => input.held ?? slots.map((slotName) => ({ slotName })),
     pinnedSlots: input.pinnedSlots ?? (() => []),
+    terminalWidth: () => 200,
     workerId: WORKER_ID,
   })
   return { open: panel.open, switched }
