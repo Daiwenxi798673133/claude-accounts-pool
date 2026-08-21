@@ -222,6 +222,26 @@ const PANEL_PADDING = 4
 // 4 indent + 6 label + 16 bar + percentage + reset countdown. It is a floor, not the width — the
 // drawn width divides up whatever the dialog gave, so the leftovers land in the title row where the
 // holder names live rather than as dead space past the last column.
+// Solid blocks rather than the local panel's `[###---]`. Two columns of accounts only reads as a
+// grid if the bars line up as a shape, and brackets plus hashes carry too much visual noise at that
+// density. The local panel keeps its own form — this is the pool view's alone.
+//
+// HERE RATHER THAN IN dialogs.tsx, where it used to live: the senpi panel draws the same bar and
+// cannot import that file — it is TSX against opencode's plugin runtime and Solid, neither of which
+// exists in a senpi process. A second copy is how two views of one number start disagreeing about
+// what 50% looks like. The width is a parameter for the same reason: opencode's dialog gives a bar
+// its own 16-cell row, while senpi's panel packs three of them onto one selectable line.
+export const POOL_BAR_WIDTH = 16
+
+export function blockBar(util: number, width: number = POOL_BAR_WIDTH): string {
+  // CLAMPED, and not defensively for its own sake: `repeat` throws on a negative count, so a
+  // utilization the master reported out of range would take down the whole panel rather than draw
+  // one odd row.
+  const pct = Math.max(0, Math.min(100, util))
+  const fill = Math.round((pct / 100) * width)
+  return `${"█".repeat(fill)}${"░".repeat(width - fill)}`
+}
+
 export const POOL_COLUMN_MIN_WIDTH = 45
 export const POOL_COLUMN_GAP = 4
 // Below this, one column still fits on a normal screen without scrolling, and a single list reads

@@ -11,6 +11,7 @@ import { currentConversation } from "./current-conversation.ts"
 import {
   clampSelection,
   heldStateFor,
+  blockBar,
   initialPageSelection,
   initialWorkerSelection,
   moveSelection,
@@ -567,17 +568,6 @@ export function openUsageDialog(api: TuiPluginApi, options: UsageDialogOptions):
 //
 // Deliberately NOT ported from the local panel: `d` (delete) and `m` (不自动切), because both write to
 // the account LIBRARY, which lives on the master and is not this machine's to edit.
-
-// Solid blocks rather than the local panel's `[###---]`. Two columns of accounts only reads as a
-// grid if the bars line up as a shape, and brackets plus hashes carry too much visual noise at that
-// density. The local panel keeps its own form — this is the pool view's alone.
-const POOL_BAR_WIDTH = 16
-
-function blockBar(util: number): string {
-  const pct = Math.max(0, Math.min(100, util))
-  const fill = Math.round((pct / 100) * POOL_BAR_WIDTH)
-  return `${"█".repeat(fill)}${"░".repeat(POOL_BAR_WIDTH - fill)}`
-}
 
 // An untouched window is not "healthy", it is unused, and painting it the same green as 40% makes
 // a wall of idle accounts look like a wall of active ones.

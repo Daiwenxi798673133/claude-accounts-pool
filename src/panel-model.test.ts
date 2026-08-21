@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 import type { StoredAccount } from "./accounts.ts"
 import type { OpenaiUsage } from "./openai-usage.ts"
 import {
+  blockBar,
   clampSelection,
   heldStateFor,
   pinnedStateFor,
@@ -406,4 +407,29 @@ test("U39:一个名字都放不下时退化成裸 +N,再不够才彻底不显示
   expect(holderChips(["a-very-long-worker-id", "b"], 4)).toEqual({ names: [], overflow: 2 })
   expect(holderChips(["a-very-long-worker-id", "b"], 1)).toEqual({ names: [], overflow: 0 })
   expect(holderChips(["vince-local"], 0)).toEqual({ names: [], overflow: 0 })
+})
+
+// MOVED HERE FROM dialogs.tsx so both panels draw one bar. The senpi panel cannot import that file —
+// it is TSX against opencode's plugin runtime and Solid — and a second copy is how two views of the
+// same number end up disagreeing about what 50% looks like.
+test("the bar fills in proportion and always occupies its full width", () => {
+  expect(blockBar(0, 6)).toBe("░░░░░░")
+  expect(blockBar(100, 6)).toBe("██████")
+  expect(blockBar(50, 6)).toBe("███░░░")
+  // Every value renders the SAME number of cells, which is what lets a column of bars read as a
+  // shape rather than as ragged text.
+  for (const util of [0, 1, 33, 67, 99, 100]) expect(blockBar(util, 6)).toHaveLength(6)
+})
+
+// A utilization outside 0-100 is the master's to report, not ours to trust: a negative would make
+// "░".repeat throw on a negative count and take the whole panel down with it.
+test("the bar clamps a utilization it should never have been given", () => {
+  expect(blockBar(-20, 6)).toBe("░░░░░░")
+  expect(blockBar(140, 6)).toBe("██████")
+})
+
+// The default is the width dialogs.tsx used before the move, so the opencode panel renders byte-for-byte
+// what it did.
+test("the default width is the opencode panel's", () => {
+  expect(blockBar(100)).toHaveLength(16)
 })
