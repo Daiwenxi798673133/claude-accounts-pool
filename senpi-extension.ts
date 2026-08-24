@@ -41,6 +41,7 @@
 //
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
+import { clearEnvSlotAuthBlock } from "./src/senpi/authBlockClear.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
 import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
@@ -190,6 +191,9 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     const warm = cached.get(slotName)
     if (warm) {
       void envSlot.writeLease(warm)
+      // A sticky auth_error senpi persisted last session would outlive this restart and keep the
+      // freshly-republished slot sidelined; drop it so the warm lease can actually be selected.
+      void clearEnvSlotAuthBlock(slotName)
       // Recorded so the first renewal of a DIFFERENT slot excludes this account instead of being
       // handed the one this slot is already publishing.
       roster.seed(slotName, warm.accountId)
@@ -206,6 +210,9 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       await envSlot.writeLease(input)
       live.set(slotName, { accountId: input.accountId, access: input.access, expires: input.expires })
       await writeLeaseCache(live)
+      // A freshly published lease is the one moment this slot's token is known good, so drop any
+      // sticky auth_error senpi pinned on it from an earlier, now-replaced token.
+      await clearEnvSlotAuthBlock(slotName)
     }
 
     // THE PIN, IN MEMORY, PER SLOT. opencode persists it in TuiKV so a pin survives a restart; there
