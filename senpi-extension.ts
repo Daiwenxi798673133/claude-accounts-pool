@@ -41,7 +41,7 @@
 //
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
-import { clearEnvSlotAuthBlock } from "./src/senpi/authBlockClear.ts"
+import { clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
 import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
@@ -193,7 +193,11 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       void envSlot.writeLease(warm)
       // A sticky auth_error senpi persisted last session would outlive this restart and keep the
       // freshly-republished slot sidelined; drop it so the warm lease can actually be selected.
-      void clearEnvSlotAuthBlock(slotName)
+      //
+      // `auth-only` here, deliberately: this republishes the very account the cache already named, so
+      // a rate-limit block on the slot may well be that account's and still be real. The first
+      // renewal that moves to a different account is what clears one.
+      void clearEnvSlotBlock(slotName, "auth-only")
       // Recorded so the first renewal of a DIFFERENT slot excludes this account instead of being
       // handed the one this slot is already publishing.
       roster.seed(slotName, warm.accountId)
@@ -207,12 +211,19 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // writeLeaseCache swallows its own failures, so a disk fault can never cost this process the
     // lease it just landed.
     const writeSlotLease = async (input: { access: string; expires: number; accountId: string }): Promise<void> => {
+      // READ BEFORE THE SET BELOW. This is the only moment both the outgoing and the incoming account
+      // are known, and telling a renewal-in-place from a SWAP is what decides which of senpi's blocks
+      // this publish may drop: a rate-limit block is real while its account stays, and stale the
+      // instant a different one takes the slot. An absent previous (a cold start with no warm cache)
+      // counts as a swap — there is then no evidence any persisted block describes what we just
+      // leased, and the master does not hand out an account it is cooling.
+      const swapped = live.get(slotName)?.accountId !== input.accountId
       await envSlot.writeLease(input)
       live.set(slotName, { accountId: input.accountId, access: input.access, expires: input.expires })
       await writeLeaseCache(live)
       // A freshly published lease is the one moment this slot's token is known good, so drop any
-      // sticky auth_error senpi pinned on it from an earlier, now-replaced token.
-      await clearEnvSlotAuthBlock(slotName)
+      // block senpi pinned on it from an earlier, now-replaced token.
+      await clearEnvSlotBlock(slotName, swapped ? "account-changed" : "auth-only")
     }
 
     // THE PIN, IN MEMORY, PER SLOT. opencode persists it in TuiKV so a pin survives a restart; there

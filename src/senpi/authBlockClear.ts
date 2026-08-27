@@ -11,8 +11,20 @@
 // shows 0% while a login account absorbs everything.
 //
 // This clears that sticky auth_error the moment we publish a lease we believe valid, so the healed
-// slot rejoins selection. Only auth_error is cleared: a real rate-limit block (blockedUntil) is left
-// for senpi's own clearExpiredBlocks to expire, or a genuinely throttled account would be hammered.
+// slot rejoins selection.
+//
+// A RATE-LIMIT BLOCK IS CLEARED TOO, BUT ONLY ONCE THE SLOT'S ACCOUNT HAS CHANGED. senpi keys the
+// block by SLOT NAME — an env slot's account name is the literal string "env" (accounts.js), never
+// anything derived from the token — so a pool that multiplexes N accounts through one slot leaves the
+// dead account's block sitting on top of its replacement. Reported from a live session: the operator
+// hit a limit, switched account in /usage, and every turn still failed with "All Claude accounts are
+// currently blocked" until the block expired. With `accounts: []` on the provider, one blocked slot
+// IS "all accounts blocked" — the whole pool stops for up to MAX_RATE_LIMIT_BLOCK_MS (48h).
+//
+// The account having CHANGED is what makes that safe, and the distinction is the whole design: while
+// the SAME account still occupies the slot its block is real and must stand, or clearing it would
+// hammer a throttled account once per turn for as long as the limit lasts. Only a block describing an
+// occupant that is no longer there is stale.
 //
 // WRITES senpi's auth.json — a live credentials file a SECOND omo process also writes. So it takes
 // senpi's OWN lock (proper-lockfile with the same policy as dist/core/lockfile-policy.js) to stay
@@ -43,21 +55,29 @@ export function senpiAuthPath(env: NodeJS.ProcessEnv): string | undefined {
   return dir ? join(dir, "auth.json") : undefined
 }
 
+// Which blocks this call is entitled to drop. `auth-only` is the steady-state publish, where the slot
+// still holds the same account; `account-changed` is a swap, where any block on the slot described the
+// previous occupant.
+export type BlockClearScope = "auth-only" | "account-changed"
+
 type SlotBlock = { blockReason?: string; blockedUntil?: number }
 type OAuthCredential = { slotState?: Record<string, SlotBlock>; [key: string]: unknown }
 
 // Returns the credential file with the slot's sticky auth_error removed, or undefined when there is
 // nothing to clear — so the caller writes (and contends the lock) ONLY on the rare recovery turn,
 // never on the steady-state publish. A malformed file throws to the caller, which leaves it to senpi.
-export function withoutAuthBlock(raw: string, slotName: string): string | undefined {
+export function withoutSlotBlock(raw: string, slotName: string, scope: BlockClearScope): string | undefined {
   const parsed = JSON.parse(raw) as Record<string, unknown>
   const credential = parsed[CLAUDE_SDK_OAUTH_PROVIDER_ID]
   if (credential === null || typeof credential !== "object") return undefined
   const slotState = (credential as OAuthCredential).slotState
   if (slotState === undefined || typeof slotState !== "object") return undefined
   const entry = slotState[slotName]
-  // Only the sticky kind. A `blockedUntil` rate-limit is senpi's to expire.
-  if (!entry || entry.blockReason !== "auth_error") return undefined
+  if (!entry) return undefined
+  // The sticky kind always: it has no expiry and no login can ever clear a pool-fed slot.
+  // Anything else only on a swap, where the block cannot describe the token now in the slot.
+  const stale = entry.blockReason === "auth_error" || scope === "account-changed"
+  if (!stale) return undefined
   const nextSlotState = { ...slotState }
   delete nextSlotState[slotName]
   const nextCredential: OAuthCredential = { ...(credential as OAuthCredential) }
@@ -67,7 +87,11 @@ export function withoutAuthBlock(raw: string, slotName: string): string | undefi
   return JSON.stringify({ ...parsed, [CLAUDE_SDK_OAUTH_PROVIDER_ID]: nextCredential }, null, 2)
 }
 
-export async function clearEnvSlotAuthBlock(slotName: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function clearEnvSlotBlock(
+  slotName: string,
+  scope: BlockClearScope,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
   const path = senpiAuthPath(env)
   if (path === undefined) return
   let raw: string
@@ -76,11 +100,11 @@ export async function clearEnvSlotAuthBlock(slotName: string, env: NodeJS.Proces
   } catch {
     return // no auth.json yet — senpi has blocked nothing
   }
-  // Cheap pre-check OUTSIDE the lock: only a sticky auth_error on this slot is worth contending for a
-  // lock a running senpi may hold. The common publish finds nothing and never touches the file.
+  // Cheap pre-check OUTSIDE the lock: only a block this call may drop is worth contending for a lock a
+  // running senpi may hold. The common publish finds nothing and never touches the file.
   let precheck: string | undefined
   try {
-    precheck = withoutAuthBlock(raw, slotName)
+    precheck = withoutSlotBlock(raw, slotName, scope)
   } catch {
     return // a malformed auth.json is senpi's to own, not ours to rewrite
   }
@@ -92,7 +116,7 @@ export async function clearEnvSlotAuthBlock(slotName: string, env: NodeJS.Proces
     // block in the gap. Write only if it still needs clearing, against the authoritative content.
     let cleared: string | undefined
     try {
-      cleared = withoutAuthBlock(readFileSync(path, "utf-8"), slotName)
+      cleared = withoutSlotBlock(readFileSync(path, "utf-8"), slotName, scope)
     } catch {
       cleared = undefined
     }
@@ -100,10 +124,10 @@ export async function clearEnvSlotAuthBlock(slotName: string, env: NodeJS.Proces
       // Plain write under the lock, exactly as senpi's own FileAuthStorageBackend does (same 0600).
       writeFileSync(path, cleared, { encoding: "utf-8", mode: 0o600 })
       chmodSync(path, 0o600)
-      log.info("senpi:env-slot-unblocked", { slotName })
+      log.info("senpi:env-slot-unblocked", { slotName, scope })
     }
   } catch (error) {
-    log.warn("senpi:env-slot-unblock-fail", { slotName, error: error instanceof Error ? error.message : String(error) })
+    log.warn("senpi:env-slot-unblock-fail", { slotName, scope, error: error instanceof Error ? error.message : String(error) })
   } finally {
     if (release) await release().catch(() => {})
   }
