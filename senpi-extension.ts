@@ -41,16 +41,17 @@
 //
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
-import { clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
+import { auditSlotBlocks, clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
 import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
+import { createFileLogClient } from "./src/senpi/logSink.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
 import { createUsagePanel, type PanelUi } from "./src/senpi/usagePanel.ts"
 import { formatStatusText, type SlotHold } from "./src/senpi/usageRows.ts"
 import { resolveWorkerConfig } from "./src/senpi/workerConfig.ts"
-import { log } from "./src/logger.ts"
+import { initLogger, log } from "./src/logger.ts"
 import { createLeaseClient } from "./src/worker/leaseClient.ts"
 import { installLeaseKeeper } from "./src/worker/leaseKeeper.ts"
 import { createManualSwitch } from "./src/worker/manualSwitch.ts"
@@ -124,6 +125,8 @@ type Installed = {
   // then throw from every method — so the message waits here for a turn to bring a live one.
   drainToasts: () => QueuedToast[]
   followExternal: () => Promise<string[]>
+  // Per-turn recovery for a slot senpi auth-blocked mid-session, plus the record of what it saw.
+  auditBlocks: () => Promise<void>
 }
 
 function errorMessage(error: unknown): string {
@@ -391,6 +394,7 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
   return {
     ensureLeased,
     statusText: () => formatStatusText({ held: held(), labelByPrefix }),
+    auditBlocks: () => auditSlotBlocks(slotUnits.map((slot) => slot.slotName)),
     drainToasts: () => toasts.splice(0, toasts.length),
     openPanel: (ui) =>
       createUsagePanel({
@@ -437,6 +441,11 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   // itself, and an extension that complained on every unrelated senpi start would be uninstalled.
   if (!config) return
 
+  // AFTER the config gate, so a machine that is not a pool worker never gets a log file it did not
+  // ask for. Everything below reports through guard(), which discards its error when no client is
+  // installed — this call is what makes the rest of this file diagnosable at all.
+  initLogger(createFileLogClient(process.env))
+
   const registry = globalThis as Record<PropertyKey, unknown>
   const existing = registry[KEEPER_KEY] as Installed | undefined
   const installed = existing ?? install(config.masterUrl, config.workerId, config.slots ?? 1)
@@ -466,6 +475,15 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
       for (const parked of installed.drainToasts()) ctx.ui.notify(parked.message, parked.variant)
       for (const notice of await installed.followExternal()) ctx.ui.notify(notice, "warning")
     })
+    // BEFORE the lease, and that ordering is the fix: a slot senpi auth-blocked mid-session is not
+    // republished by the lease below (a warm lease is not due for renewal, so ensureLeased does
+    // nothing), and the block would then outlive this turn too.
+    await guard("senpi:turn-block-audit", () => installed.auditBlocks())
+    // BEFORE THE LEASE, so a slot senpi auth-blocked mid-session is selectable again for THIS turn
+    // rather than from the next renewal — which is LEASE_RENEW_BUFFER_MS before expiry, i.e. hours.
+    // On a worker with no stored login account, one blocked slot is senpi's "All Claude accounts are
+    // currently blocked", and its advice to re-login cannot apply: a pool-fed env slot has no login.
+    await guard("senpi:turn-block-audit", () => installed.auditBlocks())
     await installed
       .ensureLeased()
       .catch((error: unknown) => log.error("senpi:turn-lease-fail", { error: errorMessage(error) }))
@@ -498,8 +516,17 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   // rather than process-wide state to guard against duplicating.
   pi.registerCommand("usage", {
     description: "账号池用量：查看池内账号、切换或钉住当前账号",
-    handler: (_args, ctx) => guard("senpi:usage-command", () => openPanel(ctx)),
+    handler: (_args, ctx) => {
+      // THE PAIR IS THE POINT. `/usage` has failed twice with nothing on disk to say which half broke,
+      // and the two halves need opposite fixes: senpi renames same-named commands to `usage:1`/`usage:2`,
+      // so a second copy of this extension in one session's runner leaves bare `/usage` matching nothing
+      // and this line never runs — while a registration that never happened leaves the line above missing
+      // too. One log tells them apart; neither can be inferred from the panel not appearing.
+      log.info("senpi:usage-dispatched", { hasUI: ctx.hasUI })
+      return guard("senpi:usage-command", () => openPanel(ctx))
+    },
   })
+  log.info("senpi:usage-registered")
 
   pi.registerShortcut(PANEL_SHORTCUT, {
     description: "打开账号池用量面板",

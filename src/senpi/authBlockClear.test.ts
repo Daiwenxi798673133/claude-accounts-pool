@@ -2,7 +2,8 @@ import { expect, test } from "bun:test"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { clearEnvSlotBlock, senpiAuthPath, withoutSlotBlock } from "./authBlockClear.ts"
+import { initLogger } from "../logger.ts"
+import { auditSlotBlocks, clearEnvSlotBlock, describeCandidates, senpiAuthPath, withoutSlotBlock } from "./authBlockClear.ts"
 
 const PROVIDER = "claude-sdk-oauth"
 
@@ -176,6 +177,129 @@ test("clearEnvSlotBlock clears a replaced account's rate-limit block on disk", a
     const parsed = JSON.parse(readFileSync(path, "utf-8"))
     expect("slotState" in parsed[PROVIDER]).toBe(false)
     expect(parsed[PROVIDER].refresh).toBe("refresh-default")
+  } finally {
+    box.cleanup()
+  }
+})
+
+// ── describeCandidates ───────────────────────────────────────────────────────────────────────────
+
+// senpi's own order, because a reader comparing this record against its selectAccount must not have
+// to reconcile two orderings: stored accounts first, then env slots (listAccounts).
+test("describeCandidates reports both halves of the table with their block state", () => {
+  const raw = authFile({ env: { blockReason: "auth_error" } })
+  expect(describeCandidates(raw, ["env", "env-2"])).toEqual([
+    { name: "default", source: "stored" },
+    { name: "env", source: "env", blockReason: "auth_error" },
+    { name: "env-2", source: "env" },
+  ])
+})
+
+// The accounts[] shape, which is where senpi's persistBlock puts a NON-env account's block. Reported
+// so a stored login failure is legible, never so it can be cleared.
+test("describeCandidates reports a stored account's own block", () => {
+  const raw = authFile(undefined, {
+    accounts: [
+      { name: "default", source: "login", blockReason: "auth_error" },
+      { name: "second", source: "login", blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 },
+    ],
+  })
+  expect(describeCandidates(raw, [])).toEqual([
+    { name: "default", source: "stored", blockReason: "auth_error" },
+    { name: "second", source: "stored", blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 },
+  ])
+})
+
+test("describeCandidates reports an empty table rather than throwing on an unusable file", () => {
+  expect(describeCandidates(JSON.stringify({}), ["env"])).toEqual([])
+  expect(describeCandidates(JSON.stringify({ [PROVIDER]: "not-an-object" }), ["env"])).toEqual([])
+  expect(describeCandidates(authFile(undefined, { accounts: "not-an-array" }), [])).toEqual([])
+})
+
+// ── auditSlotBlocks ──────────────────────────────────────────────────────────────────────────────
+
+// THE STALL THIS EXISTS TO BOUND. A publish clears the slot's sticky auth_error, but a publish only
+// happens on renewal — hours away. Landing mid-session, the block sidelines the slot until then, and
+// with no stored account one sidelined slot IS "all accounts blocked".
+test("auditSlotBlocks clears our slot's sticky auth_error and records the table", async () => {
+  const box = sandbox()
+  type Entry = { message: string; extra?: Record<string, unknown> }
+  const entries: Entry[] = []
+  try {
+    initLogger({ app: { log: (payload: Entry) => entries.push(payload) } })
+    const path = join(box.dir, "auth.json")
+    writeFileSync(path, authFile({ env: { blockReason: "auth_error" } }))
+
+    await auditSlotBlocks(["env"], box.env)
+
+    expect("slotState" in JSON.parse(readFileSync(path, "utf-8"))[PROVIDER]).toBe(false)
+    const record = entries.find((entry) => entry.message.includes("senpi:candidates-blocked"))
+    expect(record?.extra?.candidates).toEqual([
+      { name: "default", source: "stored" },
+      { name: "env", source: "env", blockReason: "auth_error" },
+    ])
+  } finally {
+    initLogger(undefined)
+    box.cleanup()
+  }
+})
+
+// A rate limit is REAL while the same account holds the slot, and clearing it would hammer a throttled
+// account once per turn. Only the publish path, which knows an account changed, may drop one.
+test("auditSlotBlocks leaves a rate-limit block standing", async () => {
+  const box = sandbox()
+  try {
+    const path = join(box.dir, "auth.json")
+    const original = authFile({ env: { blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 } })
+    writeFileSync(path, original)
+    await auditSlotBlocks(["env"], box.env)
+    expect(readFileSync(path, "utf-8")).toBe(original)
+  } finally {
+    box.cleanup()
+  }
+})
+
+// A stored account's auth_error is a real login failure only `/login` resolves. senpi's persistBlock
+// keys on `source`, so this block lives on the accounts[] entry — and stripping it would send every
+// turn at a dead account. Reported, never touched.
+test("auditSlotBlocks never touches a stored account's block", async () => {
+  const box = sandbox()
+  try {
+    const path = join(box.dir, "auth.json")
+    const original = authFile(undefined, { accounts: [{ name: "default", source: "login", blockReason: "auth_error" }] })
+    writeFileSync(path, original)
+    await auditSlotBlocks(["env"], box.env)
+    expect(readFileSync(path, "utf-8")).toBe(original)
+  } finally {
+    box.cleanup()
+  }
+})
+
+// The steady state, which is every turn on a healthy worker: nothing blocked, so nothing is written
+// and nothing is logged — a per-turn call must not become per-turn noise or per-turn lock contention.
+test("auditSlotBlocks is silent when nothing is blocked", async () => {
+  const box = sandbox()
+  const entries: { message: string }[] = []
+  try {
+    initLogger({ app: { log: (payload: { message: string }) => entries.push(payload) } })
+    const path = join(box.dir, "auth.json")
+    const original = authFile({})
+    writeFileSync(path, original)
+    await auditSlotBlocks(["env"], box.env)
+    expect(readFileSync(path, "utf-8")).toBe(original)
+    expect(entries).toEqual([])
+  } finally {
+    initLogger(undefined)
+    box.cleanup()
+  }
+})
+
+test("auditSlotBlocks is a no-op outside omo and with a missing file", async () => {
+  await auditSlotBlocks(["env"], {})
+  const box = sandbox()
+  try {
+    await auditSlotBlocks(["env"], box.env)
+    expect(() => readFileSync(join(box.dir, "auth.json"), "utf-8")).toThrow()
   } finally {
     box.cleanup()
   }

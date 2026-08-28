@@ -87,6 +87,86 @@ export function withoutSlotBlock(raw: string, slotName: string, scope: BlockClea
   return JSON.stringify({ ...parsed, [CLAUDE_SDK_OAUTH_PROVIDER_ID]: nextCredential }, null, 2)
 }
 
+// One row of the table senpi's selectAccount ranks. `source` matters more than it looks: it is what
+// decides where a block LIVES, and therefore who may clear it. senpi's persistBlock keys on it —
+// env-sourced blocks go to slotState, stored ones onto the accounts[] entry — so a stored account's
+// auth_error is a real login failure only `/login` can resolve, and never ours to strip.
+export type CandidateBlock = {
+  name: string
+  source: "env" | "stored"
+  blockReason?: string
+  blockedUntil?: number
+}
+
+/**
+ * The candidate table as auth.json describes it, in senpi's own order (stored accounts first, then
+ * env slots — see its listAccounts).
+ *
+ * INCOMPLETE BY CONSTRUCTION, and that is fine for what it is for: senpi synthesises an env slot only
+ * when the matching CLAUDE_CODE_OAUTH_TOKEN is present in the process it selects in, and it also
+ * blocks in memory within one failover pass without ever reaching disk. This reports what a bystander
+ * can actually see, which is exactly what was missing when "All Claude accounts are blocked" had to be
+ * diagnosed after the fact.
+ */
+export function describeCandidates(raw: string, slotNames: readonly string[]): CandidateBlock[] {
+  const parsed = JSON.parse(raw) as Record<string, unknown>
+  const credential = parsed[CLAUDE_SDK_OAUTH_PROVIDER_ID]
+  if (credential === null || typeof credential !== "object") return []
+  const { accounts, slotState } = credential as { accounts?: unknown; slotState?: Record<string, SlotBlock> }
+  const block = (entry: SlotBlock | undefined): Pick<CandidateBlock, "blockReason" | "blockedUntil"> => ({
+    ...(typeof entry?.blockReason === "string" ? { blockReason: entry.blockReason } : {}),
+    ...(typeof entry?.blockedUntil === "number" ? { blockedUntil: entry.blockedUntil } : {}),
+  })
+  const stored: CandidateBlock[] = (Array.isArray(accounts) ? accounts : []).flatMap((account) => {
+    if (typeof account !== "object" || account === null) return []
+    const { name } = account as Record<string, unknown>
+    if (typeof name !== "string") return []
+    return [{ name, source: "stored", ...block(account as SlotBlock) }]
+  })
+  return [...stored, ...slotNames.map((name) => ({ name, source: "env" as const, ...block(slotState?.[name]) }))]
+}
+
+/**
+ * Per-turn recovery for this worker's own slots, and the record that makes a recurrence diagnosable.
+ *
+ * WHY A TURN AND NOT A PUBLISH. clearEnvSlotBlock already runs whenever a lease is published, but a
+ * publish happens on renewal — LEASE_RENEW_BUFFER_MS before expiry, i.e. hours apart. A sticky
+ * auth_error landing mid-session therefore sidelines the slot until then, and on a pure worker (no
+ * login account in accounts[]) one sidelined slot IS "all accounts blocked": every turn fails for
+ * hours against a pool with nothing wrong with it. Clearing at turn_start bounds that to one turn.
+ *
+ * SAFE FOR THE SAME REASON THE PUBLISH PATH IS: scope stays `auth-only`, so a real rate-limit block
+ * keeps standing and a throttled account is never hammered. If the published token really is dead,
+ * senpi's next attempt re-blocks it and the cost is one retry — against hours of a stall.
+ *
+ * ONLY OUR OWN SLOTS. A stored account's block is left exactly where it is.
+ */
+export async function auditSlotBlocks(slotNames: readonly string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const path = senpiAuthPath(env)
+  if (path === undefined) return
+  let raw: string
+  try {
+    raw = readFileSync(path, "utf-8")
+  } catch {
+    return // no auth.json yet — senpi has blocked nothing
+  }
+  let candidates: CandidateBlock[]
+  try {
+    candidates = describeCandidates(raw, slotNames)
+  } catch {
+    return // a malformed auth.json is senpi's to own
+  }
+  const blocked = candidates.filter((candidate) => candidate.blockReason !== undefined)
+  if (blocked.length === 0) return
+  // THE WHOLE TABLE, not just the blocked rows: "which candidates existed" is half the question, and
+  // an empty stored list is what turns one blocked slot into "all accounts blocked".
+  log.warn("senpi:candidates-blocked", { candidates })
+  for (const candidate of blocked) {
+    if (candidate.source !== "env" || candidate.blockReason !== "auth_error") continue
+    await clearEnvSlotBlock(candidate.name, "auth-only", env)
+  }
+}
+
 export async function clearEnvSlotBlock(
   slotName: string,
   scope: BlockClearScope,
