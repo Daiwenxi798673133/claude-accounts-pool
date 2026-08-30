@@ -48,6 +48,7 @@ import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/l
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { createFileLogClient } from "./src/senpi/logSink.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
+import { uiIsRpcBridged } from "./src/senpi/uiBridge.ts"
 import { createUsagePanel, type PanelUi } from "./src/senpi/usagePanel.ts"
 import { formatStatusText, type SlotHold } from "./src/senpi/usageRows.ts"
 import { resolveWorkerConfig } from "./src/senpi/workerConfig.ts"
@@ -92,6 +93,14 @@ type SenpiExtensionApi = {
     shortcut: string,
     options: { description?: string; handler: (ctx: SenpiCtx) => Promise<void> | void },
   ) => void
+  // The ONLY channel out of the shared host daemon that reaches the operator — see uiBridge.ts. It
+  // travels as a session message rather than a UI request, so it survives the RPC hop the whole
+  // ctx.ui surface is dropped on. `triggerTurn: false` keeps it from starting a turn; the text does
+  // enter the model's context, which is why the bridged path prints the roster and nothing else.
+  sendMessage: (
+    message: { customType: string; content: string; display: boolean },
+    options?: { triggerTurn?: boolean },
+  ) => void
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -109,8 +118,16 @@ const STATUS_KEY = "claude-accounts-pool"
 // Not any of ctrl+{a,c,d,f,g,l,n,o,p,r,s,t,u,v,x,z}: senpi's interactive mode already binds every one
 // of those, and registering over one would shadow a working key rather than add a new one. Whether a
 // terminal can even DELIVER ctrl+shift+u distinguishably from ctrl+u depends on its keyboard protocol
-// — `/usage` is the surface that always works, and this is the accelerator for terminals that can.
+// — `/usage` is the surface that always answers, and this is the accelerator for terminals that can.
+//
+// It is also the ONLY interactive one under omo's shared RPC host: a shortcut handler runs in the TUI
+// process against a live surface, while a slash command is dispatched in the daemon, where the dialog
+// has nobody to answer it (uiBridge.ts). So this key stopped being a convenience there.
 const PANEL_SHORTCUT = "ctrl+shift+u"
+
+// The customType on the session message the bridged panel prints itself as. senpi shows it as the
+// message's heading, so it is operator-facing text, not an internal key.
+const PANEL_MESSAGE_TYPE = "账号池用量"
 
 type QueuedToast = { variant: "warning" | "error"; message: string }
 
@@ -498,12 +515,35 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   // The methods are re-wrapped rather than passed as references. `ctx.ui.select` detached from `ctx.ui`
   // loses its receiver, and senpi's implementation is a method on a live TUI object — an unbound call
   // is the kind of failure that only appears in the real terminal.
-  const openPanel = async (ctx: SenpiCtx): Promise<void> => {
-    await installed.openPanel({
-      hasUI: ctx.hasUI,
+  //
+  // On the RPC bridge the panel is declared UI-LESS even though `ctx.hasUI` says otherwise, which is
+  // what routes it down usagePanel's existing `-p` branch: print the roster once and return, never
+  // opening the dialog that would hang there forever. The accelerator is the interactive half, and it
+  // runs in the TUI process where the same wrapper hands back the real surface.
+  const panelSurface = (ctx: SenpiCtx): PanelUi => {
+    const bridged = uiIsRpcBridged(process.argv)
+    return {
+      hasUI: ctx.hasUI && !bridged,
       select: (title, options) => ctx.ui.select(title, options),
-      notify: (message, type) => ctx.ui.notify(message, type),
-    })
+      notify: (message, type) => {
+        if (!bridged) {
+          ctx.ui.notify(message, type)
+          return
+        }
+        // usagePanel notifies the roster bare and every failure with a severity, so an absent `type`
+        // IS the roster — the one message the accelerator hint belongs on. Appending it to "master
+        // 不可达" would advise a key that opens a panel which cannot load either.
+        const hint = `\n\n交互面板（切号 / 钉号）按 ${PANEL_SHORTCUT} 打开：这个会话跑在共享 RPC 宿主里，扩展的对话框在那条链路上无人应答。`
+        pi.sendMessage(
+          { customType: PANEL_MESSAGE_TYPE, content: type === undefined ? `${message}${hint}` : message, display: true },
+          { triggerTurn: false },
+        )
+      },
+    }
+  }
+
+  const openPanel = async (ctx: SenpiCtx): Promise<void> => {
+    await installed.openPanel(panelSurface(ctx))
     // Refreshed on the way OUT, so a switch the operator just made is on the footer before the dialog
     // has finished closing. It also covers the case turn_start alone cannot: a session where nobody
     // has sent a message yet has run no turn, so opening the panel is the first moment this line can
