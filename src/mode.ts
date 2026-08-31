@@ -1,10 +1,25 @@
 import type { PluginOptions } from "@opencode-ai/plugin"
+import type { AccountsScope } from "./accounts.ts"
 
 export type ModeConfig =
   | { mode: "local" }
   | { mode: "cloud-master"; hostname: string; port: number }
   | { mode: "cloud-worker"; masterUrl: string; workerId: string }
   | { mode: "invalid"; reason: string }
+
+// Which account library each mode owns. A Record for the same reason PARSERS below is one: a variant
+// added to ModeConfig is a COMPILE error here until someone decides which file it writes, and
+// "silently shares the local store" is the one answer that costs an account (INV-CLOUD-1).
+export const ACCOUNTS_SCOPE: Record<ModeConfig["mode"], AccountsScope> = {
+  local: "shared",
+  // The master's pool IS the shared file, so a suffix here would orphan every account in it.
+  "cloud-master": "shared",
+  // The one mode that must not touch a local install's store: it records only which account it
+  // leased, while the local store holds real refresh tokens the master alone may rotate.
+  "cloud-worker": "cloud-worker",
+  // Nothing is installed for `invalid` and no I/O follows, but a total table has no holes.
+  invalid: "shared",
+}
 
 // Everything a user may WRITE in tui.json. `invalid` is a parse RESULT, never an input,
 // so it is excluded here — that is also what makes the table below total: adding a variant

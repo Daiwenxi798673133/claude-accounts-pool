@@ -1,5 +1,19 @@
 import { expect, test } from "bun:test"
-import { parseMode } from "./mode.ts"
+import { ACCOUNTS_SCOPE, parseMode } from "./mode.ts"
+import { accountsPath, setAccountsScope } from "./accounts.ts"
+
+test("cloud-worker 的账号库与 local / cloud-master 不是同一个文件", () => {
+  try {
+    setAccountsScope(ACCOUNTS_SCOPE["local"])
+    const local = accountsPath()
+    setAccountsScope(ACCOUNTS_SCOPE["cloud-master"])
+    expect(accountsPath()).toBe(local)
+    setAccountsScope(ACCOUNTS_SCOPE["cloud-worker"])
+    expect(accountsPath()).not.toBe(local)
+  } finally {
+    setAccountsScope("shared")
+  }
+})
 
 test("undefined options parse as local", () => {
   expect(parseMode(undefined)).toEqual({ mode: "local" })

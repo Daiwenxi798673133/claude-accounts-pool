@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { accountsOf, activeIdOf, loadAccounts, providerOf, removeAccount, setAccountExcluded } from "./src/accounts.ts"
+import { accountsOf, activeIdOf, loadAccounts, providerOf, removeAccount, setAccountExcluded, setAccountsScope } from "./src/accounts.ts"
 import { autoCapture, collectAllUsage, retryFlaggedRefresh, switchToAccount } from "./src/usage.ts"
 import { fetchOpenaiUsage } from "./src/openai-usage.ts"
 import { backfillOpenaiLabel, captureOpenaiSlot, switchToOpenaiAccount } from "./src/openai-slot.ts"
@@ -12,7 +12,7 @@ import { initLogger, log } from "./src/logger.ts"
 import { openUsageDialog, type UsageState } from "./src/dialogs.tsx"
 import { aggregate, loadRows, type RawRow, type TimeRange } from "./src/stats.ts"
 import { openStatsDialog, type StatsState } from "./src/stats-dialog.tsx"
-import { parseMode } from "./src/mode.ts"
+import { ACCOUNTS_SCOPE, parseMode } from "./src/mode.ts"
 import { dispatchMode } from "./src/cloud/dispatch.ts"
 
 const ID = "claude-accounts-usage"
@@ -29,7 +29,12 @@ const tui: TuiPlugin = async (api, options) => {
   // So a cloud mode returns here instead of reaching any of it, and an invalid config installs
   // nothing at all rather than running half-configured. Absent options parse as `local`, so every
   // existing install falls straight through to the exact sequence it has always run.
-  if (dispatchMode(api, parseMode(options)) === "handled") return
+  const mode = parseMode(options)
+  // WHICH ACCOUNT LIBRARY THIS PROCESS OWNS, decided before anything can read or write one. A
+  // cloud-worker gets its own file so it can never read, rewrite or inherit a local install's store
+  // — that store holds real refresh tokens the master alone may rotate (INV-CLOUD-1).
+  setAccountsScope(ACCOUNTS_SCOPE[mode.mode])
+  if (dispatchMode(api, mode) === "handled") return
   const [state, setState] = createSignal<UsageState>({ loading: false, openaiLoading: false, results: [] })
   const [statsState, setStatsState] = createSignal<StatsState>({ loading: false })
 

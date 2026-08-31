@@ -160,7 +160,39 @@ export function applyToken(record: StoredAccount, write: TokenWrite | AuthToken)
   return record
 }
 
-const ACCOUNTS_PATH = join(homedir(), ".config", "opencode", "claude-accounts.json")
+// WHICH ACCOUNT LIBRARY THIS PROCESS OWNS. A cloud-worker must not share a file with a local
+// install, and the reason is INV-CLOUD-1 rather than tidiness: a local install holds REAL refresh
+// tokens and refreshes them itself, while the master owns those same chains and is their only
+// legitimate refresher. One file for both makes the same box a second refresher — and Anthropic
+// revokes the previously issued access token on every successful refresh, so whichever side
+// refreshes second knocks every other holder of that account offline. Observed exactly that way:
+// three accounts in a local store, all `needsReauth: true`, while the master reported the same
+// accounts healthy and kept handing out leases the API answered 401 on.
+//
+// `shared` IS THE UNSUFFIXED NAME, and that is not laziness either: the master's pool IS this file,
+// so renaming it would orphan every account in it.
+export type AccountsScope = "shared" | "cloud-worker"
+
+const ACCOUNTS_FILENAME: Record<AccountsScope, string> = {
+  shared: "claude-accounts.json",
+  "cloud-worker": "claude-accounts.cloud-worker.json",
+}
+
+// Process state rather than a parameter: every reader below is called from paths that have no idea
+// which mode the plugin booted in, and threading a scope through all of them would put the decision
+// at hundreds of call sites instead of one. MUST be set before any accounts I/O — tui.tsx does it on
+// the line above dispatchMode, which is the first statement of the plugin's entry.
+let accountsScope: AccountsScope = "shared"
+
+export function setAccountsScope(scope: AccountsScope): void {
+  if (scope === accountsScope) return
+  accountsScope = scope
+  log.info("accounts:scope", { scope })
+}
+
+export function accountsPath(): string {
+  return join(homedir(), ".config", "opencode", ACCOUNTS_FILENAME[accountsScope])
+}
 
 function authJsonCandidates(): string[] {
   const list: string[] = []
@@ -234,7 +266,7 @@ export async function readActiveId(): Promise<string | undefined> {
 }
 
 export async function loadAccounts(): Promise<AccountsFile> {
-  const data = await readJson<Partial<AccountsFile>>(ACCOUNTS_PATH)
+  const data = await readJson<Partial<AccountsFile>>(accountsPath())
   return {
     version: data?.version ?? 1,
     activeId: data?.activeId,
@@ -249,7 +281,7 @@ export async function loadAccounts(): Promise<AccountsFile> {
 }
 
 export async function saveAccounts(file: AccountsFile): Promise<void> {
-  await atomicWriteJson(ACCOUNTS_PATH, file)
+  await atomicWriteJson(accountsPath(), file)
 }
 
 export async function readAuthAnthropic(): Promise<AnthropicOauth | undefined> {
@@ -443,7 +475,7 @@ export async function removeAccount(id: string): Promise<StoredAccount | undefin
 // library itself: this file is a live credential sitting outside the store every other reader knows
 // about.
 export async function backupRemovedAccount(account: StoredAccount): Promise<string> {
-  const path = join(dirname(ACCOUNTS_PATH), `claude-accounts.deleted-${Date.now()}-${account.id.slice(0, 8)}.json`)
+  const path = join(dirname(accountsPath()), `claude-accounts.deleted-${Date.now()}-${account.id.slice(0, 8)}.json`)
   await atomicWriteJson(path, account)
   log.info("accounts:remove-backup", { id: account.id, path })
   return path
