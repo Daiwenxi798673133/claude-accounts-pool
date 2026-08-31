@@ -40,6 +40,7 @@ import { startLeaseServer } from "./leaseServer.ts"
 import { createRefresher, type MasterToken, type RefreshRevokedOutcome } from "./refresher.ts"
 import { createScheduler } from "./scheduler.ts"
 import { installUsagePoller } from "./usagePoller.ts"
+import { createWorkerRegistry } from "./workerRegistry.ts"
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -130,6 +131,11 @@ export function installCloudMaster(
   // would re-lease accounts that are still spent.
   const scheduler = createScheduler({ kv: api.kv })
 
+  // Same store as the cooldown book, for the same reason: a master that forgot which workers had
+  // been registered would report every machine in the pool as unknown after a restart — an alarm
+  // nobody can act on, instead of the one this book exists to raise.
+  const workerRegistry = createWorkerRegistry({ kv: api.kv })
+
   const refresher = createRefresher({
     // The real global fetch: this is the composition root, the one place a live POST to Anthropic's
     // token endpoint is the CORRECT thing to wire. Every test injects its own.
@@ -189,6 +195,7 @@ export function installCloudMaster(
   // live: a worker that reached a half-composed master would be handed a 500 it retries forever.
   const server = startLeaseServer({
     scheduler,
+    workerRegistry,
     refresher,
     loadAccounts: roster,
     accountOnboard,

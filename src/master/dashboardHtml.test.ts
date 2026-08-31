@@ -10,6 +10,7 @@ const html = dashboardHtml({
   authorizeRoute: "/v1/accounts/authorize",
   addRoute: "/v1/accounts/add",
   deleteRoute: "/v1/accounts/delete",
+  registerRoute: "/v1/worker/register",
 })
 
 test("an account id prefix is carried as an opaque handle and never rendered", () => {

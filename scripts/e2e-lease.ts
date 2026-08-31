@@ -117,11 +117,26 @@ async function scanForPort(stream: ReadableStream<Uint8Array>): Promise<number> 
 
 const MASTER_SCRIPT = `
 const { startLeaseServer } = await import(process.env.E2E_SERVER_MODULE)
+const { createWorkerRegistry } = await import(process.env.E2E_REGISTRY_MODULE)
 const ttl = Number(process.env.E2E_LEASE_TTL_MS)
 const id = process.env.E2E_ACCOUNT_ID
 const controller = new AbortController()
+// 真实的名册实现 + 内存 kv:登记用例断言的是这本册子真的变了,而不是一个桩的返回值。
+// 起始为空,所以下面 lease 那三发全是"未登记 worker",阶段一必须照常放行。
+const kv = new Map()
+const workerRegistry = createWorkerRegistry({
+  kv: { get: (key, fallback) => (kv.has(key) ? kv.get(key) : fallback), set: (key, value) => kv.set(key, value) },
+})
 const server = startLeaseServer({
-  scheduler: { pickAccount: ({ accounts, exclude }) => accounts.find((a) => a.id !== exclude), reportRateLimit: () => {} },
+  // recordLease / justAdopted 是 serveLease 与 handleLease 真的会调的两个动词。这个桩曾经漏了它们,
+  // 于是每一发 lease 都以 TypeError 逃逸成 Bun 的 500,整个 harness 在 main 上就是红的。
+  scheduler: {
+    pickAccount: ({ accounts, exclude }) => accounts.find((a) => a.id !== exclude),
+    recordLease: () => {},
+    justAdopted: () => false,
+    reportRateLimit: () => {},
+  },
+  workerRegistry,
   refresher: { getFreshAccess: async (accountId) => ({ access: process.env.E2E_FAKE_ACCESS_PREFIX + accountId, expiresAt: Date.now() + ttl }) },
   loadAccounts: async () => [{ id, label: id + "@e2e.invalid", refresh: "e2e-master-only-refresh" }],
   hostname: "127.0.0.1",
@@ -176,6 +191,11 @@ function leaseArgs(base: string, options: { authorization?: string; workerId?: s
   return ["-X", "POST", "-H", "Content-Type: application/json", ...auth, "-d", body, `${base}${CLOUD_ROUTES.lease}`]
 }
 
+function registerArgs(base: string, workerId: string): string[] {
+  const body = JSON.stringify({ workerId })
+  return ["-X", "POST", "-H", "Content-Type: application/json", "-d", body, `${base}${CLOUD_ROUTES.workerRegister}`]
+}
+
 function reportCurl(title: string, result: CurlResult): void {
   console.log(`  ${title}`)
   // redactBody 是本仓库自己的脱敏器,会把 "access":"…" 打成 "access":"***"。这里的 access 本来就是
@@ -184,11 +204,13 @@ function reportCurl(title: string, result: CurlResult): void {
 }
 
 async function runCurlTrio(base: string, bodyPath: string): Promise<void> {
-  console.log(`\n[2/3] S5 证据:三次真实 curl POST ${CLOUD_ROUTES.lease}`)
+  console.log(`\n[2/4] S5 证据:三次真实 curl POST ${CLOUD_ROUTES.lease}`)
 
   const granted = await curl(leaseArgs(base), bodyPath)
   reportCurl("① 不带 Authorization 头", granted)
   checkEqual("无凭据必须放行(池子不再有应用层凭据)", "200", String(granted.status))
+  // 同一发请求的第二个断言:此刻名册是空的,所以这个 200 同时证明阶段一"只告警不拒绝"。
+  checkEqual("名册为空时未登记 worker 仍必须放行(阶段一只告警)", "200", String(granted.status))
 
   const stray = await curl(leaseArgs(base, { authorization: STRAY_AUTHORIZATION }), bodyPath)
   reportCurl(`② Authorization: ${STRAY_AUTHORIZATION}`, stray)
@@ -206,6 +228,30 @@ async function runCurlTrio(base: string, bodyPath: string): Promise<void> {
 }
 
 type WorkerRun = { exitCode: number; stdout: string; stderr: string }
+
+// 阶段一名册:只记账,不拦人。上面那三发 lease 打在一本空册子上却全部 200,那就是"只告警不拒绝"的证据;
+// 这一节证的是登记本身——首次与重复的区别、畸形标签被挡在边界、以及这条会写的路由不吃 GET。
+async function runRegisterChecks(base: string, bodyPath: string): Promise<void> {
+  console.log(`\n[3/4] 阶段一证据:真实 curl POST ${CLOUD_ROUTES.workerRegister}`)
+
+  const first = await curl(registerArgs(base, WORKER_ID), bodyPath)
+  reportCurl("① 首次登记", first)
+  checkEqual("首次登记必须 200", "200", String(first.status))
+  checkEqual("首次登记 existing 必须是 false", "false", String(asRecord(parseJson(first.body))?.["existing"]))
+
+  const again = await curl(registerArgs(base, WORKER_ID), bodyPath)
+  reportCurl("② 重复登记同一标签", again)
+  checkEqual("重复登记仍必须 200(册子已经这么说了,拒绝没有补救可给)", "200", String(again.status))
+  checkEqual("重复登记 existing 必须是 true", "true", String(asRecord(parseJson(again.body))?.["existing"]))
+
+  const malformed = await curl(registerArgs(base, "bad id/../with spaces"), bodyPath)
+  reportCurl("③ 畸形标签", malformed)
+  checkEqual("畸形标签必须 400(记进去也永远等不到同名租约)", "400", String(malformed.status))
+
+  const read = await curl(["-X", "GET", `${base}${CLOUD_ROUTES.workerRegister}`], bodyPath)
+  reportCurl("④ 同一路由的 GET", read)
+  checkEqual("会写的路由必须 405 而不是 404", "405", String(read.status))
+}
 
 async function runWorkerChild(base: string, home: string, data: string): Promise<WorkerRun> {
   const proc = Bun.spawn(["bun", "-e", WORKER_SCRIPT], {
@@ -266,11 +312,12 @@ async function main(): Promise<number> {
 
   let master: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined
   try {
-    console.log("\n[1/3] 启动 master 子进程(真实 startLeaseServer, port=0)")
+    console.log("\n[1/4] 启动 master 子进程(真实 startLeaseServer, port=0)")
     master = Bun.spawn(["bun", "-e", MASTER_SCRIPT], {
       env: {
         ...process.env,
         E2E_SERVER_MODULE: src("master", "leaseServer.ts"), E2E_WORKER_ID: WORKER_ID,
+      E2E_REGISTRY_MODULE: src("master", "workerRegistry.ts"),
         E2E_ACCOUNT_ID: ACCOUNT_ID, E2E_FAKE_ACCESS_PREFIX: FAKE_ACCESS_PREFIX, E2E_LEASE_TTL_MS: String(LEASE_TTL_MS),
       },
       stdout: "pipe",
@@ -286,8 +333,9 @@ async function main(): Promise<number> {
     checkEqual("健康探针必须 200", "200", String(health.status))
 
     await runCurlTrio(base, curlBody)
+    await runRegisterChecks(base, curlBody)
 
-    console.log("\n[3/3] S1 证据:真实 worker 子进程走完 lease → 写盘(HOME / XDG_DATA_HOME 已沙箱化)")
+    console.log("\n[4/4] S1 证据:真实 worker 子进程走完 lease → 写盘(HOME / XDG_DATA_HOME 已沙箱化)")
     const run = await runWorkerChild(base, workerHome, workerData)
     console.log(`  worker 子进程 exit=${run.exitCode}`)
     if (run.stderr.trim()) console.log(`  worker stderr: ${redactBody(run.stderr, 600)}`)
