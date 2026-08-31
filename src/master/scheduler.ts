@@ -16,17 +16,26 @@ import type { UsageResponse } from "../usage.ts"
 // PURE helpers (scoreWindows / latestMaxedReset / PROVIDERS.anthropic.normalize) really are
 // imported, so scoring and reset resolution keep exactly one implementation.
 //
-// DELIBERATELY NO STICKINESS BY DEFAULT. There is no worker→account affinity this file invents: the
-// owner chose maximum throughput (usage-based rotation) over prompt-cache locality. Do not add one.
-// pickPreferred is NOT an exception to that: it answers ONE request naming ONE account and remembers
-// nothing about who asked, so the very next renewal ranks by usage like every other pick.
+// STICKY ON RENEWAL, AND THAT REVERSES WHAT THIS FILE SAID FOR MOST OF ITS LIFE. The old rule was
+// "no worker→account affinity, ever" — maximum throughput (usage-based rotation) chosen over
+// prompt-cache locality, with pickPreferred explicitly not an exception because it remembered nothing
+// about who asked. The pool owner rejected that default after living with it: re-ranking on EVERY
+// renewal moved a worker off a perfectly healthy account roughly every four hours over a few points
+// of utilization, and from the outside it read as the pool switching accounts for no reason.
 //
-// THE PIN IS THE ONE SANCTIONED EXCEPTION, and it is recorded rather than invented — an amendment to
-// the paragraph above, made deliberately by the pool owner. The stickiness lives entirely on the
-// WORKER: it re-names its account through pickPreferred on every renewal, and nothing here pulls a
-// worker back to anything. What this file gained is the FLAG on the lease book, used for exactly two
-// read-only purposes — telling the dashboard which holders will not move, and steering a pick for a
-// DIFFERENT worker around the reservation. Neither is affinity; do not let them grow into it.
+// pickIncumbent is the amendment. A routine renewal KEEPS its account; only an account that cannot be
+// served moves the worker — and `cooling` is one of those, so stickiness ends exactly where a
+// subscription limit begins. Ranking still owns every FIRST pick and every rotation.
+//
+// The old promise is quoted rather than deleted because it was load-bearing: anything written against
+// "a worker never stays put" is now wrong, and a silent replacement would hide that.
+//
+// THE PIN IS NARROWER THAN THE NEW DEFAULT, NOT WIDER, which is most of what is left of it: renewal
+// stickiness holds whatever account you are on until it becomes unservable, while a pin holds ONE
+// NAMED account and overrides the `excluded` flag (pickPreferred does not refuse it, pickIncumbent
+// does). The FLAG on the lease book still serves exactly two read-only purposes — telling the
+// dashboard which holders will not move, and steering a pick for a DIFFERENT worker around the
+// reservation.
 //
 // The lease book below is NOT the affinity that paragraph forbids — it is its OPPOSITE. It remembers
 // who holds what in order to push the next lease AWAY from an account already in use, so two workers
@@ -103,9 +112,23 @@ export type PreferredInput = {
   prefix: string
 }
 
+export type IncumbentInput = {
+  accounts: StoredAccount[]
+  // A FULL account id, not a prefix: this is the account the worker says it already holds, which it
+  // learned from a lease this master minted — never something a human typed.
+  accountId: string
+  // The accounts this worker's OTHER slots already hold. A multi-slot worker renews slot by slot, and
+  // holding the incumbent must never book one account into two slots of the same machine.
+  excludeIds?: readonly string[]
+}
+
 export type Scheduler = {
   pickAccount: (input: PickInput) => StoredAccount | undefined
   pickPreferred: (input: PreferredInput) => PreferredPick
+  // The account a routine renewal should KEEP, or undefined when keeping it is not possible and the
+  // caller must fall back to a ranked pick. This is the pool's stickiness, and it lives here rather
+  // than in the lease route because it is a selection policy like every other one in this file.
+  pickIncumbent: (input: IncumbentInput) => StoredAccount | undefined
   // `workerId` names who is reporting, so a report about an account that worker adopted seconds ago
   // can be discarded as misattributed (RATELIMIT_ADOPTION_GRACE_MS). Optional because the report is
   // best-effort telemetry: a caller that cannot say who it is still gets its account cooled.
@@ -387,6 +410,31 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     return { ok: true, account }
   }
 
+  // THE POOL'S STICKINESS. A routine renewal KEEPS the account it already holds; only an account that
+  // cannot be served moves the worker. Ranking still owns every first pick and every rotation — it
+  // just no longer re-runs an election the worker already won.
+  //
+  // EVERY REFUSAL, AND WHY IT IS ONE:
+  //   * cooling — the quota is spent. THE case the pool owner asked to keep rotating on: stickiness
+  //     ends exactly where the limit begins.
+  //   * needsReauth — the refresh chain is broken, so no access token can be minted for it at all.
+  //   * excluded — the flag means "drain this one", and a renewal that kept holding it would never let
+  //     it drain. Deliberately the OPPOSITE of pickPreferred, where the flag does not refuse: there a
+  //     human is naming the row, here a timer is.
+  //   * absent from the library, or not anthropic — the id names nothing this pool can lease (INV-M1).
+  //   * already held by another slot of the SAME worker — keeping it would book one account twice.
+  function pickIncumbent(input: IncumbentInput): StoredAccount | undefined {
+    const account = input.accounts.find((entry) => entry.id === input.accountId)
+    if (!account || providerOf(account) !== "anthropic") return undefined
+    if (account.needsReauth === true || account.excluded === true) return undefined
+    if (isCoolingDown(account.id)) return undefined
+    if (input.excludeIds?.includes(account.id) === true) return undefined
+    // The rotation cursor names whoever was handed out LAST, exactly as pickPreferred maintains it:
+    // leaving it stale would make the next round-robin walk start from an account nobody holds.
+    lastPickedId = account.id
+    return account
+  }
+
   function setUsageCache(entries: UsageSnapshotEntry[]): void {
     const byId = new Map<string, UsageResponse>()
     for (const entry of entries) byId.set(entry.id, entry.usage)
@@ -433,6 +481,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   return {
     pickAccount,
     pickPreferred,
+    pickIncumbent,
     reportRateLimit: (accountId: string, resetsAt?: number, workerId?: string) => {
       if (workerId !== undefined && justAdopted(workerId, accountId)) {
         log.info("master:ratelimit-misattributed", { workerId, accountId })

@@ -74,11 +74,11 @@ function messageFor(failure: LeaseFailure, label: string): string {
 function successMessage(label: string, pin?: boolean): string {
   if (pin === true) return `已钉住「${label}」，在额度用满前不再被账号池轮换走`
   if (pin === false) return `已取消钉住「${label}」，续租恢复按用量轮换`
-  // Not hedging, but the truth about this pool: with no pin there is NO worker→account affinity, so
-  // the next renewal ranks by utilization like any other and may well move off this account. Saying so
-  // beats letting the operator discover it as a bug — and it names the remedy without naming a key,
-  // because two panels render this sentence now and only one of them binds `p` to the pin.
-  return `已切到「${label}」，续租时可能被账号池按用量轮换走(可钉住以固定)`
+  // THE TRUTH ABOUT THIS POOL CHANGED: master now keeps a worker on its current account across
+  // renewals (scheduler.ts's pickIncumbent), so a plain switch sticks until that account hits a limit.
+  // The old sentence promised the opposite — "可能被按用量轮换走" — which would now describe a bug in
+  // the other direction and send the operator looking for a pin they no longer need.
+  return `已切到「${label}」，续租会保住它，撞限额才换号`
 }
 
 // A FAILED un-pin is not a failed switch, and must not be reported as one: the local pin is already

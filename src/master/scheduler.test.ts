@@ -39,6 +39,55 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+test("pickIncumbent 保住可服务的当前账号，即便另一个账号用量更低", () => {
+  const { kv } = makeKv()
+  const scheduler = createScheduler({ kv, now: () => 1_000 })
+  scheduler.setUsageCache([
+    { id: "a", usage: usage(90) },
+    { id: "b", usage: usage(1) },
+  ])
+  const accounts = [account("a"), account("b")]
+
+  // The ranked verb WOULD move this worker to b — that contrast is the whole fixture. pickIncumbent is
+  // the verb that declines to hold the election in the first place.
+  expect(scheduler.pickAccount({ accounts })?.id).toBe("b")
+  expect(scheduler.pickIncumbent({ accounts, accountId: "a" })?.id).toBe("a")
+})
+
+test("pickIncumbent 对不可服务的当前账号一律放手，交回排名轮换", () => {
+  const { kv } = makeKv()
+  const scheduler = createScheduler({ kv, now: () => 1_000 })
+  const accounts = [
+    account("cool"),
+    account("reauth", { needsReauth: true }),
+    account("drained", { excluded: true }),
+    account("chatgpt", { provider: "openai" }),
+  ]
+  scheduler.reportRateLimit("cool")
+
+  // 撞限额冷却中：这正是操作者唯一希望它换号的时刻。
+  expect(scheduler.pickIncumbent({ accounts, accountId: "cool" })).toBeUndefined()
+  // 刷新链断了，铸不出 token。
+  expect(scheduler.pickIncumbent({ accounts, accountId: "reauth" })).toBeUndefined()
+  // `excluded` 的语义是"把这个号腾空"，保着它就永远腾不空。
+  expect(scheduler.pickIncumbent({ accounts, accountId: "drained" })).toBeUndefined()
+  // 池子是 anthropic-only(INV-M1)：ChatGPT 记录不能从这条路被保住。
+  expect(scheduler.pickIncumbent({ accounts, accountId: "chatgpt" })).toBeUndefined()
+  // 账号库里已经没有这条记录了(被删号)。
+  expect(scheduler.pickIncumbent({ accounts, accountId: "nobody" })).toBeUndefined()
+})
+
+test("pickIncumbent 不把同一个账号保进本机的第二个槽位", () => {
+  const { kv } = makeKv()
+  const scheduler = createScheduler({ kv, now: () => 1_000 })
+  const accounts = [account("a"), account("b")]
+
+  // 多槽位 worker 逐槽续租，excludeIds 是"我别的槽位已经占了这些"。保号绝不能把一个账号
+  // 同时记到同一台机器的两个槽位上。
+  expect(scheduler.pickIncumbent({ accounts, accountId: "a", excludeIds: ["a"] })).toBeUndefined()
+  expect(scheduler.pickIncumbent({ accounts, accountId: "a", excludeIds: ["b"] })?.id).toBe("a")
+})
+
 test("picks lowest-usage available account", () => {
   const { kv } = makeKv()
   const scheduler = createScheduler({ kv, now: () => 1_000 })

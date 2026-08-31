@@ -43,7 +43,7 @@ import { log, redactHeaders } from "../logger.ts"
 import type { AccountOnboard } from "./accountOnboard.ts"
 import type { AccountRemove } from "./accountRemove.ts"
 import { dashboardHtml } from "./dashboardHtml.ts"
-import type { PreferredInput, PreferredPick, UsageSnapshot } from "./scheduler.ts"
+import type { IncumbentInput, PreferredInput, PreferredPick, UsageSnapshot } from "./scheduler.ts"
 import { buildUsageView } from "./usageView.ts"
 import type { RegisteredWorker } from "./workerRegistry.ts"
 
@@ -63,6 +63,11 @@ export type LeaseServerDeps = {
     // Selection for a lease that NAMES its account, kept a separate verb from pickAccount so the
     // ranked path cannot accidentally inherit "excluded is servable" and vice versa.
     pickPreferred(input: PreferredInput): PreferredPick
+    // Selection for a ROUTINE renewal, which keeps the account the worker already holds instead of
+    // re-running the ranked election. A third verb rather than a flag on pickAccount for the same
+    // reason pickPreferred is one: that function's job is to rank and rotate, and this one's job is
+    // to do neither.
+    pickIncumbent(input: IncumbentInput): StoredAccount | undefined
     reportRateLimit(accountId: string, resetsAt?: number, workerId?: string): void
     justAdopted(workerId: string, accountId: string): boolean
     // The two READ-ONLY halves of the dashboard's payload. Required, not optional: a master serving
@@ -360,6 +365,24 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       if (stay && stay.needsReauth !== true && !deps.scheduler.isCoolingDown(stay.id)) {
         log.info("master:lease-ratelimit-misattributed", { workerId, accountId: stay.id })
         return serveLease(workerId, stay, false)
+      }
+    }
+    // KEEP THE ACCOUNT THIS WORKER ALREADY HOLDS. A `prelease` is a RENEWAL, not a fresh assignment,
+    // and re-running the ranked election on every one of them moved a worker off a perfectly healthy
+    // account roughly every four hours over a few points of utilization — which is the behaviour the
+    // pool owner asked to stop. Only pickIncumbent may answer here, and it refuses exactly when
+    // keeping the account is impossible; every refusal falls through to the ranked pick below, so a
+    // spent account still rotates without the worker having to classify anything.
+    if (request.reason === "prelease" && request.currentAccountId !== undefined) {
+      const incumbent = deps.scheduler.pickIncumbent({
+        accounts,
+        accountId: request.currentAccountId,
+        ...(request.excludeAccountIds === undefined ? {} : { excludeIds: request.excludeAccountIds }),
+      })
+      if (incumbent) {
+        log.info("master:lease-incumbent", { workerId, accountId: incumbent.id })
+        // `false`: a pin only ever arrives WITH a named prefix, which the branch above already served.
+        return serveLease(workerId, incumbent, false)
       }
     }
     const account = deps.scheduler.pickAccount({

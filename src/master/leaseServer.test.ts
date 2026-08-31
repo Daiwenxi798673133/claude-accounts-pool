@@ -205,6 +205,18 @@ function startHarness(options?: {
         if (cooled.has(target.id)) return { ok: false, refusal: "cooling" }
         return { ok: true, account: target }
       },
+      // Mirrors the real rule (scheduler.test.ts owns proving it), reading the SAME `cooled` set as
+      // every other verdict here so "kept on renewal" and "skipped by selection" can never disagree.
+      // `excluded` IS a refusal on this path, unlike pickPreferred: that flag is the operator saying
+      // "drain this one", and a renewal that kept holding it would never let it drain.
+      pickIncumbent({ accounts: pool, accountId, excludeIds }) {
+        const target = pool.find((a) => a.id === accountId)
+        if (!target) return undefined
+        if (target.needsReauth === true || target.excluded === true) return undefined
+        if (cooled.has(target.id)) return undefined
+        if (excludeIds?.includes(target.id) === true) return undefined
+        return target
+      },
       reportRateLimit(accountId, resetsAt, workerId) {
         if (workerId !== undefined) {
           const held = leases.get(workerId)
@@ -451,17 +463,15 @@ test("lease returns 200 with accountId access expiresAt", async () => {
     expect(lease).toEqual({ accountId: "acct-a", access: "sk-ant-oat01-acct-a", expiresAt: EXPIRES_AT })
     expect(harness.refreshed).toEqual(["acct-a"])
 
-    // A `prelease` carries NO exclusion EVEN THOUGH the request named a current account: the
-    // routine renewal path is allowed — and expected — to hand back the very account the worker
-    // already holds. acct-b exists precisely so this is a distinguishing fixture: an
-    // implementation that excluded `currentAccountId` regardless of reason would answer acct-b
-    // here and rotate the pool on every routine renewal.
-    expect(harness.picks).toEqual([{ ids: ["acct-a", "acct-b"], workerId: "worker-impersonated" }])
+    // A `prelease` KEEPS the account the request named, and ranked selection is not consulted at all.
+    // acct-b exists precisely so this is a distinguishing fixture: an implementation that excluded
+    // `currentAccountId` regardless of reason would answer acct-b here and rotate the pool on every
+    // routine renewal. Until the incumbent rule landed, this path DID reach pickAccount and merely
+    // happened to be re-elected — the two dedicated renewal cases further down own that contract now.
+    expect(harness.picks).toEqual([])
 
-    // The workerId DOES reach selection now — but only so the holder count can discount this worker's
-    // own outstanding lease. It can never make an account more attractive, only stop the requester
-    // from counting as its own competition, so a forged label buys the caller nothing here: with an
-    // empty book every candidate has zero holders either way and the answer is the ranked one.
+    // A forged label buys the caller nothing here either: the incumbent rule keys off the account id
+    // the request names, and this fixture's acct-a is servable no matter who claims to be asking.
     expect(lease.accountId).toBe("acct-a")
   } finally {
     harness.stop()
@@ -657,6 +667,56 @@ test("ratelimit report cools the account and next lease picks another", async ()
     // by the very write that takes acct-b. Nothing on the wire says "release".
     expect(harness.book()).toEqual([[WORKER_ID, "acct-b"]])
     expect(harness.refreshed).toEqual(["acct-a", "acct-b"])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("普通续租保住当前账号，即便排名会选另一个", async () => {
+  // Given: the ranked pick answers acct-a (the fake returns the first servable account), so acct-b is
+  // reachable on a routine renewal ONLY if the incumbent is kept
+  const harness = startHarness()
+  try {
+    // When: a worker renews while it already holds acct-b
+    const res = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      currentAccountId: "acct-b",
+    } satisfies LeaseRequest)
+
+    // Then: acct-b comes back, minted through the same tail every lease uses
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ accountId: "acct-b", access: "sk-ant-oat01-acct-b", expiresAt: EXPIRES_AT })
+
+    // AND THE LOAD-BEARING ASSERTION: ranked selection was never consulted. That is the whole change —
+    // a renewal that still went through pickAccount is a renewal that can LOSE an election it never
+    // needed to hold, which is how a worker used to get moved off a healthy account every four hours.
+    expect(harness.picks).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("当前账号撞限额冷却后，续租不再保它而是轮换", async () => {
+  const harness = startHarness()
+  try {
+    // Given: acct-a is spent and cooling (no lease was taken, so this report is not misattributed)
+    const report: RateLimitReport = { workerId: WORKER_ID, accountId: "acct-a", headers: {} }
+    expect((await post(harness.base, CLOUD_ROUTES.ratelimit, report)).status).toBe(204)
+
+    // When: a ROUTINE renewal arrives still naming that cooling account
+    const res = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      currentAccountId: "acct-a",
+    } satisfies LeaseRequest)
+
+    // Then: it rotates. Stickiness ends exactly where the limit begins — the one reason the pool owner
+    // asked for an account to move at all — and it does so on `prelease`, without waiting for the
+    // worker to classify anything as a ratelimit request.
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as LeaseResponse).accountId).toBe("acct-b")
+    expect(harness.picks).toHaveLength(1)
   } finally {
     harness.stop()
   }

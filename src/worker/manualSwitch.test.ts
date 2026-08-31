@@ -53,10 +53,11 @@ test("a manual switch names the account, writes the lease and reports the accoun
   expect(toasts).toHaveLength(1)
   expect(toasts[0].variant).toBe("success")
   expect(toasts[0].message).toContain("vince.dai3@potentia.ai")
-  // The success message SAYS the choice may not survive the next renewal. There is no worker→account
-  // affinity in this pool by design, so staying silent would let the operator discover the rotation
-  // as a bug.
-  expect(toasts[0].message).toContain("轮换")
+  // The success message SAYS what happens after the switch. The pool now KEEPS this account across
+  // renewals (scheduler.ts's pickIncumbent), so what the operator needs told is the ONE condition that
+  // still moves it — silence either way lets them discover the behaviour as a bug. This assertion used
+  // to demand the opposite word ("轮换"), which is exactly what the master default reversed.
+  expect(toasts[0].message).toContain("撞限额")
   // Never the credential itself, in any message the operator can screenshot.
   expect(toasts[0].message).not.toContain(LEASE.access)
 })
