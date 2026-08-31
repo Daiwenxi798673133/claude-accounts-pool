@@ -295,11 +295,53 @@ test("auditSlotBlocks is silent when nothing is blocked", async () => {
 })
 
 test("auditSlotBlocks is a no-op outside omo and with a missing file", async () => {
-  await auditSlotBlocks(["env"], {})
+  expect(await auditSlotBlocks(["env"], {})).toEqual([])
   const box = sandbox()
   try {
-    await auditSlotBlocks(["env"], box.env)
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual([])
     expect(() => readFileSync(join(box.dir, "auth.json"), "utf-8")).toThrow()
+  } finally {
+    box.cleanup()
+  }
+})
+
+// THE LIVELOCK THIS RETURN VALUE BREAKS. An auth_error is senpi reporting a 401, i.e. the ONLY evidence
+// this machine gets that a published token is dead — a revoked token has the same bytes and a lease
+// horizon still in the future, so nothing else here can tell. Clearing the block alone puts that dead
+// token straight back into selection, senpi re-blocks it on the next request, and the pair oscillates
+// for the rest of the session. The caller needs these names to invalidate the slots and re-lease.
+test("auditSlotBlocks reports the env slots senpi auth-blocked", async () => {
+  const box = sandbox()
+  try {
+    const blocks = { env: { blockReason: "auth_error" }, "env-2": { blockReason: "auth_error" } }
+    writeFileSync(join(box.dir, "auth.json"), authFile(blocks))
+    expect(await auditSlotBlocks(["env", "env-2"], box.env)).toEqual(["env", "env-2"])
+  } finally {
+    box.cleanup()
+  }
+})
+
+// A rate-limit block describes a token that WORKS, so it must not trigger a re-lease: the account is
+// throttled rather than revoked, and rotating off it would spend a lease to solve nothing.
+test("auditSlotBlocks reports no slot for a rate-limit block", async () => {
+  const box = sandbox()
+  try {
+    const blocks = { env: { blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 } }
+    writeFileSync(join(box.dir, "auth.json"), authFile(blocks))
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual([])
+  } finally {
+    box.cleanup()
+  }
+})
+
+// A stored account's auth_error is a real login failure only `/login` can fix. Reporting it would have
+// this worker invalidate and re-lease its OWN healthy slot on behalf of somebody else's broken account.
+test("auditSlotBlocks reports no slot for a stored account's auth_error", async () => {
+  const box = sandbox()
+  try {
+    const stored = { accounts: [{ name: "default", source: "login", blockReason: "auth_error" }] }
+    writeFileSync(join(box.dir, "auth.json"), authFile(undefined, stored))
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual([])
   } finally {
     box.cleanup()
   }

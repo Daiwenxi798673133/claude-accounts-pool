@@ -2,7 +2,8 @@ import { expect, test } from "bun:test"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
-import { type CachedLease, leaseCachePath, readLeaseCache, writeLeaseCache } from "./leaseCache.ts"
+import { LEASE_RENEW_BUFFER_MS } from "../constants.ts"
+import { adoptableLease, type CachedLease, leaseCachePath, readLeaseCache, writeLeaseCache } from "./leaseCache.ts"
 
 const NOW = 1_800_000_000_000
 
@@ -97,4 +98,51 @@ test("junk, a wrong version and malformed members all read as nothing cached", (
   } finally {
     box.cleanup()
   }
+})
+
+// ── adoptableLease ───────────────────────────────────────────────────────────────────────────────
+
+const AHEAD = NOW + LEASE_RENEW_BUFFER_MS + 1
+const noneDead: ReadonlySet<string> = new Set()
+
+// WHY ADOPTION EXISTS AT ALL. omo runs several senpi hosts on one machine and they share this file,
+// one slot name and one workerId. Each host leasing for itself books N accounts out of the pool for
+// one laptop, and leaves the master's holder count — which assumes one holder per workerId — wrong by
+// construction. Measured at five hosts.
+test("adoptableLease takes a cached lease with a full renewal window ahead of it", () => {
+  const cached = new Map([["env", lease("acct-a", AHEAD)]])
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toEqual(
+    lease("acct-a", AHEAD),
+  )
+})
+
+// Adopting a lease already inside its own renewal window leaves the slot due again immediately, so the
+// publish and the cache write bought nothing.
+test("adoptableLease refuses a lease already inside its renewal window", () => {
+  const cached = new Map([["env", lease("acct-a", NOW + LEASE_RENEW_BUFFER_MS - 1)]])
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toBeUndefined()
+})
+
+// THE INTERACTION THAT WOULD OTHERWISE REVIVE THE LIVELOCK THIS BRANCH FIXES. A revoked token is
+// byte-identical to a live one and its horizon is still in the future, so the cache cannot rule it out
+// on its own. The recovery path invalidates the dead token; without this guard the very next renewal
+// would adopt the same bytes straight back out of this file.
+test("adoptableLease refuses a token this process already saw a 401 on", () => {
+  const dead = lease("acct-a", AHEAD)
+  const cached = new Map([["env", dead]])
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: new Set([dead.access]), pinned: false, at: NOW })).toBeUndefined()
+})
+
+// A pin is an instruction the operator gave by hand. Adopting another host's pick reverses it without
+// saying so, and it also makes pin.ts's give-up path unreachable: the master is never asked, so it
+// never refuses, so the pin can never be dropped and the slot never renews again.
+test("adoptableLease refuses to adopt for a pinned slot", () => {
+  const cached = new Map([["env", lease("acct-a", AHEAD)]])
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: true, at: NOW })).toBeUndefined()
+})
+
+test("adoptableLease reads only its own slot, and an empty cache is a cold start", () => {
+  const cached = new Map([["env-2", lease("acct-b", AHEAD)]])
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached: new Map(), slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toBeUndefined()
 })

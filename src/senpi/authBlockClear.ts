@@ -140,31 +140,44 @@ export function describeCandidates(raw: string, slotNames: readonly string[]): C
  * senpi's next attempt re-blocks it and the cost is one retry — against hours of a stall.
  *
  * ONLY OUR OWN SLOTS. A stored account's block is left exactly where it is.
+ *
+ * RETURNS THE SLOTS SENPI AUTH-BLOCKED, because clearing the block is only half the recovery. senpi
+ * blocked them after a 401, which is the one piece of evidence this machine ever gets that a published
+ * token is dead — a revoked token is byte-identical to a live one and its lease horizon is still in the
+ * future, so nothing else here can tell. Handing the names back is what lets the caller invalidate
+ * those slots and re-lease; clearing alone just puts the same dead token back into selection, and the
+ * retry re-blocks it. That loop is the livelock this return value exists to break.
  */
-export async function auditSlotBlocks(slotNames: readonly string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function auditSlotBlocks(
+  slotNames: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<readonly string[]> {
   const path = senpiAuthPath(env)
-  if (path === undefined) return
+  if (path === undefined) return []
   let raw: string
   try {
     raw = readFileSync(path, "utf-8")
   } catch {
-    return // no auth.json yet — senpi has blocked nothing
+    return [] // no auth.json yet — senpi has blocked nothing
   }
   let candidates: CandidateBlock[]
   try {
     candidates = describeCandidates(raw, slotNames)
   } catch {
-    return // a malformed auth.json is senpi's to own
+    return [] // a malformed auth.json is senpi's to own
   }
   const blocked = candidates.filter((candidate) => candidate.blockReason !== undefined)
-  if (blocked.length === 0) return
+  if (blocked.length === 0) return []
   // THE WHOLE TABLE, not just the blocked rows: "which candidates existed" is half the question, and
   // an empty stored list is what turns one blocked slot into "all accounts blocked".
   log.warn("senpi:candidates-blocked", { candidates })
+  const authBlocked: string[] = []
   for (const candidate of blocked) {
     if (candidate.source !== "env" || candidate.blockReason !== "auth_error") continue
+    authBlocked.push(candidate.name)
     await clearEnvSlotBlock(candidate.name, "auth-only", env)
   }
+  return authBlocked
 }
 
 export async function clearEnvSlotBlock(
