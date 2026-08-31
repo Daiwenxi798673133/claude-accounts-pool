@@ -16,6 +16,11 @@ export type LeaseFailure =
   | { kind: "refused"; refused: LeaseRefusal } // 409 — we NAMED an account the master will not serve
   | { kind: "unreachable"; detail: string } // network / retries exhausted
   | { kind: "bad-response"; detail: string } // unparseable or schema-invalid body
+  // NEVER PRODUCED BY THIS TRANSPORT. The senpi lane's dead-access guard raises it when the master
+  // serves an access token this process already saw a 401 on — twice in a row, so excluding the
+  // account did not help either. It belongs in this union because the renewal loop's Setback speaks
+  // it; see src/senpi/deadLease.ts for why a live-looking token can already be revoked.
+  | { kind: "dead-access"; accountId: string }
 
 export type LeaseOutcome = { ok: true; lease: LeaseResponse } | { ok: false; failure: LeaseFailure }
 

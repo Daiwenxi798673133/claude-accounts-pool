@@ -60,6 +60,10 @@ const FAILURE_MESSAGE: Record<LeaseFailure["kind"], string> = {
   // wording still has to hold if one ever appears; the operator-facing refusal messages, which name
   // the specific reason, live with the manual switch that can actually provoke one.
   refused: "云端账号池拒绝了本次租借请求，未切号",
+  // A DIFFERENT REMEDY FROM EVERY OTHER ROW, which is why it gets its own sentence: nothing here is
+  // going to heal on a retry — the token the master holds for that account has been revoked, so it
+  // has to be re-authorized on the master before the pool can serve it again.
+  "dead-access": "云端账号池发回的访问令牌已被吊销，未能切到可用账号，请在 master 上重新授权该账号",
 }
 
 export function createSwitchStrategy(deps: SwitchStrategyDeps): SwitchStrategy {

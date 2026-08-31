@@ -42,6 +42,7 @@
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
 import { auditSlotBlocks, blockClearScope, clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
+import { leaseLiveAccess } from "./src/senpi/deadLease.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
 import { adoptableLease, type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
@@ -296,7 +297,14 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
           log.info("senpi:slot-lease-adopted", { slotName, accountId: shared.accountId, expires: shared.expires })
           return { ok: true, lease: { accountId: shared.accountId, access: shared.access, expiresAt: shared.expires } }
         }
-        const outcome = await client.lease({ ...input, excludeAccountIds: section.excludeAccountIds })
+        // THROUGH THE DEAD-ACCESS GUARD, never straight at the transport. The master serves its
+        // CACHED access token, so leasing the account senpi just 401'd on returns the identical
+        // string — and publishing it again is the livelock this whole recovery path exists to break.
+        // See deadLease.ts; `deadAccess` is read live because the audit fills it mid-turn.
+        const outcome = await leaseLiveAccess(
+          { lease: (request) => client.lease(request), deadAccess },
+          { ...input, excludeAccountIds: section.excludeAccountIds },
+        )
         // Claimed only on success, and inside the section: a pick that failed to mint leaves this
         // slot on whatever it had, and recording it would make every other slot steer around a
         // hold that does not exist.

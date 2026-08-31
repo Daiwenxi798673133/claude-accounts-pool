@@ -54,6 +54,7 @@ const FAILURE_MESSAGE: Record<Exclude<LeaseFailure["kind"], "refused">, string> 
   "no-account": "云端账号池没有可租借的账号，未切号",
   unreachable: "连不上云端账号池，未切号，请检查网络或 master 服务",
   "bad-response": "云端账号池返回了无法识别的响应，未切号",
+  "dead-access": "云端账号池发回的访问令牌已被吊销，未切号，请在 master 上重新授权该账号",
 }
 
 // THIS TABLE IS THE "NEVER FAIL SILENTLY" GUARANTEE: every refusal the master can answer has a
