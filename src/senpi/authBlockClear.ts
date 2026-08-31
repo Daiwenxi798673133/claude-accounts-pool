@@ -60,6 +60,28 @@ export function senpiAuthPath(env: NodeJS.ProcessEnv): string | undefined {
 // previous occupant.
 export type BlockClearScope = "auth-only" | "account-changed"
 
+/**
+ * The scope a publish of `accountId` into a slot is entitled to, given what THIS PROCESS last
+ * published there.
+ *
+ * NEVER ASK THE SHARED LEASE CACHE ON DISK. senpi stamps a block while a specific token sits in a
+ * specific process's environment, so "has this slot's occupant changed" is a question about our own
+ * environment and nothing else. Consulting the cache first — as this decision used to — makes the
+ * follow-external path structurally unable to answer yes: it republishes an account it just READ out
+ * of that cache, so the comparison always found it unchanged, the scope degraded to `auth-only`, and
+ * the previous occupant's rate-limit block kept standing over the healthy account just adopted. With
+ * `accounts: []` on the provider that is senpi's "All Claude accounts are currently blocked" for every
+ * session on the machine, and only a manual switch ever cleared it: measured at 598 blocked-candidate
+ * reports against 19 clears across one day of one worker's log.
+ *
+ * NO PREVIOUS PUBLISH COUNTS AS A SWAP: a cold start with no warm cache holds no evidence that a
+ * persisted block describes what was just leased, and the master does not hand out an account it is
+ * cooling.
+ */
+export function blockClearScope(publishedAccountId: string | undefined, accountId: string): BlockClearScope {
+  return publishedAccountId === accountId ? "auth-only" : "account-changed"
+}
+
 type SlotBlock = { blockReason?: string; blockedUntil?: number }
 type OAuthCredential = { slotState?: Record<string, SlotBlock>; [key: string]: unknown }
 

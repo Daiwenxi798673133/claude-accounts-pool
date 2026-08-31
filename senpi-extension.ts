@@ -41,7 +41,7 @@
 //
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
-import { auditSlotBlocks, clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
+import { auditSlotBlocks, blockClearScope, clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
 import { adoptableLease, type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
@@ -236,23 +236,21 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     const writeSlotLease = async (input: { access: string; expires: number; accountId: string }): Promise<void> => {
       // MERGED FROM DISK, NEVER WRITTEN FROM `live` WHOLESALE. Several senpi hosts publish into this
       // one file, so this process's map only records what IT last wrote; persisting it verbatim drops
-      // every slot another host has renewed since we started. Merging also makes the swap test below
-      // answer about the slot's REAL previous occupant instead of ours.
+      // every slot another host has renewed since we started.
       const onDisk = readLeaseCache(process.env)
-      // READ BEFORE THE SET BELOW. This is the only moment both the outgoing and the incoming account
+      // READ BEFORE THE SET BELOW: this is the only moment both the outgoing and the incoming account
       // are known, and telling a renewal-in-place from a SWAP is what decides which of senpi's blocks
-      // this publish may drop: a rate-limit block is real while its account stays, and stale the
-      // instant a different one takes the slot. An absent previous (a cold start with no warm cache)
-      // counts as a swap — there is then no evidence any persisted block describes what we just
-      // leased, and the master does not hand out an account it is cooling.
-      const swapped = (onDisk.get(slotName) ?? live.get(slotName))?.accountId !== input.accountId
+      // this publish may drop. Asked of `live` — what THIS process published — and never of the cache
+      // read just above, which is where the follow-external path gets its own input from. See
+      // blockClearScope for what asking the cache cost.
+      const scope = blockClearScope(live.get(slotName)?.accountId, input.accountId)
       await envSlot.writeLease(input)
       const entry: CachedLease = { accountId: input.accountId, access: input.access, expires: input.expires }
       live.set(slotName, entry)
       await writeLeaseCache(new Map(onDisk).set(slotName, entry))
       // A freshly published lease is the one moment this slot's token is known good, so drop any
       // block senpi pinned on it from an earlier, now-replaced token.
-      await clearEnvSlotBlock(slotName, swapped ? "account-changed" : "auth-only")
+      await clearEnvSlotBlock(slotName, scope)
     }
 
     // THE PIN, IN MEMORY, PER SLOT. opencode persists it in TuiKV so a pin survives a restart; there
