@@ -186,6 +186,8 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     keeper: { heldAccountId: () => string | undefined; adoptAccount: (accountId: string) => void }
     writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
     pin: PinStore
+    // Retained for the block audit: it is what turns senpi's auth_error report into a renewal.
+    invalidate: () => void
   }[] = []
   const toasts: QueuedToast[] = []
   // Filled from a switch the operator performed, which is the one moment the label and the prefix are
@@ -316,7 +318,7 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // avoids it by adopting the recorded id before its first tick (see src/worker/install.ts).
     if (warm) keeper.adoptAccount(warm.accountId)
     joiners.push(createLeaseJoiner(keeper.tickOnce))
-    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease, pin })
+    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease, pin, invalidate: envSlot.invalidate })
   }
 
   // allSettled, NOT all: senpi selects among whatever slots currently carry a token, so one slot's
@@ -411,7 +413,16 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
   return {
     ensureLeased,
     statusText: () => formatStatusText({ held: held(), labelByPrefix }),
-    auditBlocks: () => auditSlotBlocks(slotUnits.map((slot) => slot.slotName)),
+    // CLEARING THE BLOCK IS ONLY HALF THE RECOVERY. senpi blocked the slot after a 401, so the token
+    // this process published is dead — and a revoked token is indistinguishable from a live one here
+    // (same bytes, horizon still in the future), so the block IS the evidence. Clearing alone puts that
+    // dead token straight back into selection; senpi re-blocks it, and the pair oscillates for the rest
+    // of the session. Invalidating drops the remembered lease, so the ensureLeased() that follows in
+    // this same turn leases a live one.
+    auditBlocks: async (): Promise<void> => {
+      const authBlocked = await auditSlotBlocks(slotUnits.map((slot) => slot.slotName))
+      for (const slotName of authBlocked) slotUnits.find((slot) => slot.slotName === slotName)?.invalidate()
+    },
     drainToasts: () => toasts.splice(0, toasts.length),
     openPanel: (ui) =>
       createUsagePanel({
@@ -492,14 +503,13 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
       for (const parked of installed.drainToasts()) ctx.ui.notify(parked.message, parked.variant)
       for (const notice of await installed.followExternal()) ctx.ui.notify(notice, "warning")
     })
-    // BEFORE the lease, and that ordering is the fix: a slot senpi auth-blocked mid-session is not
-    // republished by the lease below (a warm lease is not due for renewal, so ensureLeased does
-    // nothing), and the block would then outlive this turn too.
-    await guard("senpi:turn-block-audit", () => installed.auditBlocks())
-    // BEFORE THE LEASE, so a slot senpi auth-blocked mid-session is selectable again for THIS turn
-    // rather than from the next renewal — which is LEASE_RENEW_BUFFER_MS before expiry, i.e. hours.
-    // On a worker with no stored login account, one blocked slot is senpi's "All Claude accounts are
-    // currently blocked", and its advice to re-login cannot apply: a pool-fed env slot has no login.
+    // BEFORE the lease, and that ordering is the fix: a slot senpi auth-blocked mid-session is
+    // selectable again for THIS turn rather than from the next renewal — which is LEASE_RENEW_BUFFER_MS
+    // before expiry, i.e. hours away, and a warm lease is not due for renewal so the lease below would
+    // do nothing on its own. On a worker with no stored login account one blocked slot IS senpi's "All
+    // Claude accounts are currently blocked", whose advice to re-login cannot apply: a pool-fed env slot
+    // has no login. The audit also invalidates every slot it unblocks, which is what makes the lease
+    // below replace the dead token rather than republish it.
     await guard("senpi:turn-block-audit", () => installed.auditBlocks())
     await installed
       .ensureLeased()

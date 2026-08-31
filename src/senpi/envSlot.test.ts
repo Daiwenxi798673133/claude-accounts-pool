@@ -62,6 +62,49 @@ test("a cleared token reads as no credential", async () => {
   expect(await slot.readAuth()).toBeUndefined()
 })
 
+// THE HOLE THE DRIFT CHECK CANNOT COVER. Anthropic revokes the previously issued access token the
+// instant the master refreshes, which leaves this slot remembering a credential every request 401s on:
+// identical bytes, so the drift check passes, and an expiry still in the future, so renewalDue() parks
+// the keeper for the whole window. senpi's auth_error block is the only local evidence, and this is
+// how the path that reads it gets the keeper to lease again.
+test("invalidate reads as no credential while the token stays published", async () => {
+  const environment = env()
+  const slot = createEnvSlot({ env: environment })
+  await slot.writeLease({ access: "access-1", expires: 1_800_000_000_000, accountId: "acct-a" })
+
+  slot.invalidate()
+
+  expect(await slot.readAuth()).toBeUndefined()
+  // STILL PUBLISHED, and this assertion is the guard rail: senpi synthesises an env slot only while the
+  // variable is present, so clearing it would drop the slot out of the candidate table and cost the
+  // whole turn ("No API key found") in exchange for a renewal about to happen anyway.
+  expect(environment[SENPI_OAUTH_TOKEN_VAR]).toBe("access-1")
+})
+
+test("invalidate before any lease leaves a foreign token alone", async () => {
+  const environment = env()
+  environment[SENPI_OAUTH_TOKEN_VAR] = "somebody-elses-token"
+  const slot = createEnvSlot({ env: environment })
+
+  slot.invalidate()
+
+  expect(environment[SENPI_OAUTH_TOKEN_VAR]).toBe("somebody-elses-token")
+  expect(await slot.readAuth()).toBeUndefined()
+})
+
+// The recovery is invalidate-then-renew, so a publish after an invalidate has to land normally —
+// otherwise the path would drop the remembered lease and have no way to replace it.
+test("a lease after invalidate republishes and reads back", async () => {
+  const environment = env()
+  const slot = createEnvSlot({ env: environment })
+  await slot.writeLease({ access: "access-1", expires: 1_800_000_000_000, accountId: "acct-a" })
+  slot.invalidate()
+  await slot.writeLease({ access: "access-2", expires: 1_800_000_900_000, accountId: "acct-a" })
+
+  expect(environment[SENPI_OAUTH_TOKEN_VAR]).toBe("access-2")
+  expect(await slot.readAuth()).toEqual({ access: "access-2", expires: 1_800_000_900_000 })
+})
+
 test("a custom variable name is honoured and the default is left alone", async () => {
   // senpi's numbered slots (CLAUDE_CODE_OAUTH_TOKEN_2 … _16) are what a later multi-account lease
   // will target, so the name has to be a parameter rather than a constant baked into the writer.

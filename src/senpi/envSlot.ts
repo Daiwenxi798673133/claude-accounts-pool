@@ -68,6 +68,15 @@ export type EnvSlotDeps = {
 export type EnvSlot = {
   readAuth: () => Promise<{ access?: string; expires?: number } | undefined>
   writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
+  // The drift check below catches a token somebody REPLACED. It cannot catch one Anthropic REVOKED:
+  // that leaves the string byte-identical and the remembered expiry in the future, so the slot reports
+  // itself healthy and renewalDue() parks the keeper on a credential every request 401s on. senpi's
+  // auth_error block is the only local evidence, and this is how the path that reads it forces a lease.
+  //
+  // LEAVES THE VARIABLE IN PLACE, DELIBERATELY: senpi only synthesises an env slot while the variable
+  // is present, so clearing it drops the slot out of the candidate table — "No API key found" on a
+  // worker with no login account. A revoked token costs one 401; an absent one costs the turn.
+  invalidate: () => void
 }
 
 export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
@@ -97,6 +106,11 @@ export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
       // accountId and expiry only. `input.access` is a live credential and is never logged.
       log.info("senpi:env-slot-written", { accountId: input.accountId, expires: input.expires })
       return Promise.resolve()
+    },
+    invalidate: () => {
+      if (written === undefined) return
+      log.info("senpi:env-slot-invalidated", { accountId: written.accountId, expires: written.expires })
+      written = undefined
     },
   }
 }
