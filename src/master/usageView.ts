@@ -23,6 +23,12 @@ export type UsageViewInput = {
   isCoolingDown: (accountId: string) => boolean
   holdersOf: (accountId: string) => string[]
   pinnersOf: (accountId: string) => string[]
+  // Every label the pool has been TOLD to expect. A flat list rather than a per-account flag,
+  // because registration is a fact about a machine and not about a lease: the page subtracts it from
+  // `holders` to mark the ones nobody registered, and the same list also lets it say how many there
+  // are. REQUIRED, so a caller cannot forget it and publish an empty book — on the wire an empty
+  // array means "nothing is registered", which is a claim, not the absence of one.
+  registeredWorkers: string[]
 }
 
 // `typeof === "string"`, NOT `!== undefined`. MEASURED against the live endpoint: a window sitting at
@@ -67,5 +73,5 @@ export function buildUsageView(input: UsageViewInput): UsageSnapshotView {
   // Row order is the ROSTER's order, deliberately not sorted by utilization: the operator scans the
   // same list in the same positions on every refresh, and a self-reordering table makes a pool that
   // is merely rotating look like one that is churning.
-  return { at: input.snapshot.at, stale: input.snapshot.stale, accounts }
+  return { at: input.snapshot.at, stale: input.snapshot.stale, accounts, registeredWorkers: input.registeredWorkers }
 }

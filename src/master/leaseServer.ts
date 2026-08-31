@@ -34,6 +34,8 @@ import type {
   RateLimitReport,
   ThrottledBody,
   UsageSnapshotView,
+  WorkerRegisterRequest,
+  WorkerRegisterResponse,
 } from "../cloud/protocol.ts"
 import { CLOUD_ROUTES, isWorkerLabel } from "../cloud/protocol.ts"
 import { LEASE_CHECK_INTERVAL_MS, LEASE_RENEW_BUFFER_MS, MASTER_REFRESH_THRESHOLD_MS } from "../constants.ts"
@@ -43,6 +45,7 @@ import type { AccountRemove } from "./accountRemove.ts"
 import { dashboardHtml } from "./dashboardHtml.ts"
 import type { PreferredInput, PreferredPick, UsageSnapshot } from "./scheduler.ts"
 import { buildUsageView } from "./usageView.ts"
+import type { RegisteredWorker } from "./workerRegistry.ts"
 
 export type LeaseServerDeps = {
   scheduler: {
@@ -67,6 +70,15 @@ export type LeaseServerDeps = {
     // a pool with no accounts.
     getUsageSnapshot(): UsageSnapshot
     isCoolingDown(accountId: string): boolean
+  }
+  // The pool's book of KNOWN worker labels. OBSERVE-ONLY on this server: an unregistered label is
+  // logged and then served exactly as a registered one is, because refusing it is a separate
+  // decision with a separate failure mode (see CLOUD_ROUTES.workerRegister). Required rather than
+  // optional so a master cannot be composed without a book and then report every worker as known.
+  workerRegistry: {
+    isRegistered(workerId: string): boolean
+    register(workerId: string): { existing: boolean }
+    list(): RegisteredWorker[]
   }
   refresher: { getFreshAccess(accountId: string, minHorizonMs?: number): Promise<{ access: string; expiresAt: number }> }
   loadAccounts: () => Promise<StoredAccount[]>
@@ -112,6 +124,7 @@ function json(
     | AccountAddResponse
     | AccountDeleteRefusedBody
     | AccountDeleteResponse
+    | WorkerRegisterResponse
     | { ok: true },
 ): Response {
   return Response.json(body, { status })
@@ -254,6 +267,16 @@ function parseAccountDeleteRequest(raw: unknown): AccountDeleteRequest | undefin
   return { idPrefix, label: trimmed }
 }
 
+function parseWorkerRegisterRequest(raw: unknown): WorkerRegisterRequest | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined
+  const { workerId } = raw as Record<string, unknown>
+  // THE SAME shape check the two worker routes make, and here it is the point rather than hygiene: a
+  // label the book holds but no lease can ever equal would read as an unregistered worker forever,
+  // and the operator would keep pressing the button on a machine that is already in the book.
+  if (!isWorkerLabel(workerId)) return undefined
+  return { workerId }
+}
+
 // English, like every other `error` string on this wire: the page branches on `refused` and renders
 // its own Chinese, so these exist for whoever is reading the route with curl.
 const DELETE_REFUSAL_DETAIL: Record<AccountDeleteRefusal, string> = {
@@ -289,6 +312,12 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     const request = parseLeaseRequest(await readJson(req))
     if (!request) return badRequest("malformed lease request")
     const { workerId } = request
+    // OBSERVE-ONLY (phase one): recorded, then served like any other. What the line buys is the
+    // ability to answer "whose lease was that" afterwards — the one question a one-off probe label
+    // leaves unanswerable once its hold is the only trace it left.
+    if (!deps.workerRegistry.isRegistered(workerId)) {
+      log.warn("master:lease-unknown-worker", { workerId, reason: request.reason })
+    }
     const accounts = await deps.loadAccounts()
     // A NAMED account short-circuits selection completely. `reason` still says why the worker is
     // asking, but it no longer influences WHICH account is served — the operator pressed a row.
@@ -406,6 +435,12 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     const report = parseRateLimitReport(await readJson(req))
     if (!report) return badRequest("malformed ratelimit report")
     const { workerId } = report
+    // COVERED for the same reason `lease` is, and this is the CHEAPER surface to abuse: a report
+    // cools an account out of selection for everyone, so an unknown label needs no token at all to
+    // shrink the pool. Observe-only here too — the report is still believed.
+    if (!deps.workerRegistry.isRegistered(workerId)) {
+      log.warn("master:ratelimit-unknown-worker", { workerId, accountId: report.accountId })
+    }
     deps.scheduler.reportRateLimit(report.accountId, report.resetsAt, workerId)
     // Header KEYS only, via redactHeaders: the worker forwards the limit response's headers
     // verbatim, and echoing values into a shared log file is how a credential-bearing header
@@ -439,6 +474,9 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
       isCoolingDown: (accountId) => deps.scheduler.isCoolingDown(accountId),
       holdersOf: (accountId) => deps.scheduler.holdersOf(accountId),
       pinnersOf: (accountId) => deps.scheduler.pinnersOf(accountId),
+      // The labels only — `registeredAt` is the book's own bookkeeping and the page has nothing to
+      // say with it, so it does not go on an unauthenticated wire.
+      registeredWorkers: deps.workerRegistry.list().map((entry) => entry.workerId),
     })
   }
 
@@ -542,6 +580,23 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     return json(200, { idPrefix: outcome.idPrefix, label: outcome.label })
   }
 
+  // The dashboard's 登记 worker button. POST-enforced like every other writing route here, for the
+  // ordinary reason: a link scanner's speculative GET must never reach a write.
+  //
+  // NOT GATED, and it could not usefully be: the label it records is self-declared, so a caller that
+  // can reach this port can register whatever it is about to lease under. This is a LEDGER, not a
+  // gate — see the header of this file and CLOUD_ROUTES.workerRegister.
+  async function handleWorkerRegister(req: Request): Promise<Response> {
+    if (req.method !== "POST") return json(405, { error: "use POST" })
+    const request = parseWorkerRegisterRequest(await readJson(req))
+    if (!request) return badRequest("malformed worker register request")
+    const { existing } = deps.workerRegistry.register(request.workerId)
+    // 200 for both outcomes, with the difference in the BODY. A 409 for `existing` would make the
+    // page render a refusal for the one case where the book already says what the operator wanted it
+    // to say, and the remedy for that is nothing.
+    return json(200, { workerId: request.workerId, existing })
+  }
+
   // The STRING is built once (the shell is a constant), but each request gets a FRESH Response: a
   // Response body is a single-use stream, so sharing one object would serve the first browser and
   // then fail every reload after it.
@@ -552,6 +607,7 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     authorizeRoute: CLOUD_ROUTES.accountAuthorize,
     addRoute: CLOUD_ROUTES.accountAdd,
     deleteRoute: CLOUD_ROUTES.accountDelete,
+    registerRoute: CLOUD_ROUTES.workerRegister,
   })
 
   const routes: Record<Route, RouteHandler> = {
@@ -579,6 +635,10 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // notice all three here, and should not add a fourth in this table — the header of this file
     // explains why an application-layer one would be theatre.
     [CLOUD_ROUTES.accountDelete]: (req) => handleAccountDelete(req),
+    // WRITES, but only to this master's own book of labels: it mints nothing, moves no account and
+    // reaches no network. What it changes is what the dashboard and the log can SAY about a holder,
+    // which is why it sits below the three above rather than beside them in risk.
+    [CLOUD_ROUTES.workerRegister]: (req) => handleWorkerRegister(req),
   }
 
   // A table lookup, not an if/else chain over paths: the chain's fallthrough silently answers an

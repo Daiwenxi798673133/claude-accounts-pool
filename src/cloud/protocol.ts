@@ -79,6 +79,21 @@ export const CLOUD_ROUTES = Object.freeze({
   // delete an account: it can, if it can reach this port and read the dashboard the label is printed
   // on. The bind address is what narrows that, exactly as for every other route here.
   accountDelete: "/v1/account/delete",
+  // POST — the dashboard's "登记 worker" flow: records a workerId as one this pool EXPECTS to see.
+  //
+  // WHAT IT BUYS IS ACCOUNTABILITY, NOT ACCESS CONTROL, and that has to stay written down or the
+  // next reader will take it for a gate. A workerId is self-declared, nothing on this wire
+  // authenticates it, and this route is reachable by exactly the same callers as the two above — so
+  // anyone who can lease can also register the label they are about to lease under. What the book
+  // gives the operator is the ability to SEE an unregistered holder, on the dashboard and in the
+  // log, which is the fault it was added for: a diagnostic probe held an account under a one-off
+  // label, nobody reclaimed the hold, and afterwards nothing could say whose it had been.
+  //
+  // PHASE ONE IS OBSERVE-ONLY: an unregistered worker is still served. Refusing one is a separate
+  // decision with its own failure mode — leaseClient classifies an unfamiliar status as a transient
+  // fault and retries with backoff for ~10 minutes, so "you are not registered" would reach the
+  // operator as 连不上云端账号池 — and is deliberately not bundled in here.
+  workerRegister: "/v1/worker/register",
 } as const)
 
 // Why the worker is asking. `prelease` is the routine path (startup or renewal before the
@@ -166,6 +181,23 @@ export type RateLimitReport = {
   accountId: string
   headers: Record<string, string>
   resetsAt?: number
+}
+
+// ── Worker registration payloads (the 登记 worker flow) ──────────────────────────────────────────
+
+export type WorkerRegisterRequest = {
+  // Held to the SAME shape as every other workerId on this wire (WORKER_LABEL_PATTERN), because the
+  // whole value of the book is that the label in it matches the label a lease arrives under
+  // character for character. A registry entry that no lease can ever equal is worse than no entry.
+  workerId: string
+}
+
+export type WorkerRegisterResponse = {
+  workerId: string
+  // true when this label was ALREADY in the book. Reported rather than folded into success, because
+  // the two outcomes call for different words on screen and hiding the difference is how an operator
+  // ends up believing they just registered a machine that was registered all along.
+  existing: boolean
 }
 
 export type ErrorBody = {
@@ -312,4 +344,10 @@ export type UsageSnapshotView = {
   // already stopped ranking by these numbers, so the page must stop presenting them as current.
   stale: boolean
   accounts: UsageAccountView[]
+  // Every workerId this master has been TOLD to expect. The page marks a holder that is NOT in this
+  // list, so the direction matters: an ABSENT field means "this master keeps no book" and must mark
+  // nothing, while an EMPTY array means "the book is empty" and marks every holder. Optional for the
+  // usual reason — a master predating the book sends none, and the worker /usage panel parses this
+  // same payload, so a required field would make every pre-upgrade answer schema-invalid.
+  registeredWorkers?: string[]
 }

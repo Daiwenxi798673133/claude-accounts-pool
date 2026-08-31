@@ -52,6 +52,7 @@ test("joins roster, snapshot and cooldown into one anthropic-only view", () => {
     isCoolingDown: never,
     holdersOf: unheld,
     pinnersOf: unheld,
+    registeredWorkers: [],
   })
 
   expect(view.at).toBe(1_700_000_000_000)
@@ -91,6 +92,7 @@ test("a null resets_at from the API is omitted, not forwarded as null", () => {
     isCoolingDown: never,
     holdersOf: unheld,
     pinnersOf: unheld,
+    registeredWorkers: [],
   })
 
   // The KEY IS ABSENT, not present-and-null. UsageWindowView promises "absent or a string", so a
@@ -110,6 +112,7 @@ test("an account missing from the snapshot is unknown, never zero", () => {
     isCoolingDown: never,
     holdersOf: unheld,
     pinnersOf: unheld,
+    registeredWorkers: [],
   })
 
   // The poller OMITS accounts whose usage fetch failed (a 429 on /api/oauth/usage lasts minutes), so
@@ -138,6 +141,7 @@ test("cooldown, reauth and excluded flags come through, and a token never does",
     isCoolingDown: (accountId) => accountId === "cool",
     holdersOf: unheld,
     pinnersOf: unheld,
+    registeredWorkers: [],
   })
 
   expect(view.stale).toBe(true)
@@ -154,4 +158,35 @@ test("cooldown, reauth and excluded flags come through, and a token never does",
   expect(wire).not.toContain("sk-ant-")
   expect(wire).not.toContain("access")
   expect(wire).not.toContain("refresh")
+})
+
+test("已登记名单原样转发，空名单也要发空数组而不是省略字段", () => {
+  // Given: two holders, one of them registered.
+  const view = buildUsageView({
+    accounts: [account("held")],
+    snapshot: snapshot([["held", { five_hour: { utilization: 10 } }]]),
+    isCoolingDown: never,
+    holdersOf: () => ["vince-local", "vince-diagnose"],
+    pinnersOf: unheld,
+    registeredWorkers: ["vince-local"],
+  })
+
+  // Then: the WHOLE list travels. The page marks a holder that is absent from it, so forwarding a
+  // subset would silently brand a registered machine as unknown.
+  expect(view.registeredWorkers).toEqual(["vince-local"])
+  expect(view.accounts[0].holders).toEqual(["vince-local", "vince-diagnose"])
+
+  const empty = buildUsageView({
+    accounts: [account("held")],
+    snapshot: snapshot([]),
+    isCoolingDown: never,
+    holdersOf: unheld,
+    pinnersOf: unheld,
+    registeredWorkers: [],
+  })
+
+  // EMPTY, never absent: on this wire an omitted field means "this master keeps no book" and the page
+  // must then mark nothing at all, so a master whose book is empty has to say so out loud.
+  expect(empty.registeredWorkers).toEqual([])
+  expect(Object.hasOwn(empty, "registeredWorkers")).toBe(true)
 })

@@ -2,12 +2,13 @@ import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
 import { LEASE_RENEW_BUFFER_MS, MASTER_REFRESH_THRESHOLD_MS, ONBOARD_ADD_MIN_INTERVAL_MS } from "../constants.ts"
 import { CLOUD_ROUTES } from "../cloud/protocol.ts"
-import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView } from "../cloud/protocol.ts"
+import type { LeaseRequest, LeaseResponse, RateLimitReport, ThrottledBody, UsageSnapshotView, WorkerRegisterResponse } from "../cloud/protocol.ts"
 import { createAccountOnboard } from "./accountOnboard.ts"
 import { createAccountRemove } from "./accountRemove.ts"
 import { startLeaseServer, USAGE_REFRESH_MIN_INTERVAL_MS } from "./leaseServer.ts"
 import { RATELIMIT_ADOPTION_GRACE_MS } from "./scheduler.ts"
 import type { UsageSnapshot } from "./scheduler.ts"
+import { createWorkerRegistry } from "./workerRegistry.ts"
 
 // A REAL Bun.serve on an EPHEMERAL port, driven by REAL fetch. The deliverable here is HTTP
 // behaviour (status codes, boundary refusals, empty-body 204), and a handler invoked directly as
@@ -57,6 +58,9 @@ type Harness = {
   // Who the master believes holds what, right now. A snapshot copy rather than the live map, so a
   // case cannot assert against a book that has moved on since it looked.
   book: () => Array<[string, string]>
+  // The labels the master has been told to expect. Kept apart from `book` because leasing is not
+  // registering: a harness where one implied the other could not show that.
+  registered: () => string[]
 }
 
 function startHarness(options?: {
@@ -72,6 +76,8 @@ function startHarness(options?: {
   profileThrows?: boolean
   // A refresher that cannot mint — a revoked chain, or a 429 cooldown with nothing cached.
   refreshThrows?: boolean
+  // Labels already in the master's book when the server starts.
+  registeredWorkers?: string[]
 }): Harness {
   const accounts = options?.accounts ?? [account("acct-a"), account("acct-b")]
   const accountExpiresAt = options?.accountExpiresAt ?? ACCOUNT_EXPIRES_AT
@@ -139,6 +145,21 @@ function startHarness(options?: {
     },
   })
 
+  // The REAL book over an in-memory kv, for the same reason accountOnboard and accountRemove are
+  // real here: these cases assert what the ROUTE does to it, and a stub answering canned values
+  // would prove nothing about persistence or about a repeat registration.
+  const kvStore = new Map<string, unknown>()
+  const workerRegistry = createWorkerRegistry({
+    kv: {
+      get: <V>(key: string, fallback?: V): V => (kvStore.has(key) ? (kvStore.get(key) as V) : (fallback as V)),
+      set: (key: string, value: unknown): void => {
+        kvStore.set(key, value)
+      },
+    },
+    now: clock,
+  })
+  for (const workerId of options?.registeredWorkers ?? []) workerRegistry.register(workerId)
+
   const server = startLeaseServer({
     scheduler: {
       pickAccount({ accounts: pool, exclude, workerId, excludeIds }) {
@@ -197,6 +218,7 @@ function startHarness(options?: {
       // account being skipped by selection can never disagree in this harness.
       isCoolingDown: (accountId) => cooled.has(accountId),
     },
+    workerRegistry,
     refresher: {
       async getFreshAccess(accountId) {
         refreshed.push(accountId)
@@ -238,6 +260,7 @@ function startHarness(options?: {
     deleted,
     roster: () => accounts.map((entry) => entry.id),
     book: () => [...leases].map(([workerId, hold]) => [workerId, hold.accountId]),
+    registered: () => workerRegistry.list().map((entry) => entry.workerId),
   }
 }
 
@@ -1588,6 +1611,100 @@ test("a malformed excludeAccountIds is refused 400 before anything is picked or 
     })
     expect(notArray.status).toBe(400)
     expect(harness.picks).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("未登记的 worker 照常发牌，只留下一条可查的告警", async () => {
+  // Given: a book that knows this machine but not the probe — the shape of the real incident, where a
+  // one-off diagnostic label leased an account and left nothing behind but its hold.
+  const harness = startHarness({ registeredWorkers: [WORKER_ID] })
+  try {
+    // When
+    const stranger = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: "vince-diagnose",
+      reason: "prelease",
+    } satisfies LeaseRequest)
+
+    // Then: SERVED. Phase one records the fact and changes no outcome — refusing here would reach the
+    // operator through leaseClient's backoff as 连不上云端账号池, not as "this label is not registered".
+    expect(stranger.status).toBe(200)
+    expect(harness.book()).toEqual([["vince-diagnose", "acct-a"]])
+    // AND leasing is not registering: a ledger that enrolled whoever showed up could only ever
+    // confirm what had already happened.
+    expect(harness.registered()).toEqual([WORKER_ID])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("登记 worker：首次 existing=false，重复 existing=true，并出现在 /v1/usage 的名单里", async () => {
+  // Given
+  const harness = startHarness()
+  try {
+    // When
+    const first = await post(harness.base, CLOUD_ROUTES.workerRegister, { workerId: "vince-diagnose" })
+    const again = await post(harness.base, CLOUD_ROUTES.workerRegister, { workerId: "vince-diagnose" })
+
+    // Then
+    expect(first.status).toBe(200)
+    expect(await first.json()).toEqual({ workerId: "vince-diagnose", existing: false } satisfies WorkerRegisterResponse)
+    // 200 and NOT 409: the book already says what the operator wanted it to say, and a refusal offers
+    // a remedy for a state that needs none.
+    expect(again.status).toBe(200)
+    expect(await again.json()).toEqual({ workerId: "vince-diagnose", existing: true } satisfies WorkerRegisterResponse)
+
+    // The page marks the holders that are NOT in this list, so the list has to reach it — and it
+    // carries labels only, never the book's own registeredAt bookkeeping.
+    const view = (await (await fetch(`${harness.base}${CLOUD_ROUTES.usage}`)).json()) as UsageSnapshotView
+    expect(view.registeredWorkers).toEqual(["vince-diagnose"])
+    expect(JSON.stringify(view)).not.toContain("registeredAt")
+  } finally {
+    harness.stop()
+  }
+})
+
+test("登记路由拒绝畸形标签与非 POST，且一条都不记", async () => {
+  // Given
+  const harness = startHarness()
+  try {
+    // When
+    const malformed = await post(harness.base, CLOUD_ROUTES.workerRegister, { workerId: "bad id/../with spaces" })
+    const missing = await post(harness.base, CLOUD_ROUTES.workerRegister, {})
+    const notJson = await post(harness.base, CLOUD_ROUTES.workerRegister, "{")
+    const read = await fetch(`${harness.base}${CLOUD_ROUTES.workerRegister}`)
+
+    // Then: 400 for every shape fault. A label the book holds but no lease can ever equal would read
+    // as an unregistered worker forever, and the operator would keep pressing the button on it.
+    expect([malformed.status, missing.status, notJson.status]).toEqual([400, 400, 400])
+    // 405 rather than 404: the latter reads as "this master is too old to have the route", which is
+    // the one thing that is not wrong here.
+    expect(read.status).toBe(405)
+    expect(harness.registered()).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("陌生标签的限流上报同样被记下，而报告仍然生效", async () => {
+  // Given
+  const harness = startHarness({ registeredWorkers: [WORKER_ID] })
+  try {
+    // When: the CHEAPER surface to abuse — a report needs no token at all and cools an account out of
+    // selection for every worker in the pool.
+    const res = await post(harness.base, CLOUD_ROUTES.ratelimit, {
+      workerId: "vince-diagnose",
+      accountId: "acct-a",
+      headers: {},
+    } satisfies RateLimitReport)
+
+    // Then: still believed, because phase one changes no outcome anywhere — the cooled account is
+    // duly skipped by the next pick.
+    expect(res.status).toBe(204)
+    expect(harness.reports).toEqual([{ accountId: "acct-a" }])
+    const next = await post(harness.base, CLOUD_ROUTES.lease, PRELEASE)
+    expect(((await next.json()) as LeaseResponse).accountId).toBe("acct-b")
   } finally {
     harness.stop()
   }

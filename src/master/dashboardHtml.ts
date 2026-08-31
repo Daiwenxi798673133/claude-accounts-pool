@@ -31,6 +31,7 @@ export type DashboardConfig = {
   authorizeRoute: string
   addRoute: string
   deleteRoute: string
+  registerRoute: string
 }
 
 export function dashboardHtml(config: DashboardConfig): string {
@@ -140,6 +141,16 @@ export function dashboardHtml(config: DashboardConfig): string {
      operator should expect to see here on the next refresh. No new colour enters the palette. */
   .badge.pin { font-family: var(--mono); color: var(--accent); background: var(--chip-bg);
                border-color: var(--accent); }
+  /* A holder NOBODY registered. The DARKEST accent in the palette, the tone a maxed usage bar uses,
+     because this is the only mark on the row that says "the pool cannot tell you whose machine this
+     is" — the fault a one-off probe label leaves behind once its hold is its only trace. It outranks
+     .pin for colour and keeps both glyphs, so a pinned stranger still reads as pinned. No new colour
+     enters the palette. */
+  .badge.alien { font-family: var(--mono); color: var(--accent-dark); background: var(--chip-bg);
+                 border-color: var(--accent-dark); }
+  /* The suggestion chips inside the 登记 worker dialog are real buttons, so they are focusable and
+     keyboard-activatable; .badge already owns their size and shape. */
+  .crew button.badge { cursor: pointer; }
   /* ITS OWN ROW, NOT part of .who, and a FIXED height present on every card whether or not anyone
      holds the account — the same reason .bar.ghost exists further down. Holder count is the one thing
      on this page that varies per account without bound, so leaving these badges to wrap inside .who
@@ -312,6 +323,10 @@ export function dashboardHtml(config: DashboardConfig): string {
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.8 4.4h10.4"></path><path d="M6.4 4.4V3.1h3.2v1.3"></path><path d="M4.1 4.4l0.6 8.5h6.6l0.6-8.5"></path></svg>
         <span>删除账号</span>
       </button>
+      <button id="reg" type="button">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.6 3.4h7.2l3.6 4.6-3.6 4.6H2.6z"></path><path d="M5.4 8h3.2"></path></svg>
+        <span>登记 worker</span>
+      </button>
       <button id="refresh" type="button">
         <span class="spin" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.7 6.6A6 6 0 0 0 3.1 4.6"></path><path d="M2.3 9.4A6 6 0 0 0 12.9 11.4"></path><path d="M13.9 2.6v4h-4"></path><path d="M2.1 13.4v-4h4"></path></svg></span>
         <span id="refresh-label">刷新</span>
@@ -370,6 +385,21 @@ export function dashboardHtml(config: DashboardConfig): string {
         <button id="delcancel" class="pill" type="button">取消</button>
       </div>
     </div>
+    <div id="d-reg" class="stage" hidden>
+      <div class="field">
+        <label for="regid">worker 标签（那台机器 tui.json 里的 workerId）</label>
+        <input id="regid" type="text" spellcheck="false" autocomplete="off" placeholder="例如 vince-local">
+        <span class="hint">登记只是把这个标签记进 master 的名册，让看板和日志能说出「这台机器是谁」。它不拦任何人租号——能连到这个端口的人本来就能自己登记。下面列的是当前正持有账号、但没人登记过的标签，点一下即可填入。</span>
+      </div>
+      <div id="regsuggest" class="crew"></div>
+      <p id="regerr" hidden></p>
+      <div class="row">
+        <button id="regsubmit" class="pill primary" type="button" disabled>
+          <span id="regsubmitlabel">登记</span>
+        </button>
+        <button id="regcancel" class="pill" type="button">取消</button>
+      </div>
+    </div>
     <div id="d-done" class="stage" hidden>
       <span class="tick" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-6"></path></svg></span>
       <span id="donetext"></span>
@@ -391,6 +421,7 @@ export function dashboardHtml(config: DashboardConfig): string {
   var AUTHORIZE_URL = "${config.authorizeRoute}";
   var ADD_URL = "${config.addRoute}";
   var DELETE_URL = "${config.deleteRoute}";
+  var WORKER_REG_URL = "${config.registerRoute}";
   var THROTTLE_MS = ${String(config.throttleMs)};
   var RELOAD_MS = 5000;
   var TICK_MS = 1000;
@@ -490,6 +521,28 @@ export function dashboardHtml(config: DashboardConfig): string {
   // own age. Rebuilt from state on every tick rather than written at the point of each event — the
   // one-second re-render used to erase a fetch error a moment after it appeared, because whoever set
   // the text was racing the timer that rewrote it.
+  // The holders this pool was never told to expect, de-duplicated across accounts: one machine can
+  // hold several accounts (a senpi worker fills several token slots), and counting it once per
+  // account would report a number the page cannot point at.
+  //
+  // null means THIS MASTER KEEPS NO BOOK — an absent registeredWorkers field. Marking nothing is the
+  // only safe reading of that: the opposite one (an empty book) brands every holder in the pool.
+  function strangerHolders() {
+    if (!latest || !latest.registeredWorkers) return null;
+    var known = latest.registeredWorkers;
+    var out = [];
+    for (var i = 0; i < latest.accounts.length; i++) {
+      var holders = latest.accounts[i].holders || [];
+      for (var h = 0; h < holders.length; h++) {
+        // indexOf against the output array rather than an object used as a set: a workerId may be
+        // "__proto__" (the master's own label pattern allows it), and assigning that key to a plain
+        // object creates no own property, so the dedupe would silently miss exactly that one.
+        if (known.indexOf(holders[h]) < 0 && out.indexOf(holders[h]) < 0) out.push(holders[h]);
+      }
+    }
+    return out;
+  }
+
   function renderMeta() {
     if (sweeping) {
       meta.className = "";
@@ -503,8 +556,10 @@ export function dashboardHtml(config: DashboardConfig): string {
     }
     var wait = throttledUntil - Date.now();
     var suffix = wait > 0 ? "（刚刚已采集，" + Math.ceil(wait / 1000) + " 秒后可再刷新）" : "";
+    var strangers = strangerHolders();
+    var alien = strangers && strangers.length > 0 ? " · 未登记 worker " + strangers.length + " 个" : "";
     meta.className = latest && (latest.stale || latest.at === 0) ? "stale" : "";
-    meta.textContent = snapshotText() + suffix;
+    meta.textContent = snapshotText() + suffix + alien;
   }
 
   function syncButton() {
@@ -608,9 +663,15 @@ export function dashboardHtml(config: DashboardConfig): string {
     // pinnedBy is a SUBSET of holders by construction (see the protocol type), so a pin DECORATES the
     // holder it belongs to instead of adding a second chip — one list, one chip per machine.
     var pinned = account.pinnedBy || [];
+    // An absent registeredWorkers means this master keeps no book, so NOTHING may be marked here.
+    var known = latest && latest.registeredWorkers ? latest.registeredWorkers : null;
     for (var h = 0; h < holders.length; h++) {
       var sticky = pinned.indexOf(holders[h]) >= 0;
-      crew.appendChild(el("span", sticky ? "badge pin" : "badge busy", sticky ? "📌 " + holders[h] : holders[h]));
+      var stranger = known !== null && known.indexOf(holders[h]) < 0;
+      // Both glyphs survive when both apply, but 未登记 owns the COLOUR: "we cannot say whose machine
+      // this is" is the one thing on the row an operator has to act on rather than merely expect.
+      var tone = stranger ? "badge alien" : sticky ? "badge pin" : "badge busy";
+      crew.appendChild(el("span", tone, (sticky ? "📌 " : "") + (stranger ? "⚠ " : "") + holders[h]));
     }
     head.appendChild(crew);
     card.appendChild(head);
@@ -735,6 +796,7 @@ export function dashboardHtml(config: DashboardConfig): string {
     loading: document.getElementById("d-loading"),
     ready: document.getElementById("d-ready"),
     del: document.getElementById("d-del"),
+    reg: document.getElementById("d-reg"),
     done: document.getElementById("d-done"),
     fatal: document.getElementById("d-fatal")
   };
@@ -758,6 +820,10 @@ export function dashboardHtml(config: DashboardConfig): string {
     del: {
       del: "这一步不可撤销：删掉的是账号在池子里的唯一一份凭据。",
       done: "删除成功。"
+    },
+    reg: {
+      reg: "登记只改变看板和日志能说什么，不会拦住任何人租号。",
+      done: "名册已更新。"
     }
   };
   var flow = "add";
@@ -803,6 +869,7 @@ export function dashboardHtml(config: DashboardConfig): string {
     pendingId = "";
     submitting = false;
     deleting = false;
+    registering = false;
   }
 
   // Asks for a fresh PKCE session every time the dialog opens. Deliberately NOT cached across opens:
@@ -1101,6 +1168,117 @@ export function dashboardHtml(config: DashboardConfig): string {
   });
   delConfirm.addEventListener("keydown", function (event) {
     if (event.key === "Enter") submitDelete();
+  });
+
+  // ── 登记 worker ────────────────────────────────────────────────────────────────────────────────
+  // The ledger's only write surface, and the dialog says out loud what it is not: a workerId is
+  // self-declared, so anyone who can reach this port can register the label they are about to lease
+  // under. What it buys is being able to look at a holder chip and know whether anybody ever expected
+  // that machine — the question a one-off probe label left unanswerable.
+  var regInput = document.getElementById("regid");
+  var regSubmit = document.getElementById("regsubmit");
+  var regSubmitLabel = document.getElementById("regsubmitlabel");
+  var regError = document.getElementById("regerr");
+  var regSuggest = document.getElementById("regsuggest");
+  var registering = false;
+  // The master's own WORKER_LABEL_PATTERN, restated here for ONE purpose: keeping the button dead
+  // until the value could possibly be accepted. The server's 400 stays the verdict.
+  var LABEL_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+  function setRegisterError(text) {
+    regError.textContent = text;
+    regError.hidden = !text;
+  }
+
+  function syncRegister() {
+    regSubmit.disabled = registering || !LABEL_RE.test(regInput.value.trim());
+    regSubmitLabel.textContent = registering ? "登记中…" : "登记";
+  }
+
+  // A closure per chip rather than a shared handler reading the event target: with var-scoped loop
+  // variables a shared handler would capture the LAST label for every chip.
+  function suggestChip(workerId) {
+    var chip = el("button", "badge alien", "⚠ " + workerId);
+    chip.type = "button";
+    chip.addEventListener("click", function () {
+      regInput.value = workerId;
+      setRegisterError("");
+      syncRegister();
+      regInput.focus();
+    });
+    return chip;
+  }
+
+  function beginRegister() {
+    clearTimeout(closeTimer);
+    flow = "reg";
+    dialogTitle.textContent = "登记 worker";
+    veil.hidden = false;
+    registering = false;
+    regInput.value = "";
+    setRegisterError("");
+    // REBUILT from the current snapshot on every open, like the delete picker: a chip naming a holder
+    // that has since dropped its lease would enrol a label nobody is using.
+    regSuggest.textContent = "";
+    var strangers = strangerHolders() || [];
+    for (var i = 0; i < strangers.length; i++) regSuggest.appendChild(suggestChip(strangers[i]));
+    showStage("reg");
+    syncRegister();
+    regInput.focus();
+  }
+
+  function submitRegister() {
+    if (registering) return;
+    var workerId = regInput.value.trim();
+    // The same test syncRegister just made, re-made at the point of the request: the button is only
+    // one of the ways this function is reached (Enter in the field is the other).
+    if (!LABEL_RE.test(workerId)) return;
+    registering = true;
+    setRegisterError("");
+    syncRegister();
+    fetch(WORKER_REG_URL, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workerId: workerId })
+    })
+      .then(function (res) {
+        if (res.ok) return res.json();
+        throw { status: res.status };
+      })
+      .then(function (payload) {
+        // The two outcomes get different words. A re-registration reported as a fresh one is how an
+        // operator ends up believing they just enrolled a machine that was in the book all along.
+        doneText.textContent = payload.existing
+          ? "worker「" + payload.workerId + "」本来就在名册里，没有改动。"
+          : "worker「" + payload.workerId + "」已记入名册。";
+        showStage("done");
+        // The chips behind the dialog are now stale by exactly one label.
+        load();
+        closeTimer = setTimeout(closeDialog, 2600);
+      })
+      .catch(function (failure) {
+        setRegisterError(
+          failure && failure.status === 400
+            ? "这个标签不符合 workerId 的形状（只允许字母、数字、点、下划线、短横，1 到 64 位），名册没有改动。"
+            : "登记失败：" + (failure && failure.status ? "HTTP " + failure.status : "网络错误") + "，名册没有改动。"
+        );
+      })
+      .then(function () {
+        registering = false;
+        syncRegister();
+      });
+  }
+
+  document.getElementById("reg").addEventListener("click", beginRegister);
+  document.getElementById("regcancel").addEventListener("click", closeDialog);
+  regSubmit.addEventListener("click", submitRegister);
+  regInput.addEventListener("input", function () {
+    setRegisterError("");
+    syncRegister();
+  });
+  regInput.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") submitRegister();
   });
 
   // ── WAKING UP ─────────────────────────────────────────────────────────────────────────────────

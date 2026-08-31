@@ -103,12 +103,13 @@ master 在**同一个端口**上多挂几条路由,给运维一个能看**全池
 
 | 路由 | 方法 | 鉴权 | 内容 |
 |---|---|---|---|
-| `/v1/usage` | GET | **免鉴权** | 全池每个 anthropic 账号的 label、id 前缀、各窗口利用率与 `resetsAt`、冷却状态、token 到期、`needsReauth` / `excluded`,以及 `holders`(租约未过期的 workerId)与 `pinnedBy`(其中钉住了这个号的那些)。两者都**空数组表示没人**、字段缺失才表示"这台 master 不追踪这件事" |
+| `/v1/usage` | GET | **免鉴权** | 全池每个 anthropic 账号的 label、id 前缀、各窗口利用率与 `resetsAt`、冷却状态、token 到期、`needsReauth` / `excluded`,以及 `holders`(租约未过期的 workerId)与 `pinnedBy`(其中钉住了这个号的那些)。两者都**空数组表示没人**、字段缺失才表示"这台 master 不追踪这件事";以及 `registeredWorkers`(已登记的 workerId 名单,看板据此把不在其中的 holder 标为未登记)。字段缺失表示这台 master 不记名册,**必须什么都不标**;空数组才表示名册是空的 |
 | `/` | GET | **免鉴权** | 一个零依赖的 HTML 页面,自己去拉 `/v1/usage` 并渲染(进度条 + 倒计时)。页面本身不含任何数据 |
 | `/v1/usage/refresh` | **POST** | **免鉴权** | 页面上「刷新」按钮打的那一发:立刻跑一轮采集,再返回采集结果。**服务端 30 秒最小间隔**,被拒时返回 `429` + `Retry-After` + `retryAfterMs` |
 | `/v1/account/authorize` | **POST** | **免鉴权** | 「添加账号」第一步:生成一条 Claude PKCE 授权链接,返回 `{url, pendingId, expiresAt}`。verifier 只留在 master 内存里,浏览器只拿到 `pendingId` |
 | `/v1/account/add` | **POST** | **免鉴权** | 第二步:用运维粘回来的 code 换取真实 token,查 profile,写进账号库。返回 `{idPrefix, label, existing}`,**不含任何 token** |
 | `/v1/account/delete` | **POST** | **免鉴权** | 「删除账号」:按 `{idPrefix, label}` 把一个账号移出账号库。**两个字段都必填**——前缀定位、label 是确认。前缀命中多个直接拒(`409 ambiguous`),label 对不上也拒(`409 label-mismatch`),删之前先把这条记录单独备份到 `claude-accounts.json` 同目录 |
+| `/v1/worker/register` | **POST** | **免鉴权** | 「登记 worker」:把一个 workerId 记进 master 的名册,回 `{workerId, existing}`。**这是一本账,不是一道门**——workerId 是自称的,能连到端口的人可以自己登记自己即将使用的标签;名册买到的是「看板和日志能说出这个持有者是谁」。阶段一**只告警不拒绝**:未登记的 worker 照常发牌,只在日志里留 `master:lease-unknown-worker` / `master:ratelimit-unknown-worker`,并在看板上标出来 |
 
 关于刷新按钮有两处不是随手写的:
 
@@ -130,6 +131,15 @@ master 在**同一个端口**上多挂几条路由,给运维一个能看**全池
 - **能报一次假的撞限**,把某个健康账号冷却出选号队列,削掉一截池子容量。
 
 **能收窄的只有绑定地址**,别无他法——默认 `127.0.0.1`,想更宽必须在 `tui.json` 里显式写 `hostname`。本项目的部署里绑的是 Tailscale 地址,于是"谁能用这个池子"这个问题的真正答案是"谁在这个 tailnet 里"。把这句话当成部署前的检查项:**在决定 `hostname` 写什么的那一刻,你就把访问控制策略定完了**。
+
+### 「登记 worker」买到的是什么
+
+一句话:**问责,不是访问控制**。`workerId` 是自称标签,`/v1/worker/register` 和加号、删号站在同一个位置上——能连到端口的人可以把自己即将使用的标签登记进去。所以名册挡不住任何人,它只是让「这个 holder 是谁」这个问题在事后有答案。
+
+它是被一次真实事故推出来的:一次排障探针以 `vince-diagnose` 租走了一个号,租完没人回收,占着一个 holder 名额直到租约地平线过去,而事后没有任何东西能说出那是谁的。
+
+阶段一**只告警不拒绝**:未登记的 worker 照常发牌,只在日志和看板上可见。翻成拒绝是另一次改动,因为它有自己的失败模式——`leaseClient` 把陌生状态码当瞬时故障退避约 10 分钟,于是「你没登记」会以「连不上云端账号池」的面目到达运维手里。
+
 
 ### 「添加账号」用什么代替鉴权
 
