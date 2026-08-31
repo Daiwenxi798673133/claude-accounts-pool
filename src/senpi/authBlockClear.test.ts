@@ -3,7 +3,14 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { initLogger } from "../logger.ts"
-import { auditSlotBlocks, clearEnvSlotBlock, describeCandidates, senpiAuthPath, withoutSlotBlock } from "./authBlockClear.ts"
+import {
+  auditSlotBlocks,
+  blockClearScope,
+  clearEnvSlotBlock,
+  describeCandidates,
+  senpiAuthPath,
+  withoutSlotBlock,
+} from "./authBlockClear.ts"
 
 const PROVIDER = "claude-sdk-oauth"
 
@@ -180,6 +187,30 @@ test("clearEnvSlotBlock clears a replaced account's rate-limit block on disk", a
   } finally {
     box.cleanup()
   }
+})
+
+// ── blockClearScope: which scope a publish has earned ────────────────────────────────────────────
+
+// A renewal in place. The account did not move, so a rate-limit block on the slot is that account's
+// and still REAL — clearing it would hammer a throttled account once per turn.
+test("blockClearScope holds a renewal in place at auth-only", () => {
+  expect(blockClearScope("acct-a", "acct-a")).toBe("auth-only")
+})
+
+// THE REGRESSION THIS FUNCTION EXISTS FOR, and the reason the previous account is passed in rather
+// than looked up. Following another host's switch republishes an account read straight out of the
+// shared lease cache, so a decision that compared against that cache found it "unchanged" and
+// degraded to auth-only — leaving the throttled previous occupant's block standing over the healthy
+// account just adopted, which with `accounts: []` is senpi's "All Claude accounts are currently
+// blocked" for every session on the machine. Only what THIS process published can answer it.
+test("blockClearScope reports a swap when the published account is replaced", () => {
+  expect(blockClearScope("acct-throttled", "acct-healthy")).toBe("account-changed")
+})
+
+// A cold start with no warm cache: nothing was published here, so there is no evidence any persisted
+// block describes what was just leased.
+test("blockClearScope treats no previous publish as a swap", () => {
+  expect(blockClearScope(undefined, "acct-a")).toBe("account-changed")
 })
 
 // ── describeCandidates ───────────────────────────────────────────────────────────────────────────
