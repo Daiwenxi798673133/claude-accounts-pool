@@ -262,3 +262,117 @@ test("backs off exponentially between failed renewals", async () => {
   expect(h.writes).toEqual([])
   expect(h.toasts).toEqual([])
 })
+
+// ── section: the machine-wide critical section ────────────────────────────────────────────────────
+
+const FRESH = { accountId: "acct-a", access: "fresh", expiresAt: NOW + 3_600_000 }
+
+// The senpi lane runs SEVERAL hosts against one credential slot, and this keeper owns the only
+// sequence that must not interleave across them: due → lease → publish. That is why the seam is here
+// and not in the senpi composition root, which cannot reach inside the interval's tick.
+test("the section covers the lease and the publish, and is released before the backoff", async () => {
+  const captured = captureLogs()
+  const order: string[] = []
+  const client = {
+    lease: async () => {
+      order.push("lease")
+      return { ok: false as const, failure: { kind: "no-account" as const } }
+    },
+  }
+  const h = harness({ client, auth: { access: "leased", expires: NOW - 1 } })
+  const keeper = installLeaseKeeper({
+    ...h.deps,
+    sleep: async (ms) => {
+      order.push(`sleep:${ms}`)
+    },
+    section: async (leaseAndPublish) => {
+      order.push("enter")
+      await leaseAndPublish()
+      order.push("exit")
+      return true
+    },
+  })
+
+  try {
+    await keeper.tickOnce()
+  } finally {
+    keeper.dispose()
+    captured.restore()
+  }
+
+  // THE SLEEP LANDS OUTSIDE. The backoff runs up to five minutes, and a cross-process section held
+  // across it would stall every other host for that sleep on top of the failure that caused it.
+  expect(order).toEqual(["enter", "lease", "exit", `sleep:${LEASE_BACKOFF_BASE_MS}`])
+})
+
+test("the publish happens inside the section, not after it", async () => {
+  const order: string[] = []
+  const h = harness({ client: { lease: async () => ({ ok: true as const, lease: FRESH }) }, auth: { access: "leased", expires: NOW + 1_000 } })
+  const keeper = installLeaseKeeper({
+    ...h.deps,
+    writeLease: async (write) => {
+      order.push("publish")
+      h.writes.push(write)
+    },
+    section: async (leaseAndPublish) => {
+      order.push("enter")
+      await leaseAndPublish()
+      order.push("exit")
+      return true
+    },
+  })
+
+  try {
+    await keeper.tickOnce()
+  } finally {
+    keeper.dispose()
+  }
+
+  expect(order).toEqual(["enter", "publish", "exit"])
+  expect(h.writes).toHaveLength(1)
+})
+
+// A DECLINE IS NOT A FAILURE, because nothing was attempted. Reporting a stranded credential would cry
+// wolf on the one toast that must never do it, and charging a backoff would throttle the very next
+// tick — which is the tick that adopts whatever the lock's winner published.
+test("a declining section leases nothing, writes nothing, toasts nothing and charges no backoff", async () => {
+  const captured = captureLogs()
+  let leases = 0
+  const client = {
+    lease: async () => {
+      leases++
+      return { ok: false as const, failure: { kind: "no-account" as const } }
+    },
+  }
+  // An ALREADY-EXPIRED lease, which is exactly the state that normally fires the fail-safe toast —
+  // proof that the decline suppressed it rather than a credential that happened to be healthy.
+  const h = harness({ client, auth: { access: "leased", expires: NOW - 1 } })
+  const keeper = installLeaseKeeper({ ...h.deps, section: async () => false })
+
+  try {
+    await keeper.tickOnce()
+  } finally {
+    keeper.dispose()
+    captured.restore()
+  }
+
+  expect(leases).toBe(0)
+  expect(h.writes).toEqual([])
+  expect(h.toasts).toEqual([])
+  expect(h.delays).toEqual([])
+})
+
+// The opencode worker passes NO section — one process owning one auth.json has nothing to serialise
+// against — so its path has to stay exactly what it was before the seam existed.
+test("without a section the lease and publish run directly", async () => {
+  const h = harness({ client: { lease: async () => ({ ok: true as const, lease: FRESH }) } })
+  const keeper = installLeaseKeeper(h.deps)
+
+  try {
+    await keeper.tickOnce()
+  } finally {
+    keeper.dispose()
+  }
+
+  expect(h.writes).toEqual([{ access: "fresh", expires: NOW + 3_600_000, accountId: "acct-a" }])
+})

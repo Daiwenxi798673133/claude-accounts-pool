@@ -44,9 +44,10 @@
 import { auditSlotBlocks, clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
-import { type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
+import { adoptableLease, type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { createFileLogClient } from "./src/senpi/logSink.ts"
+import { withSlotLock } from "./src/senpi/slotLock.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
 import { uiIsRpcBridged } from "./src/senpi/uiBridge.ts"
 import { createUsagePanel, type PanelUi } from "./src/senpi/usagePanel.ts"
@@ -233,16 +234,22 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // writeLeaseCache swallows its own failures, so a disk fault can never cost this process the
     // lease it just landed.
     const writeSlotLease = async (input: { access: string; expires: number; accountId: string }): Promise<void> => {
+      // MERGED FROM DISK, NEVER WRITTEN FROM `live` WHOLESALE. Several senpi hosts publish into this
+      // one file, so this process's map only records what IT last wrote; persisting it verbatim drops
+      // every slot another host has renewed since we started. Merging also makes the swap test below
+      // answer about the slot's REAL previous occupant instead of ours.
+      const onDisk = readLeaseCache(process.env)
       // READ BEFORE THE SET BELOW. This is the only moment both the outgoing and the incoming account
       // are known, and telling a renewal-in-place from a SWAP is what decides which of senpi's blocks
       // this publish may drop: a rate-limit block is real while its account stays, and stale the
       // instant a different one takes the slot. An absent previous (a cold start with no warm cache)
       // counts as a swap — there is then no evidence any persisted block describes what we just
       // leased, and the master does not hand out an account it is cooling.
-      const swapped = live.get(slotName)?.accountId !== input.accountId
+      const swapped = (onDisk.get(slotName) ?? live.get(slotName))?.accountId !== input.accountId
       await envSlot.writeLease(input)
-      live.set(slotName, { accountId: input.accountId, access: input.access, expires: input.expires })
-      await writeLeaseCache(live)
+      const entry: CachedLease = { accountId: input.accountId, access: input.access, expires: input.expires }
+      live.set(slotName, entry)
+      await writeLeaseCache(new Map(onDisk).set(slotName, entry))
       // A freshly published lease is the one moment this slot's token is known good, so drop any
       // block senpi pinned on it from an earlier, now-replaced token.
       await clearEnvSlotBlock(slotName, swapped ? "account-changed" : "auth-only")
@@ -260,6 +267,16 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       },
     }
 
+    // Access tokens senpi answered 401 on. The adoption below consults it because a revoked token is
+    // byte-identical to a live one: the shared cache still holds the string we just invalidated, so
+    // without this set the recovery would forget a dead token and adopt the very same bytes straight
+    // back out of the cache — the livelock with one extra hop.
+    const deadAccess = new Set<string>()
+    const invalidateSlot = (): void => {
+      const dropped = envSlot.invalidate()
+      if (dropped !== undefined) deadAccess.add(dropped)
+    }
+
     // The roster's section: the ONLY place a lease for this slot may be minted.
     const rosterLease = (input: {
       reason: "prelease" | "ratelimit"
@@ -268,6 +285,19 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       pinned?: boolean
     }) =>
       roster.withSlot(slotName, async (section) => {
+        // ADOPT BEFORE ASKING — see adoptableLease for when that is allowed and why each refusal is.
+        const shared = adoptableLease({
+          cached: readLeaseCache(process.env),
+          slotName,
+          deadAccess,
+          pinned: input.pinned === true,
+          at: Date.now(),
+        })
+        if (shared !== undefined) {
+          section.claim(shared.accountId)
+          log.info("senpi:slot-lease-adopted", { slotName, accountId: shared.accountId, expires: shared.expires })
+          return { ok: true, lease: { accountId: shared.accountId, access: shared.access, expiresAt: shared.expires } }
+        }
         const outcome = await client.lease({ ...input, excludeAccountIds: section.excludeAccountIds })
         // Claimed only on success, and inside the section: a pick that failed to mint leaves this
         // slot on whatever it had, and recording it would make every other slot steer around a
@@ -309,6 +339,16 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         else log.warn("senpi:lease-toast", { slotName, message })
       },
       sleep,
+      // THE MACHINE-WIDE SECTION. The roster above only serialises the slots inside THIS process, and
+      // omo runs several senpi hosts that each install their own keeper against this same slot name.
+      // Declining is a normal outcome, not a failure — see slotLock.ts on why a contender skips its
+      // tick rather than queueing behind a lease that can legitimately take ten minutes.
+      //
+      // THE FILE LOCK IS TAKEN OUTSIDE THE ROSTER, here and on every other write path, and the order is
+      // deliberate: acquiring it first bounds the wait to a few hundred milliseconds and never holds
+      // this process's roster queue while a DIFFERENT machine's process is mid-renewal. The reverse
+      // order would let one host's slow acquisition head-of-line block every other slot in here.
+      section: (leaseAndPublish) => withSlotLock(slotName, leaseAndPublish),
     })
     // ADOPT THE WARM LEASE, and this is not bookkeeping — it is the only thing that makes the first
     // /usage able to mark a row. `heldAccountId` is set by a successful renewal, and when the cached
@@ -318,7 +358,7 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // avoids it by adopting the recorded id before its first tick (see src/worker/install.ts).
     if (warm) keeper.adoptAccount(warm.accountId)
     joiners.push(createLeaseJoiner(keeper.tickOnce))
-    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease, pin, invalidate: envSlot.invalidate })
+    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease, pin, invalidate: invalidateSlot })
   }
 
   // allSettled, NOT all: senpi selects among whatever slots currently carry a token, so one slot's
@@ -387,15 +427,29 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         // because senpi has no success level.
         toast: ({ variant, message }) => ui.notify(message, variant === "success" ? "info" : variant),
       })
-      const switched = await manual.switchTo({
-        prefix: input.prefix,
-        label: input.label,
-        // OMITTED for a plain switch. manualSwitch's `pin` is three-state and a bare `false` is an
-        // UNPIN there — passing it for every switch is what made the panel announce "已取消钉住"
-        // to somebody who had never pinned anything.
-        ...(input.pin === "none" ? {} : { pin: input.pin === "on" }),
+      // THE MACHINE-WIDE SECTION, the same lock and the same ordering the renewal loop uses. This path
+      // leases and publishes exactly as a renewal does, so a switch left outside it would race another
+      // host's renewal and one of the two publishes would be lost — which is the whole defect.
+      let switched: Awaited<ReturnType<typeof manual.switchTo>> | undefined
+      const held = await withSlotLock(input.slotName, async () => {
+        switched = await manual.switchTo({
+          prefix: input.prefix,
+          label: input.label,
+          // OMITTED for a plain switch. manualSwitch's `pin` is three-state and a bare `false` is an
+          // UNPIN there — passing it for every switch is what made the panel announce "已取消钉住"
+          // to somebody who had never pinned anything.
+          ...(input.pin === "none" ? {} : { pin: input.pin === "on" }),
+        })
       })
-      if (!switched.ok) {
+      if (!held) {
+        // SAID OUT LOUD, unlike a declined renewal tick: the operator pressed a key and is waiting for
+        // an answer, so "nothing happened" has to be an answer rather than silence. The pin goes back
+        // for the same reason a refusal drops it — it now describes an intent no lease acted on.
+        if (input.pin === "on") unit.pin.set(undefined)
+        ui.notify("这个槽位正被另一个 senpi 进程续租，请稍后重试", "warning")
+        return
+      }
+      if (switched === undefined || !switched.ok) {
         // A pin the master would not serve must not survive as a standing instruction: every renewal
         // from here would name it, be refused, and fall back — one wasted round trip per cycle for an
         // account the operator has already been told is unavailable.
@@ -447,12 +501,17 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       for (const change of moved) {
         const unit = slotUnits.find((slot) => slot.slotName === change.slotName)
         if (unit === undefined) continue
-        await roster.withSlot(change.slotName, async (section) => {
-          section.claim(change.to.accountId)
-          await unit.writeLease(change.to)
-          unit.keeper.adoptAccount(change.to.accountId)
-        })
-        notices.push(externalSwitchNotice(change))
+        // UNDER THE MACHINE-WIDE LOCK TOO, because this republishes into the shared cache. A decline is
+        // simply skipped and left unannounced: this runs on every turn, the host that holds the lock is
+        // mid-renewal on this very slot, and the next turn reads whatever it published.
+        const adopted = await withSlotLock(change.slotName, () =>
+          roster.withSlot(change.slotName, async (section) => {
+            section.claim(change.to.accountId)
+            await unit.writeLease(change.to)
+            unit.keeper.adoptAccount(change.to.accountId)
+          }),
+        )
+        if (adopted) notices.push(externalSwitchNotice(change))
       }
       return notices
     },

@@ -41,6 +41,15 @@ export type LeaseKeeperDeps = {
   writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
   toast: (input: { variant: "warning" | "error"; message: string }) => void
   sleep: (ms: number) => Promise<void>
+  // A CRITICAL SECTION AROUND LEASE-AND-PUBLISH, for a machine where SEVERAL processes drive their own
+  // keeper against the SAME credential slot. Absent for the opencode worker — one process owning one
+  // auth.json has nothing to serialise against — and senpi passes a cross-process file lock, because
+  // omo runs several hosts that all load the extension and all lease under one workerId.
+  //
+  // ENTERED ONLY ONCE A RENEWAL IS DUE, so a healthy worker never pays for it. Answering `false` means
+  // the section DECLINED and `leaseAndPublish` was never called: somebody else is already renewing
+  // this slot, which is a reason to do nothing, not a failure to report or back off over.
+  section?: (leaseAndPublish: () => Promise<void>) => Promise<boolean>
   // Injected clock so every expiry comparison below is testable at a frozen instant.
   now?: () => number
 }
@@ -170,7 +179,15 @@ export function installLeaseKeeper(deps: LeaseKeeperDeps): {
     try {
       const auth = await deps.readAuth()
       if (!renewalDue(auth, clock())) return
-      const setback = await renew()
+      // THE SECTION COVERS LEASE-AND-PUBLISH AND NOTHING ELSE. The backoff below sleeps for up to five
+      // minutes, and a cross-process section held across it would stall every other holder for the
+      // sleep on top of the failure — so reporting and backing off happen after it is released.
+      let setback: Setback | undefined
+      const leaseAndPublish = async (): Promise<void> => {
+        setback = await renew()
+      }
+      if (deps.section === undefined) await leaseAndPublish()
+      else if (!(await deps.section(leaseAndPublish))) return
       if (!setback) return
       // Report FIRST, then back off: the user should hear about a stranded credential now, not
       // after a delay that can be five minutes long.

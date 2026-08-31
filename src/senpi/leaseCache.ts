@@ -18,6 +18,7 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { atomicWriteJson } from "../accounts.ts"
+import { LEASE_RENEW_BUFFER_MS } from "../constants.ts"
 import { log } from "../logger.ts"
 
 export type CachedLease = { accountId: string; access: string; expires: number }
@@ -70,6 +71,34 @@ export function readLeaseCache(env: NodeJS.ProcessEnv = process.env, at: number 
     if (isCachedLease(entry, at)) usable.set(slotName, entry)
   }
   return usable
+}
+
+/**
+ * The cached lease for `slotName` that is worth taking INSTEAD of spending a lease on the master, or
+ * undefined. Called from inside the machine-wide slot lock, where a lease another senpi host published
+ * is final — adopting it is what converges N hosts onto ONE account per slot instead of booking N.
+ *
+ * Four ways to answer no, and each is load-bearing:
+ *   * `pinned` — the operator named this account by hand, so adopting somebody else's pick would
+ *     reverse that instruction silently, and the master would never get the chance to refuse it.
+ *   * nothing cached for this slot, which is an ordinary cold start.
+ *   * the token is one this process already saw a 401 on. A REVOKED token is byte-identical to a live
+ *     one and its horizon is still in the future, so the cache cannot rule it out on its own; without
+ *     this the recovery path would invalidate a dead token and adopt the same bytes straight back.
+ *   * already inside its own renewal window, where adopting would leave the slot due again at once.
+ */
+export function adoptableLease(input: {
+  cached: Map<string, CachedLease>
+  slotName: string
+  deadAccess: ReadonlySet<string>
+  pinned: boolean
+  at: number
+}): CachedLease | undefined {
+  if (input.pinned) return undefined
+  const shared = input.cached.get(input.slotName)
+  if (shared === undefined) return undefined
+  if (input.deadAccess.has(shared.access)) return undefined
+  return shared.expires - input.at >= LEASE_RENEW_BUFFER_MS ? shared : undefined
 }
 
 /**

@@ -76,7 +76,12 @@ export type EnvSlot = {
   // LEAVES THE VARIABLE IN PLACE, DELIBERATELY: senpi only synthesises an env slot while the variable
   // is present, so clearing it drops the slot out of the candidate table — "No API key found" on a
   // worker with no login account. A revoked token costs one 401; an absent one costs the turn.
-  invalidate: () => void
+  //
+  // HANDS BACK THE ACCESS IT FORGOT (undefined when there was nothing to forget) so the caller can
+  // remember which string is dead. It has to: the shared lease cache holds that same byte-identical
+  // token, and a caller that adopts from the cache would otherwise republish the credential it just
+  // invalidated.
+  invalidate: () => string | undefined
 }
 
 export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
@@ -108,9 +113,11 @@ export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
       return Promise.resolve()
     },
     invalidate: () => {
-      if (written === undefined) return
+      if (written === undefined) return undefined
+      const dropped = written.access
       log.info("senpi:env-slot-invalidated", { accountId: written.accountId, expires: written.expires })
       written = undefined
+      return dropped
     },
   }
 }
