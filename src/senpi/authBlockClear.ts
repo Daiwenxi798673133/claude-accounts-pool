@@ -33,7 +33,9 @@
 import { chmodSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { lock } from "proper-lockfile"
-import { log } from "../logger.ts"
+import { log, redactBody } from "../logger.ts"
+import { senpiEnvSlot } from "./envSlot.ts"
+import { probeRateLimit } from "./rateLimitProbe.ts"
 
 // senpi's provider id for the Claude Pro/Max OAuth pool. A stable string, not imported: the
 // extension takes no dependency on senpi (see senpi-extension.ts).
@@ -170,9 +172,39 @@ export function describeCandidates(raw: string, slotNames: readonly string[]): C
  * those slots and re-lease; clearing alone just puts the same dead token back into selection, and the
  * retry re-blocks it. That loop is the livelock this return value exists to break.
  */
+// 同一次阻塞只探一次。阻塞期间每一轮 turn_start 都会走到这里,不去重就是对着一个正在被限流的账号连打。
+// 键是槽名,值是它当时的 blockedUntil —— 换一次阻塞才值得再探一枪。
+const probedBlocks = new Map<string, number>()
+
+// 不 await:探针要发真请求(实测约 1-2 秒),而调用点在 turn_start 的关键路径上。取证失败永远不许拖慢
+// 或失败一轮对话,和这个文件里其他写操作的约定一致。
+function probeRateLimitBlocks(
+  blocked: readonly CandidateBlock[],
+  slotNames: readonly string[],
+  env: NodeJS.ProcessEnv,
+  fetchImpl: typeof fetch,
+): void {
+  for (const candidate of blocked) {
+    if (candidate.source !== "env" || candidate.blockReason !== "rate_limit") continue
+    const until = candidate.blockedUntil ?? 0
+    if (probedBlocks.get(candidate.name) === until) continue
+    probedBlocks.set(candidate.name, until)
+    const index = slotNames.indexOf(candidate.name)
+    if (index < 0) continue
+    const access = env[senpiEnvSlot(index).varName]
+    if (access === undefined) continue
+    void probeRateLimit(access, fetchImpl)
+      .then((probe) => log.warn("senpi:ratelimit-probe", { slotName: candidate.name, ...probe }))
+      .catch((error: unknown) =>
+        log.warn("senpi:ratelimit-probe-failed", { slotName: candidate.name, message: redactBody(String(error)) }),
+      )
+  }
+}
+
 export async function auditSlotBlocks(
   slotNames: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<readonly string[]> {
   const path = senpiAuthPath(env)
   if (path === undefined) return []
@@ -193,6 +225,7 @@ export async function auditSlotBlocks(
   // THE WHOLE TABLE, not just the blocked rows: "which candidates existed" is half the question, and
   // an empty stored list is what turns one blocked slot into "all accounts blocked".
   log.warn("senpi:candidates-blocked", { candidates })
+  probeRateLimitBlocks(blocked, slotNames, env, fetchImpl)
   const authBlocked: string[] = []
   for (const candidate of blocked) {
     if (candidate.source !== "env" || candidate.blockReason !== "auth_error") continue

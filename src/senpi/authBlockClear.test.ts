@@ -377,3 +377,47 @@ test("auditSlotBlocks reports no slot for a stored account's auth_error", async 
     box.cleanup()
   }
 })
+
+// senpi 把 429 的报文全丢了,只留 blockReason。探针是这台机器唯一能拿回 unified 头的地方——
+// 没有它,"配额打满"和"请求被限流器挡下"在日志里长得一模一样。
+// 阻塞期间每轮 turn_start 都会走到这里,所以同一次阻塞必须只探一枪,否则就是对着限流中的账号连打。
+test("auditSlotBlocks 对 rate_limit 块取证一次,同一次阻塞不重复探", async () => {
+  const box = sandbox()
+  box.env.CLAUDE_CODE_OAUTH_TOKEN = "leased-token"
+  type Entry = { message: string; extra?: Record<string, unknown> }
+  const calls: string[] = []
+  const fetchImpl = ((_url: string, init: RequestInit) => {
+    calls.push(String(init.body))
+    return Promise.resolve(new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected" } }))
+  }) as unknown as typeof fetch
+  let resolveProbe: (entry: Entry) => void
+  const probed = new Promise<Entry>((resolve) => {
+    resolveProbe = resolve
+  })
+  try {
+    initLogger({
+      app: {
+        log: (payload: Entry) => {
+          if (payload.message.includes("senpi:ratelimit-probe")) resolveProbe(payload)
+        },
+      },
+    })
+    const blocks = { env: { blockReason: "rate_limit", blockedUntil: 1_800_000_777_000 } }
+    writeFileSync(join(box.dir, "auth.json"), authFile(blocks))
+
+    await auditSlotBlocks(["env"], box.env, fetchImpl)
+    await auditSlotBlocks(["env"], box.env, fetchImpl)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toContain("You are Claude Code")
+    const entry = await probed
+    expect(entry.extra).toMatchObject({
+      slotName: "env",
+      status: 429,
+      headers: { "anthropic-ratelimit-unified-status": "rejected" },
+    })
+  } finally {
+    initLogger(undefined)
+    box.cleanup()
+  }
+})
