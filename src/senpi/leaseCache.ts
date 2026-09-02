@@ -79,9 +79,13 @@ export function readLeaseCache(env: NodeJS.ProcessEnv = process.env, at: number 
  * is final — adopting it is what converges N hosts onto ONE account per slot instead of booking N.
  *
  * Four ways to answer no, and each is load-bearing:
- *   * `pinned` — the operator named this account by hand, so adopting somebody else's pick would
- *     reverse that instruction silently, and the master would never get the chance to refuse it.
  *   * nothing cached for this slot, which is an ordinary cold start.
+ *   * `pinnedPrefix` names an account and the cache holds a DIFFERENT one, so adopting would reverse
+ *     an instruction the operator gave by hand. A cached lease that IS the pinned account is adopted
+ *     like any other — it satisfies the pin exactly — and the master still gets asked once the
+ *     horizon narrows past the renewal window, which is what keeps pin.ts's give-up path reachable.
+ *     Refusing a pinned slot OUTRIGHT is what left the pinning host leasing alone against the hosts
+ *     that adopted, and a `slots: 1` worker holding two accounts at once; see slotPin.ts.
  *   * the token is one this process already saw a 401 on. A REVOKED token is byte-identical to a live
  *     one and its horizon is still in the future, so the cache cannot rule it out on its own; without
  *     this the recovery path would invalidate a dead token and adopt the same bytes straight back.
@@ -91,12 +95,12 @@ export function adoptableLease(input: {
   cached: Map<string, CachedLease>
   slotName: string
   deadAccess: ReadonlySet<string>
-  pinned: boolean
+  pinnedPrefix: string | undefined
   at: number
 }): CachedLease | undefined {
-  if (input.pinned) return undefined
   const shared = input.cached.get(input.slotName)
   if (shared === undefined) return undefined
+  if (input.pinnedPrefix !== undefined && !shared.accountId.startsWith(input.pinnedPrefix)) return undefined
   if (input.deadAccess.has(shared.access)) return undefined
   return shared.expires - input.at >= LEASE_RENEW_BUFFER_MS ? shared : undefined
 }
