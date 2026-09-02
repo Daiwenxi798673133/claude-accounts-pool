@@ -38,7 +38,12 @@ import type {
   WorkerRegisterResponse,
 } from "../cloud/protocol.ts"
 import { CLOUD_ROUTES, isWorkerLabel } from "../cloud/protocol.ts"
-import { LEASE_CHECK_INTERVAL_MS, LEASE_RENEW_BUFFER_MS, MASTER_REFRESH_THRESHOLD_MS } from "../constants.ts"
+import {
+  LEASE_CHECK_INTERVAL_MS,
+  LEASE_RENEW_BUFFER_MS,
+  MASTER_REFRESH_THRESHOLD_MS,
+  MASTER_SERVE_IDLE_TIMEOUT_SECONDS,
+} from "../constants.ts"
 import { log, redactHeaders } from "../logger.ts"
 import type { AccountOnboard } from "./accountOnboard.ts"
 import type { AccountRemove } from "./accountRemove.ts"
@@ -677,6 +682,10 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // and this port is reachable by every worker on the internal network — a 500 here must say
     // nothing about the master's internals.
     development: false,
+    // Explicit, because Bun's default (10s) is shorter than this server's slowest legitimate
+    // response: /v1/usage/refresh returns only once the whole roster has been swept. See the
+    // constant for why it is the ceiling and why it must never be lowered.
+    idleTimeout: MASTER_SERVE_IDLE_TIMEOUT_SECONDS,
     fetch: async (req: Request): Promise<Response> => {
       const path = new URL(req.url).pathname
       if (!isRoute(path)) return json(404, { error: "not found" })
