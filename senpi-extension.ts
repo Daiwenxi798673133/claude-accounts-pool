@@ -49,6 +49,7 @@ import { adoptableLease, type CachedLease, readLeaseCache, writeLeaseCache } fro
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
 import { createFileLogClient } from "./src/senpi/logSink.ts"
 import { withSlotLock } from "./src/senpi/slotLock.ts"
+import { readSlotPin, writeSlotPin } from "./src/senpi/slotPin.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
 import { uiIsRpcBridged } from "./src/senpi/uiBridge.ts"
 import { createUsagePanel, type PanelUi } from "./src/senpi/usagePanel.ts"
@@ -254,16 +255,12 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       await clearEnvSlotBlock(slotName, scope)
     }
 
-    // THE PIN, IN MEMORY, PER SLOT. opencode persists it in TuiKV so a pin survives a restart; there
-    // is no equivalent store on this side, and inventing a file for it would make a pin a standing
-    // instruction that outlives every process that could report it. Per slot rather than per worker
-    // because with K slots one may be pinned while the others keep rotating.
-    let pinnedPrefix: string | undefined
+    // THE PIN, ON DISK, PER SLOT, SHARED BY EVERY senpi HOST ON THIS MACHINE — slotPin.ts carries the
+    // ping-pong a per-process pin produced and why persistence is the point rather than the cost. Per
+    // slot rather than per worker because with K slots one may be pinned while the others rotate.
     const pin: PinStore = {
-      get: () => pinnedPrefix,
-      set: (idPrefix) => {
-        pinnedPrefix = idPrefix
-      },
+      get: () => readSlotPin(slotName, process.env),
+      set: (idPrefix) => writeSlotPin(slotName, idPrefix, process.env),
     }
 
     // Access tokens senpi answered 401 on. The adoption below consults it because a revoked token is
@@ -289,7 +286,9 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
           cached: readLeaseCache(process.env),
           slotName,
           deadAccess,
-          pinned: input.pinned === true,
+          // The pin AS THIS REQUEST SAW IT, not a fresh read of the store: createPinnedLease decided
+          // both fields together, and re-reading here could answer for a pin set since.
+          pinnedPrefix: input.pinned === true ? input.preferredAccountIdPrefix : undefined,
           at: Date.now(),
         })
         if (shared !== undefined) {

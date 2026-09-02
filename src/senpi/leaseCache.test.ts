@@ -111,7 +111,7 @@ const noneDead: ReadonlySet<string> = new Set()
 // construction. Measured at five hosts.
 test("adoptableLease takes a cached lease with a full renewal window ahead of it", () => {
   const cached = new Map([["env", lease("acct-a", AHEAD)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toEqual(
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW })).toEqual(
     lease("acct-a", AHEAD),
   )
 })
@@ -120,7 +120,7 @@ test("adoptableLease takes a cached lease with a full renewal window ahead of it
 // publish and the cache write bought nothing.
 test("adoptableLease refuses a lease already inside its renewal window", () => {
   const cached = new Map([["env", lease("acct-a", NOW + LEASE_RENEW_BUFFER_MS - 1)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW })).toBeUndefined()
 })
 
 // THE INTERACTION THAT WOULD OTHERWISE REVIVE THE LIVELOCK THIS BRANCH FIXES. A revoked token is
@@ -130,19 +130,39 @@ test("adoptableLease refuses a lease already inside its renewal window", () => {
 test("adoptableLease refuses a token this process already saw a 401 on", () => {
   const dead = lease("acct-a", AHEAD)
   const cached = new Map([["env", dead]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: new Set([dead.access]), pinned: false, at: NOW })).toBeUndefined()
+  expect(
+    adoptableLease({ cached, slotName: "env", deadAccess: new Set([dead.access]), pinnedPrefix: undefined, at: NOW }),
+  ).toBeUndefined()
 })
 
-// A pin is an instruction the operator gave by hand. Adopting another host's pick reverses it without
-// saying so, and it also makes pin.ts's give-up path unreachable: the master is never asked, so it
-// never refuses, so the pin can never be dropped and the slot never renews again.
-test("adoptableLease refuses to adopt for a pinned slot", () => {
+// A pin is an instruction the operator gave by hand, so another host's pick must not silently replace
+// it. The account the operator NAMED is not somebody else's pick, though — it is the instruction.
+test("adoptableLease refuses another host's pick while a pin names a different account", () => {
   const cached = new Map([["env", lease("acct-a", AHEAD)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: true, at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: "acct-b", at: NOW })).toBeUndefined()
+})
+
+// THE CONVERGENCE A PINNED SLOT USED TO OPT OUT OF. Refusing every adoption left the pinning host
+// leasing alone while the machine's other hosts adopted, so one `slots: 1` workerId ended up holding
+// two accounts and whichever token the master had displaced was answered 401. See slotPin.ts.
+test("adoptableLease adopts the pinned account another host already published", () => {
+  const cached = new Map([["env", lease("acct-a", AHEAD)]])
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: "acct-a", at: NOW })).toEqual(
+    lease("acct-a", AHEAD),
+  )
+})
+
+// WHY ADOPTING A PIN DOES NOT STRAND IT. pin.ts may only give a pin up when the master refuses it, and
+// the master is only asked when nobody adopts — which is exactly what the renewal window brings about.
+test("adoptableLease stops adopting a pinned account once its renewal window opens", () => {
+  const cached = new Map([["env", lease("acct-a", NOW + LEASE_RENEW_BUFFER_MS - 1)]])
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: "acct-a", at: NOW })).toBeUndefined()
 })
 
 test("adoptableLease reads only its own slot, and an empty cache is a cold start", () => {
   const cached = new Map([["env-2", lease("acct-b", AHEAD)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toBeUndefined()
-  expect(adoptableLease({ cached: new Map(), slotName: "env", deadAccess: noneDead, pinned: false, at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW })).toBeUndefined()
+  expect(
+    adoptableLease({ cached: new Map(), slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW }),
+  ).toBeUndefined()
 })
