@@ -200,6 +200,24 @@ export const MASTER_WARM_SPACING_MS = 500
 // is only used to rank accounts, and a 5-minute-old ranking is still a good ranking.
 export const MASTER_USAGE_POLL_INTERVAL_MS = 5 * 60_000
 
+// How long the master's HTTP server tolerates a connection with no traffic on it. SECONDS, not
+// milliseconds — this one is handed to `Bun.serve` verbatim, which takes seconds and refuses anything
+// above 255.
+//
+// Bun's default is 10s, and `/v1/usage/refresh` answers only after `refreshUsage()` has walked the
+// whole roster: serial by necessity (the usage endpoint rate-limits by the master's single egress IP)
+// and spaced by USAGE_POLL_SPACING_MS between accounts. At 12 accounts that is 12-13s, so the default
+// closed the connection while the sweep was still running and the dashboard rendered a refresh that
+// had actually SUCCEEDED as 刷新失败 — which invites a re-press, and re-pressing walks the pool into
+// the endpoint's 429.
+//
+// Set to the maximum rather than to a comfortable multiple of today's sweep, because this number does
+// not fix the shape: sweep time grows with the roster, so any value here is a line the pool can grow
+// past again. It buys room while the real fix (answer immediately, let the sweep run behind it) is
+// still owed. NEVER lower it — a smaller window cuts long requests off EARLIER with the same
+// symptom and less to go on.
+export const MASTER_SERVE_IDLE_TIMEOUT_SECONDS = 255
+
 // ── Web onboarding (the dashboard's 添加账号 flow) ───────────────────────────────────────────────
 // Every bound below exists because these two routes are KEYLESS, like the rest of the dashboard.
 // That decision is the pool owner's (it is what keeps "open the browser and click" true), and it
