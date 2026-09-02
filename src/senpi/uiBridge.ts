@@ -18,12 +18,35 @@
 // `ctx.hasUI` cannot answer this — it is TRUE on that bridge, because from the daemon's point of view
 // a UI does exist; what is missing is anyone at the other end willing to answer it.
 //
-// ARGV, not an env var: `--mode rpc` is the flag senpi itself branches on when choosing which ui
-// implementation to build, so reading it cannot disagree with the surface we are actually holding.
-// A client that DOES answer extension UI requests (senpi's own rpc-extension-ui example, omo's
-// task-runner) is misjudged here — it loses a dialog it could have shown and gets the printed roster
-// instead. That trade is deliberate: the failure of guessing wrong in this direction is a panel that
-// reads instead of one that switches, and in the other direction it is a command that hangs.
-export function uiIsRpcBridged(argv: readonly string[]): boolean {
-  return argv.some((arg, index) => arg === "--mode=rpc" || (arg === "--mode" && argv[index + 1] === "rpc"))
+// TWO INPUTS, because argv alone answers the neighbouring question rather than this one. `--mode rpc`
+// is the flag senpi itself branches on when choosing which ui implementation to build, so reading it
+// cannot disagree about the surface we are HOLDING. But what decides the dialog is whether anyone at
+// the other end of that bridge will ANSWER an `extension_ui_request`, and the argv a host is spawned
+// with is a fixed string that says nothing about that. Judging on argv alone is therefore a measurable
+// quantity standing in for an unmeasurable one, and a host that does answer (senpi's own
+// rpc-extension-ui example, omo's task-runner) loses a dialog it could have shown.
+//
+// So a host that answers declares it, and `CAP_UI_ANSWERS` is that declaration — the direct evidence
+// the argv proxy never had. It is ONE-WAY: it can only take `bridged` from true back to false, never
+// the reverse, so it cannot be used to force a dialog onto a surface that would hang on one. An unset,
+// misspelled or unrecognised value is NOT a declaration and lands on the recoverable side: a panel
+// that reads instead of one that switches, never a command that hangs. The comparison is against the
+// exact string `"1"` and not a truthy test, because `"0"` is truthy and a loose test would flip
+// precisely into the direction that hangs.
+export const UI_ANSWERS_ENV = "CAP_UI_ANSWERS"
+
+// Returned together rather than as a bare boolean because the decision is logged as well as taken,
+// and the log has to separate "the variable never arrived" from "it arrived and we still degraded" —
+// the distinction that cost an afternoon of grepping when this path left no trace at all. Recomputing
+// either input at the log site would put the `"1"` comparison in two places.
+export type UiSurface = {
+  bridged: boolean
+  argvRpc: boolean
+  declared: boolean
+}
+
+export function uiSurface(argv: readonly string[], env: Record<string, string | undefined>): UiSurface {
+  const argvRpc = argv.some((arg, index) => arg === "--mode=rpc" || (arg === "--mode" && argv[index + 1] === "rpc"))
+  const declared = env[UI_ANSWERS_ENV] === "1"
+  return { bridged: argvRpc && !declared, argvRpc, declared }
 }

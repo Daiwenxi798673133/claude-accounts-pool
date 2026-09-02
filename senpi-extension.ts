@@ -51,7 +51,7 @@ import { createFileLogClient } from "./src/senpi/logSink.ts"
 import { withSlotLock } from "./src/senpi/slotLock.ts"
 import { readSlotPin, writeSlotPin } from "./src/senpi/slotPin.ts"
 import { createSlotRoster } from "./src/senpi/slotRoster.ts"
-import { uiIsRpcBridged } from "./src/senpi/uiBridge.ts"
+import { uiSurface } from "./src/senpi/uiBridge.ts"
 import { createUsagePanel, type PanelUi } from "./src/senpi/usagePanel.ts"
 import { formatStatusText, type SlotHold } from "./src/senpi/usageRows.ts"
 import { resolveWorkerConfig } from "./src/senpi/workerConfig.ts"
@@ -594,8 +594,15 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   // what routes it down usagePanel's existing `-p` branch: print the roster once and return, never
   // opening the dialog that would hang there forever. The accelerator is the interactive half, and it
   // runs in the TUI process where the same wrapper hands back the real surface.
+  // Resolved ONCE per factory call, not per panel open: both inputs are fixed for the life of the
+  // process. The line exists because this decision used to leave no trace, which made "the capability
+  // bit never arrived" indistinguishable from "it arrived and we degraded anyway" — an afternoon of
+  // grepping that one line would have ended.
+  const uiFacts = uiSurface(process.argv, process.env)
+  log.info("senpi:ui-surface", uiFacts)
+
   const panelSurface = (ctx: SenpiCtx): PanelUi => {
-    const bridged = uiIsRpcBridged(process.argv)
+    const bridged = uiFacts.bridged
     return {
       hasUI: ctx.hasUI && !bridged,
       select: (title, options) => ctx.ui.select(title, options),
