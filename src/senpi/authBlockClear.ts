@@ -165,12 +165,28 @@ export function describeCandidates(raw: string, slotNames: readonly string[]): C
  *
  * ONLY OUR OWN SLOTS. A stored account's block is left exactly where it is.
  *
- * RETURNS THE SLOTS SENPI AUTH-BLOCKED, because clearing the block is only half the recovery. senpi
- * blocked them after a 401, which is the one piece of evidence this machine ever gets that a published
- * token is dead — a revoked token is byte-identical to a live one and its lease horizon is still in the
- * future, so nothing else here can tell. Handing the names back is what lets the caller invalidate
- * those slots and re-lease; clearing alone just puts the same dead token back into selection, and the
- * retry re-blocks it. That loop is the livelock this return value exists to break.
+ * RETURNS EVERY SLOT WHOSE OCCUPANT MUST BE REPLACED, because clearing a block is only ever half the
+ * recovery — and against a rate limit it is not even half.
+ *
+ * auth_error: senpi blocked after a 401, which is the one piece of evidence this machine ever gets that
+ * a published token is dead — a revoked token is byte-identical to a live one and its lease horizon is
+ * still in the future, so nothing else here can tell. Handing the name back is what lets the caller
+ * invalidate the slot and re-lease; clearing alone just puts the same dead token back into selection,
+ * and the retry re-blocks it. That loop is the livelock this return value exists to break.
+ *
+ * rate_limit: the block is TRUE and stays exactly where it is — the throttled account really is the one
+ * in the slot. What was missing is the SWAP. With `accounts: []` on the provider one blocked slot is
+ * senpi's "All Claude accounts are currently blocked", so a limit on a single account stalls every turn
+ * on the machine while the pool holds healthy accounts nothing ever reaches for. Measured 2026-09-04:
+ * senpi blocked the slot at 02:24:45 until 02:25:45 and the worker only escaped at 02:25:24, when an
+ * unrelated renewal happened to rotate the account — 40 seconds in which the turn burned its retries
+ * and its model fallback. Returning the name makes that rotation the deliberate answer to the block
+ * rather than a coincidence.
+ *
+ * LEAVING THE RATE-LIMIT BLOCK STANDING IS WHAT KEEPS THE SWAP SAFE. Only the publish path drops it,
+ * and only as `account-changed`. So if the master has nothing better and re-leases the same account,
+ * the scope stays `auth-only`, the block survives, and senpi still sends the throttled account no
+ * traffic: the cost of a fruitless swap is one lease round trip, never a request against a limit.
  */
 // 同一次阻塞只探一次。阻塞期间每一轮 turn_start 都会走到这里,不去重就是对着一个正在被限流的账号连打。
 // 键是槽名,值是它当时的 blockedUntil —— 换一次阻塞才值得再探一枪。
@@ -226,13 +242,20 @@ export async function auditSlotBlocks(
   // an empty stored list is what turns one blocked slot into "all accounts blocked".
   log.warn("senpi:candidates-blocked", { candidates })
   probeRateLimitBlocks(blocked, slotNames, env, fetchImpl)
-  const authBlocked: string[] = []
+  const stranded: string[] = []
   for (const candidate of blocked) {
-    if (candidate.source !== "env" || candidate.blockReason !== "auth_error") continue
-    authBlocked.push(candidate.name)
-    await clearEnvSlotBlock(candidate.name, "auth-only", env)
+    // A stored account's block is senpi's own login failure and never ours to act on.
+    if (candidate.source !== "env") continue
+    if (candidate.blockReason === "auth_error") {
+      stranded.push(candidate.name)
+      // Sticky by construction: no login can lift it off a pool-fed slot, so drop it here.
+      await clearEnvSlotBlock(candidate.name, "auth-only", env)
+      continue
+    }
+    // No clear: the block describes the account still sitting in the slot, and it is accurate.
+    if (candidate.blockReason === "rate_limit") stranded.push(candidate.name)
   }
-  return authBlocked
+  return stranded
 }
 
 export async function clearEnvSlotBlock(

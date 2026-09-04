@@ -472,15 +472,17 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
   return {
     ensureLeased,
     statusText: () => formatStatusText({ held: held(), labelByPrefix }),
-    // CLEARING THE BLOCK IS ONLY HALF THE RECOVERY. senpi blocked the slot after a 401, so the token
-    // this process published is dead — and a revoked token is indistinguishable from a live one here
-    // (same bytes, horizon still in the future), so the block IS the evidence. Clearing alone puts that
-    // dead token straight back into selection; senpi re-blocks it, and the pair oscillates for the rest
-    // of the session. Invalidating drops the remembered lease, so the ensureLeased() that follows in
-    // this same turn leases a live one.
+    // A BLOCKED SLOT NEEDS A NEW OCCUPANT, WHICHEVER WAY IT WAS BLOCKED. After a 401 the token this
+    // process published is dead — and a revoked token is indistinguishable from a live one here (same
+    // bytes, horizon still in the future), so the block IS the evidence; clearing alone puts that dead
+    // token straight back into selection and the pair oscillates for the rest of the session. After a
+    // rate limit the account is simply unusable for as long as the limit lasts, and one blocked slot is
+    // senpi's "All Claude accounts are currently blocked" for the whole machine. Both answers are the
+    // same: invalidating drops the remembered lease, so the ensureLeased() that follows in this same
+    // turn leases a different account — which is the only reason the pool holds more than one.
     auditBlocks: async (): Promise<void> => {
-      const authBlocked = await auditSlotBlocks(slotUnits.map((slot) => slot.slotName))
-      for (const slotName of authBlocked) slotUnits.find((slot) => slot.slotName === slotName)?.invalidate()
+      const stranded = await auditSlotBlocks(slotUnits.map((slot) => slot.slotName))
+      for (const slotName of stranded) slotUnits.find((slot) => slot.slotName === slotName)?.invalidate()
     },
     drainToasts: () => toasts.splice(0, toasts.length),
     openPanel: (ui) =>

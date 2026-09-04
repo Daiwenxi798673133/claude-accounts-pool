@@ -261,7 +261,7 @@ test("auditSlotBlocks clears our slot's sticky auth_error and records the table"
     const path = join(box.dir, "auth.json")
     writeFileSync(path, authFile({ env: { blockReason: "auth_error" } }))
 
-    await auditSlotBlocks(["env"], box.env)
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual(["env"])
 
     expect("slotState" in JSON.parse(readFileSync(path, "utf-8"))[PROVIDER]).toBe(false)
     const record = entries.find((entry) => entry.message.includes("senpi:candidates-blocked"))
@@ -277,13 +277,18 @@ test("auditSlotBlocks clears our slot's sticky auth_error and records the table"
 
 // A rate limit is REAL while the same account holds the slot, and clearing it would hammer a throttled
 // account once per turn. Only the publish path, which knows an account changed, may drop one.
-test("auditSlotBlocks leaves a rate-limit block standing", async () => {
+//
+// THE SLOT IS STILL HANDED BACK, because the answer to a rate limit is a different account, not a
+// cleared block. Without this the slot rode the throttled account until an unrelated renewal happened
+// to rotate it, and with no stored account that stall is senpi's "All Claude accounts are currently
+// blocked" for every turn in between.
+test("auditSlotBlocks leaves a rate-limit block standing but hands the slot back for a swap", async () => {
   const box = sandbox()
   try {
     const path = join(box.dir, "auth.json")
     const original = authFile({ env: { blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 } })
     writeFileSync(path, original)
-    await auditSlotBlocks(["env"], box.env)
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual(["env"])
     expect(readFileSync(path, "utf-8")).toBe(original)
   } finally {
     box.cleanup()
@@ -299,7 +304,9 @@ test("auditSlotBlocks never touches a stored account's block", async () => {
     const path = join(box.dir, "auth.json")
     const original = authFile(undefined, { accounts: [{ name: "default", source: "login", blockReason: "auth_error" }] })
     writeFileSync(path, original)
-    await auditSlotBlocks(["env"], box.env)
+    // Never handed back either: invalidating a slot over a stored account's block would swap out a
+    // perfectly good lease to answer a failure that has nothing to do with the pool.
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual([])
     expect(readFileSync(path, "utf-8")).toBe(original)
   } finally {
     box.cleanup()
@@ -352,14 +359,18 @@ test("auditSlotBlocks reports the env slots senpi auth-blocked", async () => {
   }
 })
 
-// A rate-limit block describes a token that WORKS, so it must not trigger a re-lease: the account is
-// throttled rather than revoked, and rotating off it would spend a lease to solve nothing.
-test("auditSlotBlocks reports no slot for a rate-limit block", async () => {
+// A rate-limit block describes a token that still WORKS, which is why this used to report nothing —
+// "rotating off it would spend a lease to solve nothing". The token working is the irrelevant half:
+// senpi will not SELECT the slot while the block stands, so a working token nobody may use stalls the
+// machine just as hard as a dead one, and with no stored account it is "All Claude accounts are
+// currently blocked" for every turn until the limit expires (up to 48h). Spending one lease to move to
+// an unthrottled account is the pool's whole purpose.
+test("auditSlotBlocks reports the env slot for a rate-limit block, to re-lease it elsewhere", async () => {
   const box = sandbox()
   try {
     const blocks = { env: { blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 } }
     writeFileSync(join(box.dir, "auth.json"), authFile(blocks))
-    expect(await auditSlotBlocks(["env"], box.env)).toEqual([])
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual(["env"])
   } finally {
     box.cleanup()
   }
