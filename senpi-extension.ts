@@ -42,6 +42,7 @@
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
 import { auditSlotBlocks, blockClearScope, clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
+import { createAutoResume, readRunEnd } from "./src/senpi/autoResume.ts"
 import { leaseLiveAccess } from "./src/senpi/deadLease.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
@@ -82,7 +83,13 @@ type SenpiCtx = {
 type SenpiExtensionApi = {
   // The handler's promise MATTERS: senpi's runner awaits it (`await handler(event, ctx)`), which is
   // the only thing that lets a turn wait for a lease instead of racing it.
-  on: (event: "turn_start", handler: (event: unknown, ctx: SenpiCtx) => Promise<void>) => void
+  // turn_start is the lease gate. The other two are the failed-turn resume, and they are two events
+  // rather than one because senpi reports the VERDICT on agent_end while only agent_settled promises
+  // that nothing of its own — a retry, a fallback, a queued continuation — is still to come.
+  on: (
+    event: "turn_start" | "agent_end" | "agent_settled",
+    handler: (event: unknown, ctx: SenpiCtx) => Promise<void>,
+  ) => void
   // The name is registered BARE. senpi's dispatcher strips the leading slash off the typed line and
   // matches what remains, so "usage" is what makes `/usage` work — writing "/usage" here would
   // require the operator to type `//usage`.
@@ -132,6 +139,14 @@ const PANEL_SHORTCUT = "ctrl+shift+u"
 // message's heading, so it is operator-facing text, not an internal key.
 const PANEL_MESSAGE_TYPE = "账号池用量"
 
+// The customType on the "continue" this extension injects after a turn the pool killed. senpi shows
+// it as the message's heading, so a turn nobody typed is visible in the transcript as the pool's.
+const RESUME_MESSAGE_TYPE = "账号池自动继续"
+
+// The word opencode's lane resends a switched turn with (src/continuation.ts). Identical on purpose:
+// a session resumed on either harness must read the same way to the model.
+const RESUME_TEXT = "continue"
+
 type QueuedToast = { variant: "warning" | "error"; message: string }
 
 // Everything the registered surfaces need from one installed worker. `ensureLeased` is the turn gate;
@@ -145,8 +160,12 @@ type Installed = {
   // then throw from every method — so the message waits here for a turn to bring a live one.
   drainToasts: () => QueuedToast[]
   followExternal: () => Promise<string[]>
-  // Per-turn recovery for a slot senpi auth-blocked mid-session, plus the record of what it saw.
-  auditBlocks: () => Promise<void>
+  // Per-turn recovery for a slot senpi blocked mid-session, plus the record of what it saw. The slot
+  // names it hands back are also the evidence a failed run was the POOL's fault and not the model's.
+  auditBlocks: () => Promise<readonly string[]>
+  // The account each slot holds, in slot order — the before/after reading a resume compares to decide
+  // whether a recovery lease actually moved anything.
+  heldAccounts: () => readonly (string | undefined)[]
 }
 
 function errorMessage(error: unknown): string {
@@ -480,10 +499,12 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // senpi's "All Claude accounts are currently blocked" for the whole machine. Both answers are the
     // same: invalidating drops the remembered lease, so the ensureLeased() that follows in this same
     // turn leases a different account — which is the only reason the pool holds more than one.
-    auditBlocks: async (): Promise<void> => {
+    auditBlocks: async (): Promise<readonly string[]> => {
       const stranded = await auditSlotBlocks(slotUnits.map((slot) => slot.slotName))
       for (const slotName of stranded) slotUnits.find((slot) => slot.slotName === slotName)?.invalidate()
+      return stranded
     },
+    heldAccounts: () => slotUnits.map((slot) => slot.keeper.heldAccountId()),
     drainToasts: () => toasts.splice(0, toasts.length),
     openPanel: (ui) =>
       createUsagePanel({
@@ -576,7 +597,9 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
     // Claude accounts are currently blocked", whose advice to re-login cannot apply: a pool-fed env slot
     // has no login. The audit also invalidates every slot it unblocks, which is what makes the lease
     // below replace the dead token rather than republish it.
-    await guard("senpi:turn-block-audit", () => installed.auditBlocks())
+    await guard("senpi:turn-block-audit", async () => {
+      await installed.auditBlocks()
+    })
     await installed
       .ensureLeased()
       .catch((error: unknown) => log.error("senpi:turn-lease-fail", { error: errorMessage(error) }))
@@ -603,7 +626,10 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
   const uiFacts = uiSurface(process.argv, process.env)
   log.info("senpi:ui-surface", uiFacts)
 
-  const panelSurface = (ctx: SenpiCtx): PanelUi => {
+  // The heading is a parameter because the bridge is the only channel out of the shared RPC host, so
+  // every surface that must reach the operator borrows this one — and a resume notice filed under the
+  // panel's heading would read as usage output.
+  const panelSurface = (ctx: SenpiCtx, messageType: string = PANEL_MESSAGE_TYPE): PanelUi => {
     const bridged = uiFacts.bridged
     return {
       hasUI: ctx.hasUI && !bridged,
@@ -618,7 +644,7 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
         // 不可达" would advise a key that opens a panel which cannot load either.
         const hint = `\n\n交互面板（切号 / 钉号）按 ${PANEL_SHORTCUT} 打开：这个会话跑在共享 RPC 宿主里，扩展的对话框在那条链路上无人应答。`
         pi.sendMessage(
-          { customType: PANEL_MESSAGE_TYPE, content: type === undefined ? `${message}${hint}` : message, display: true },
+          { customType: messageType, content: type === undefined ? `${message}${hint}` : message, display: true },
           { triggerTurn: false },
         )
       },
@@ -633,6 +659,34 @@ export default function claudeAccountsPoolSenpiExtension(pi: SenpiExtensionApi):
     // exist at all — and "which account am I on" is exactly the question that opened it.
     ctx.ui.setStatus(STATUS_KEY, installed.statusText())
   }
+
+  // THE SECOND HALF OF A FAILOVER, and until now the missing one. auditBlocks + ensureLeased already
+  // move a blocked slot onto another account, but only turn_start ever ran them — so the turn that hit
+  // the wall stayed dead until the operator typed something. opencode's lane re-issues that turn
+  // itself (repromptFailedTurn in src/autoswitch.ts); this is the same behaviour on senpi's events.
+  //
+  // PER FACTORY CALL, unlike `installed`: the pending verdict and the resume ladder describe THIS
+  // session, and a counter shared between sessions would let one bad session silence another's.
+  const autoResume = createAutoResume({
+    recoverBlockedSlots: () => installed.auditBlocks(),
+    heldAccounts: () => installed.heldAccounts(),
+    lease: () => installed.ensureLeased(),
+    resume: () =>
+      pi.sendMessage({ customType: RESUME_MESSAGE_TYPE, content: RESUME_TEXT, display: true }, { triggerTurn: true }),
+  })
+
+  pi.on("agent_end", (event) => {
+    autoResume.noteRunEnd(readRunEnd(event))
+    return Promise.resolve()
+  })
+
+  // NEVER FROM agent_end: senpi's own retry and fallback are still ahead of it there, and a turn
+  // injected under one would race a run that has not finished. agent_settled is the host's promise
+  // that nothing else of its own will run.
+  pi.on("agent_settled", (_event, ctx) => {
+    const ui = panelSurface(ctx, RESUME_MESSAGE_TYPE)
+    return guard("senpi:auto-resume", () => autoResume.settle((message, type) => ui.notify(message, type)))
+  })
 
   // Registered per factory call, unlike the keeper above: senpi builds a fresh extension instance per
   // session and its command map lives on that instance, so this is a registration into this session
