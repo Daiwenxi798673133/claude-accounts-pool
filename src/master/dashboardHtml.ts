@@ -83,14 +83,15 @@ export function dashboardHtml(config: DashboardConfig): string {
   #meta.stale { color: var(--accent); font-weight: 600; }
   .actions { display: flex; align-items: center; gap: 12px; }
   /* The quiet siblings of #refresh, and that is a statement of rank: onboarding an account is rare
-     and destructive-adjacent, removing one is rarer and outright destructive, so neither may compete
-     with the button an operator presses every visit. #refresh stays the only accent-filled button on
+     and destructive-adjacent, removing one is rarer and outright destructive, registering a worker
+     only edits a roster, so none of the three may compete with the button an operator presses every
+     visit. #refresh stays the only accent-filled button on
      the page — 删除账号 emphatically included: the most destructive control here is the last one that
      should be easy to hit by reflex, so its accent lives in the text and never in a filled target. */
-  #add, #del { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
+  #add, #del, #reg { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
          border: 1px solid var(--divider); border-radius: 999px; background: var(--card-bg);
          color: #3D3929; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
-  #add:hover, #del:hover:enabled { background: #F0EEE6; border-color: #D3CFC3; }
+  #add:hover, #del:hover:enabled, #reg:hover { background: #F0EEE6; border-color: #D3CFC3; }
   #del { color: var(--accent); }
   /* Disabled while the page holds no roster to choose from — an empty pool, or the seconds before
      the first snapshot lands. A dialog offering an empty list is a dead end the operator has to read
