@@ -200,6 +200,16 @@ export const MASTER_WARM_SPACING_MS = 500
 // is only used to rank accounts, and a 5-minute-old ranking is still a good ranking.
 export const MASTER_USAGE_POLL_INTERVAL_MS = 5 * 60_000
 
+// How many workers the master will let onto ONE account at the same time. A HARD CEILING, unlike
+// the scheduler's fewest-holders preference which only breaks ties: past this count the account
+// leaves the candidate list entirely and a named request for it is refused.
+//
+// Sharing is what makes a five-hour window burn at N times the rate, and the damage is not linear —
+// each holder's turn also invalidates the others' assumption about remaining quota, so the whole
+// group walks into the wall together instead of one worker rotating off in time. Three is the point
+// where a subscription still carries the load and a fourth is measurably somebody's stalled session.
+export const MAX_ACCOUNT_HOLDERS = 3
+
 // How long the master's HTTP server tolerates a connection with no traffic on it. SECONDS, not
 // milliseconds — this one is handed to `Bun.serve` verbatim, which takes seconds and refuses anything
 // above 255.

@@ -58,7 +58,13 @@ function detailOf(status: number, body: string): string {
 
 // A table keyed by LeaseRefusal, mirroring the server's own LEASE_REASONS guard: a reason added to
 // the protocol becomes a COMPILE error here instead of silently degrading to "bad response".
-const LEASE_REFUSALS: Record<LeaseRefusal, true> = { unknown: true, ambiguous: true, cooling: true, "needs-reauth": true }
+const LEASE_REFUSALS: Record<LeaseRefusal, true> = {
+  unknown: true,
+  ambiguous: true,
+  cooling: true,
+  "needs-reauth": true,
+  "at-capacity": true,
+}
 
 // A 409 whose body does not name a reason we know is treated as a BAD RESPONSE, never guessed at:
 // the reason IS the message the operator acts on, so inventing one would send them to fix the wrong

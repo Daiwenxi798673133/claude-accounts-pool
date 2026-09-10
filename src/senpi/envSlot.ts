@@ -63,6 +63,7 @@ export type EnvSlotDeps = {
   // would leak a token into the runner's own environment and into every later test file.
   env: NodeJS.ProcessEnv
   varName?: string
+  now?: () => number
 }
 
 export type EnvSlot = {
@@ -82,13 +83,24 @@ export type EnvSlot = {
   // token, and a caller that adopts from the cache would otherwise republish the credential it just
   // invalidated.
   invalidate: () => string | undefined
+  // WHEN THIS ACCOUNT MOVED IN, undefined before the first lease and after an invalidate. Not the
+  // lease's own `expires`, which says when the credential dies — this says how long this account has
+  // been the one on the hook, which is the only way to tell a failure this occupant caused from one
+  // that merely arrived while it was moving in. See blockDescribesOccupant.
+  //
+  // A RENEWAL OF THE SAME ACCOUNT DOES NOT ADVANCE IT, exactly as the master's own `adoptedAt` does
+  // not (src/master/scheduler.ts). If it did, a slot whose account is genuinely spent would refresh
+  // its own grace window on every republish and never reach the age at which its block is believed —
+  // the misattribution guard would become a livelock instead of preventing one.
+  adoptedAt: () => number | undefined
 }
 
 export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
   const varName = deps.varName ?? SENPI_OAUTH_TOKEN_VAR
+  const now = deps.now ?? Date.now
   // The lease this slot last published, or undefined before the first one lands. Holds the access
   // token too — not to hand back out, but to detect the drift described below.
-  let written: { access: string; expires: number; accountId: string } | undefined
+  let written: { access: string; expires: number; accountId: string; at: number } | undefined
 
   return {
     // FAIL CLOSED ON DRIFT. The expiry lives here while the token lives in the environment, so the
@@ -107,7 +119,8 @@ export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
     },
     writeLease: (input) => {
       deps.env[varName] = input.access
-      written = { access: input.access, expires: input.expires, accountId: input.accountId }
+      const at = written?.accountId === input.accountId ? written.at : now()
+      written = { access: input.access, expires: input.expires, accountId: input.accountId, at }
       // accountId and expiry only. `input.access` is a live credential and is never logged.
       log.info("senpi:env-slot-written", { accountId: input.accountId, expires: input.expires })
       return Promise.resolve()
@@ -119,5 +132,6 @@ export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
       written = undefined
       return dropped
     },
+    adoptedAt: () => written?.at,
   }
 }

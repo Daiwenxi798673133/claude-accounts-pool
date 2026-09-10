@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
-import { MASTER_USAGE_POLL_INTERVAL_MS } from "../constants.ts"
+import { MASTER_USAGE_POLL_INTERVAL_MS, MAX_ACCOUNT_HOLDERS } from "../constants.ts"
 import type { UsageResponse } from "../usage.ts"
 import { createScheduler, RATELIMIT_ADOPTION_GRACE_MS, type SchedulerDeps } from "./scheduler.ts"
 
@@ -686,4 +686,205 @@ test("excludeIds is a filter, never the rotation anchor", () => {
   // excludeIds fed the anchor instead, the walk would start from "b" and hand back "c" for the
   // wrong reason, which this asserts apart by pinning the anchor and the filter to different ids.
   expect(scheduler.pickAccount({ accounts, exclude: "a", excludeIds: ["b"] })?.id).toBe("c")
+})
+
+const AFFINITY_KEY = "claude-accounts-usage.master.affinity"
+
+// A kv whose store is SHARED across constructions, which is how a master restart is expressed here:
+// the process goes away, the store does not. Separate from makeKv because that one seeds and reads
+// the cooldown key only, and these cases turn on the two books being independent.
+function makeSharedKv(): { kv: SchedulerDeps["kv"]; read: (key: string) => unknown } {
+  const store = new Map<string, unknown>()
+  return {
+    kv: {
+      get: <V>(key: string, fallback?: V): V => (store.has(key) ? (store.get(key) as V) : (fallback as V)),
+      set: (key: string, value: unknown): void => {
+        store.set(key, value)
+      },
+    },
+    read: (key: string) => store.get(key),
+  }
+}
+
+test("recallAffinity 记住最后一次发牌的账号，master 重启后依然答得出", () => {
+  const { kv, read } = makeSharedKv()
+  let nowMs = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => nowMs })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: nowMs + 60_000, pinned: false })
+
+  expect(scheduler.recallAffinity("w1")).toBe("a")
+  // The key name and the exact persisted shape are pinned here: a binding the next process cannot
+  // find is worth nothing, and surviving that boundary is this book's entire reason to exist.
+  expect(read(AFFINITY_KEY)).toEqual({ w1: { accountId: "a", at: nowMs } })
+
+  // THE RESTART: a new scheduler over the SAME store. The lease book deliberately does NOT come back
+  // (those tokens are dead and this master cannot renew them), but the binding must — that asymmetry
+  // is why they are two maps and not one.
+  const restarted = createScheduler({ kv, now: () => nowMs })
+  expect(restarted.recallAffinity("w1")).toBe("a")
+  expect(restarted.holdersOf("a")).toEqual([])
+})
+
+test("亲和绑定超过一天后不再作答，也不再随重启恢复", () => {
+  const { kv } = makeSharedKv()
+  let nowMs = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => nowMs })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: nowMs + 60_000, pinned: false })
+
+  nowMs += 24 * 60 * 60_000 + 1
+  // A label gone this long has to rejoin through ranking: that is where the pool gets its chance to
+  // rebalance, and a day-old binding no longer says anything about where useful work is happening.
+  expect(scheduler.recallAffinity("w1")).toBeUndefined()
+  expect(createScheduler({ kv, now: () => nowMs }).recallAffinity("w1")).toBeUndefined()
+})
+
+test("burnOf 从连续两次采集算出燃烧速率，并给出耗尽时刻", () => {
+  const { kv } = makeSharedKv()
+  let nowMs = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => nowMs })
+
+  scheduler.setUsageCache([{ id: "a", usage: usage(20) }])
+  // ONE sample has no slope. undefined is the honest answer and deliberately not 0, which a capacity
+  // check would read as "idle, safe to load up" — the exact misreading that keeps killing accounts.
+  expect(scheduler.burnOf("a")).toBeUndefined()
+
+  nowMs += 30 * 60_000
+  scheduler.setUsageCache([{ id: "a", usage: usage(35) }])
+
+  // 15 points in half an hour is 30 points/hour, and 65 points remain ⇒ a bit over two hours left.
+  const burn = scheduler.burnOf("a")
+  expect(burn?.util).toBe(35)
+  expect(burn?.ratePerHour).toBeCloseTo(30, 6)
+  expect(burn?.exhaustsInMs).toBeCloseTo((65 / 30) * 3_600_000, 0)
+})
+
+test("窗口重置不算成负速率，序列就地重开", () => {
+  const { kv } = makeSharedKv()
+  let nowMs = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => nowMs })
+  scheduler.setUsageCache([{ id: "a", usage: usage(90) }])
+  nowMs += 10 * 60_000
+  scheduler.setUsageCache([{ id: "a", usage: usage(4) }])
+
+  // The window rolled over. Averaging across that boundary reports a steeply NEGATIVE rate, and an
+  // account whose rate is negative looks like it lasts forever — the most dangerous number to be
+  // wrong about, because it reads as safe exactly when the account just became worth protecting.
+  expect(scheduler.burnOf("a")).toBeUndefined()
+
+  nowMs += 10 * 60_000
+  scheduler.setUsageCache([{ id: "a", usage: usage(10) }])
+  expect(scheduler.burnOf("a")?.ratePerHour).toBeCloseTo(36, 6)
+})
+
+test("燃烧速率盯的是最紧的那个窗口，不是五小时窗口", () => {
+  const { kv } = makeSharedKv()
+  let nowMs = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => nowMs })
+
+  // five_hour barely moves while the weekly window climbs. An account refuses requests when ANY of
+  // its windows reaches 100, so the weekly one is the binding constraint — reading only five_hour
+  // would call this account nearly idle right up until it refuses everything.
+  scheduler.setUsageCache([{ id: "a", usage: { five_hour: { utilization: 5 }, seven_day: { utilization: 80 } } }])
+  nowMs += 60 * 60_000
+  scheduler.setUsageCache([{ id: "a", usage: { five_hour: { utilization: 6 }, seven_day: { utilization: 90 } } }])
+
+  const burn = scheduler.burnOf("a")
+  expect(burn?.util).toBe(90)
+  expect(burn?.ratePerHour).toBeCloseTo(10, 6)
+})
+
+test("续租刷新亲和绑定的时间戳，长期活跃的 worker 不会被 TTL 淘汰", () => {
+  const { kv } = makeSharedKv()
+  let nowMs = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => nowMs })
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: nowMs + 60_000, pinned: false })
+
+  // Renewing every twenty hours for three days. `at` measures when this worker was last SERVED, not
+  // when it first bound, so a worker that keeps showing up keeps its account indefinitely — a TTL
+  // measured from the first binding would evict exactly the workers this book is meant to hold.
+  for (let round = 0; round < 3; round++) {
+    nowMs += 20 * 60 * 60_000
+    expect(scheduler.recallAffinity("w1")).toBe("a")
+    scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: nowMs + 60_000, pinned: false })
+  }
+  expect(scheduler.recallAffinity("w1")).toBe("a")
+})
+
+// 上限是硬拒绝,不是 fewestHolders 那种"有更空的就去更空的"偏好。所以用**唯一**候选来验:
+// 偏好在这种局面下会照发不误,只有真正的上限才会答不出来。
+test("pickAccount 拒绝已满员的账号，即使它是唯一的候选", () => {
+  const { kv } = makeKv()
+  const at = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => at })
+  const accounts = [account("a")]
+  for (const workerId of ["w1", "w2", "w3"]) {
+    scheduler.recordLease({ workerId, accountId: "a", expiresAt: at + 60_000, pinned: false })
+  }
+
+  expect(MAX_ACCOUNT_HOLDERS).toBe(3)
+  expect(scheduler.pickAccount({ accounts, workerId: "w4" })).toBeUndefined()
+})
+
+// 续租不是"再加一个人",所以请求方自己那份租约不能把自己顶出上限 —— 否则第三台机器每次续租都会
+// 被自己挤掉,永远换号。
+test("pickAccount 不把请求方自己的租约算进满员上限", () => {
+  const { kv } = makeKv()
+  const at = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => at })
+  const accounts = [account("a")]
+  for (const workerId of ["w1", "w2", "w3"]) {
+    scheduler.recordLease({ workerId, accountId: "a", expiresAt: at + 60_000, pinned: false })
+  }
+
+  expect(scheduler.pickAccount({ accounts, workerId: "w3" })?.id).toBe("a")
+})
+
+// 点名路径也要挡:一个能被人手动绕过的上限等于没有上限。
+test("pickPreferred 对已满员的账号回 at-capacity", () => {
+  const { kv } = makeKv()
+  const at = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => at })
+  const accounts = [account("aaaa1111"), account("bbbb2222")]
+  for (const workerId of ["w1", "w2", "w3"]) {
+    scheduler.recordLease({ workerId, accountId: "aaaa1111", expiresAt: at + 60_000, pinned: false })
+  }
+
+  expect(scheduler.pickPreferred({ accounts, prefix: "aaaa", workerId: "w4" })).toEqual({
+    ok: false,
+    refusal: "at-capacity",
+  })
+  // 同一张账号库里没满的那个照发,证明拒的是席位而不是这次请求。
+  expect(scheduler.pickPreferred({ accounts, prefix: "bbbb", workerId: "w4" })).toEqual({
+    ok: true,
+    account: accounts[1],
+  })
+})
+
+test("pickPreferred 不把请求方自己的租约算进满员上限", () => {
+  const { kv } = makeKv()
+  const at = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => at })
+  const accounts = [account("aaaa1111")]
+  for (const workerId of ["w1", "w2", "w3"]) {
+    scheduler.recordLease({ workerId, accountId: "aaaa1111", expiresAt: at + 60_000, pinned: false })
+  }
+
+  expect(scheduler.pickPreferred({ accounts, prefix: "aaaa", workerId: "w3" })).toEqual({
+    ok: true,
+    account: accounts[0],
+  })
+})
+
+// 过期的租约不是持有 —— 那枚令牌按 INV-CLOUD-4 已经死了。不按到期扫掉的话,一个下线的 worker
+// 会永久占着席位,池子的容量随时间只减不增。
+test("已过期的租约不占满员席位", () => {
+  const { kv } = makeKv()
+  const at = 1_000_000
+  const scheduler = createScheduler({ kv, now: () => at })
+  const accounts = [account("a")]
+  scheduler.recordLease({ workerId: "w1", accountId: "a", expiresAt: at + 60_000, pinned: false })
+  scheduler.recordLease({ workerId: "w2", accountId: "a", expiresAt: at - 1, pinned: false })
+  scheduler.recordLease({ workerId: "w3", accountId: "a", expiresAt: at - 1, pinned: false })
+
+  expect(scheduler.pickAccount({ accounts, workerId: "w4" })?.id).toBe("a")
 })
