@@ -54,7 +54,9 @@ test("a window the pool has but one account lacks is padded as an inert row", ()
   // shortLabel falls through instead of switching.
   expect(html).toContain("function windowOrder(accounts)")
   expect(html).toContain("function missingWindow(label)")
-  expect(html).toContain("renderAccount(latest.accounts[i], order)")
+  // The loop now walks the DISPLAY order (limited accounts last), not the payload's own, so the
+  // padding claim is asserted on the call that actually renders a card.
+  expect(html).toContain("renderAccount(shown[i], order)")
   // The padded label goes through the same lookup a real one does, so a future scoped window needs no
   // edit here.
   expect(html).toContain("el(\"div\", \"wl dim\", shortLabel(label))")
@@ -67,9 +69,69 @@ test("a window the pool has but one account lacks is padded as an inert row", ()
   expect(html).toContain(".bar.ghost { visibility: hidden; }")
   expect(html).toContain("el(\"div\", \"bar ghost\")")
   expect(html).toContain(".wl.dim")
-  // The exhaustive count is the guard: a fill belongs to renderWindow alone, so a second mention
-  // would mean the placeholder had grown a bar that reads as a real measurement.
-  expect(html.split("\"fill\"").length - 1).toBe(1)
+  // The exhaustive count is the guard: a fill belongs to a REAL MEASUREMENT alone, so a further
+  // mention would mean a placeholder had grown a bar that reads as one. Two now — renderWindow's
+  // full-width bar in a card, and windowBox's 84px bar in a table cell — while the placeholder pair
+  // (missingWindow, missingBox) still has none between them.
+  expect(html.split("\"fill\"").length - 1).toBe(2)
+})
+
+test("视图切换按钮排在工具栏最前，按下只换看法、不碰池子", () => {
+  expect(html).toContain("<button id=\"view\" type=\"button\"")
+  // Leftmost: it governs everything below it, while the other four each act on one account.
+  expect(html.indexOf("id=\"view\"")).toBeLessThan(html.indexOf("id=\"add\""))
+  // The label names what the PRESS will do, not the mode the page is already in.
+  expect(html).toContain("tableView ? \"卡片视图\" : \"表格视图\"")
+  expect(html).toContain("<span id=\"view-label\">表格视图</span>")
+  // Re-renders the snapshot already in hand: a toggle that called load() would let the two views
+  // land on different sweeps, which is the one thing two views of one payload must never do.
+  expect(html).toContain("tableView = !tableView;")
+  // ONE container carrying its layout as a class, so a stale view cannot survive behind [hidden].
+  expect(html).toContain("#rows.grid {")
+  expect(html).toContain("#rows.table {")
+})
+
+test("限额标识按窗口区分，7 天的盖过 5 小时的", () => {
+  // 危 = the 5-hour window is spent, 死 = the 7-day one is. EXACT labels, so a per-model weekly
+  // window (seven_day_opus) cannot raise either mark.
+  expect(html).toContain("var WEI_WINDOW = \"five_hour\";")
+  expect(html).toContain("var SI_WINDOW = \"seven_day\";")
+  expect(html).toContain("mark: si ? \"si\" : wei ? \"wei\" : \"\"")
+  // Equal specificity, so SOURCE ORDER is what makes 死 win a card that has spent both windows.
+  expect(html.indexOf(".card.wei::after { background-image")).toBeLessThan(html.indexOf(".card.si::after { background-image"))
+  // Both marks ride INSIDE the document: no second route to keep in sync, and nothing to fetch on a
+  // master with no internet route — the same reason this page links no webfont.
+  expect(html.split("data:image/png;base64,").length - 1).toBe(2)
+  // Delivered as CSS backgrounds, and the two url() rules are the ONLY place those bytes appear, so
+  // no element on this page carries a src the script had to fill in.
+  expect(html.split("background-image: url(\"data:image/png;base64,").length - 1).toBe(2)
+  expect(html).not.toContain("createElement(\"img\")")
+})
+
+test("撞了限额的账号排在两个视图的最后", () => {
+  expect(html).toContain("function displayOrder(accounts)")
+  // A stable partition, never a sort by utilization: inside each half the roster's order survives.
+  expect(html).toContain("return free.concat(spent);")
+  // BOTH render paths consume the partition — a view left reading latest.accounts directly would
+  // silently keep the old order.
+  expect(html).toContain("rows.appendChild(renderTable(shown, order));")
+  expect(html).toContain("rows.appendChild(renderAccount(shown[i], order));")
+  expect(html).not.toContain("renderAccount(latest.accounts[i], order)")
+})
+
+test("表格视图复用卡片视图的徽章、胶囊和窗口语义", () => {
+  expect(html).toContain("function renderTable(accounts, order)")
+  // One builder per shared piece, so the states cannot drift between the two views.
+  expect(html).toContain("function statusBadges(account)")
+  expect(html).toContain("function holderChips(account)")
+  // 可用 is the ABSENCE of the four badges, not a fifth state that could contradict one of them.
+  expect(html).toContain("if (badges.length === 0 && !state.mark) marks.appendChild(el(\"span\", \"ok\", \"可用\"));")
+  // …and a spent row says so in words, because the row's wash is far too faint to carry what the
+  // card's 危 / 死 says across a whole face.
+  expect(html).toContain("额度已满")
+  // The table keeps the distinction the cards' missingWindow / 本轮无数据 pair exists to protect:
+  // "this seat has no such quota" is not "the poller learned nothing this round".
+  expect(html).toContain("account.hasUsage ? \"不适用\" : \"未知\"")
 })
 
 test("the document carries no template-literal residue", () => {
