@@ -19,11 +19,16 @@
 // `@media` collapse or the state classes (`.cooling`, `.stale`, the four bar tones) this page needs
 // in order to show the states a happy-path mock never has to.
 
+import { SI_MARK_PNG, WEI_MARK_PNG } from "./dashboardAssets.ts"
+
 // Every value below is a compile-time constant owned by this codebase (two frozen CLOUD_ROUTES
 // entries and the server's own throttle window), never user input — which is why interpolating them
 // into the script needs no escaping. They are parameters rather than literals so the route table and
 // the throttle each stay a SINGLE source of truth: a renamed route cannot leave a silently broken
 // page behind, and the countdown the page shows cannot drift from the window the server enforces.
+// The two imports above are constants of the same kind — image bytes owned by this repo, carried as
+// base64 — and they reach the document through the same interpolation, into the CSS instead of the
+// script.
 export type DashboardConfig = {
   usageRoute: string
   refreshRoute: string
@@ -81,7 +86,17 @@ export function dashboardHtml(config: DashboardConfig): string {
        letter-spacing: -0.01em; }
   #meta { margin: 0; font-size: 15px; color: var(--text-2); }
   #meta.stale { color: var(--accent); font-weight: 600; }
-  .actions { display: flex; align-items: center; gap: 12px; }
+  /* WRAPS, because the toolbar is five controls wide now: without it the fifth one pushed the row
+     past the viewport on a narrow window instead of folding under the title. */
+  .actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  /* The view toggle reads as a SETTING rather than an action — it is the only control up here that
+     changes nothing in the pool — so it carries the chip fill the badges use instead of the card
+     fill its three action siblings share. Leftmost for the same reason: it governs everything below
+     it, while the other four each operate on one account. */
+  #view { display: flex; align-items: center; gap: 7px; padding: 7px 14px; font: 500 13px/normal var(--sans);
+          border: 1px solid #D3CFC3; border-radius: 999px; background: var(--chip-bg);
+          color: #3D3929; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
+  #view:hover { background: #E9E6DC; border-color: #C6C1B2; }
   /* The quiet siblings of #refresh, and that is a statement of rank: onboarding an account is rare
      and destructive-adjacent, removing one is rarer and outright destructive, registering a worker
      only edits a roster, so none of the three may compete with the button an operator presses every
@@ -113,19 +128,47 @@ export function dashboardHtml(config: DashboardConfig): string {
      one card stretched across the whole 1180px .wrap — the full-width row this layout exists to end.
      Inside that .wrap the 320px minimum yields exactly 3 columns, degrading to 2 then 1 on its own,
      which is why the narrower card needs no media query of its own. */
-  #rows { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px;
+  /* A CLASS on the one container, not two containers toggled with [hidden]: exactly one view exists
+     in the document at a time, so neither can be left behind holding a stale render. */
+  #rows.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px;
           align-items: start; }
-  .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 18px;
+  .card { position: relative; overflow: hidden;
+          background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 18px;
           padding: 22px 22px 20px; box-shadow: 0 1px 2px rgba(31,30,29,0.04);
           display: flex; flex-direction: column; gap: 18px; }
   .card.cooling { border-color: var(--accent); }
+
+  /* ── 限额标识 (危 / 死) ────────────────────────────────────────────────────────────────────────
+     Painted BEHIND the card's own content at 0.13, so a spent account can be read from across the
+     room and still be read in detail up close. 危 means the 5-hour window is spent — an account
+     that comes back within hours; 死 means the 7-day one is, which is that account written off for
+     the rest of the week. Only ONE of the two classes is ever set (see limitOf).
+     A ::after, never an <img>: the src would be the only asset reference on this page, and the
+     page's rule is that nothing reaches the DOM as markup. A background painted from a
+     compile-time constant cannot be influenced by anything the pool reports. */
+  .card.wei, .card.si { border-color: var(--accent); }
+  .card.wei::after, .card.si::after { content: ""; position: absolute; top: 2px; right: 2px;
+                                      width: 124px; height: 124px; background-repeat: no-repeat;
+                                      background-size: contain; opacity: 0.13; pointer-events: none; }
+  .card.wei::after { background-image: url("${WEI_MARK_PNG}"); }
+  /* AFTER .wei deliberately: equal specificity, so source order is what makes 死 win on a card that
+     has spent both windows — the shorter window's news is the less useful of the two. */
+  .card.si::after { background-image: url("${SI_MARK_PNG}"); }
+  /* The mark is a POSITIONED pseudo-element, so it would paint above in-flow content by default.
+     This is what puts the text back on top of it. */
+  .card > * { position: relative; z-index: 1; }
   /* Column, not a baseline-aligned row: in a ~350px card the label and the expiry line have no room
      to sit side by side. The card's own gap now owns the space this rule's margin-bottom used to. */
   .head { display: flex; flex-direction: column; gap: 10px; }
   .who { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   .label { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.005em;
            word-break: break-all; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  /* nowrap is load-bearing, not tidiness: a badge is ONE label, and CJK has no spaces to break on,
+     so a squeezed container breaks it between characters — 本轮无数据 came out as five stacked
+     glyphs in a 390px-wide table cell. A badge that cannot fit must push its container instead
+     (.who wraps, .crew scrolls, and the table below scrolls). */
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor;
+           white-space: nowrap; }
   .badge.cool { color: var(--accent); }
   .badge.reauth { color: var(--accent-soft); }
   .badge.muted { color: var(--text-3); }
@@ -202,6 +245,48 @@ export function dashboardHtml(config: DashboardConfig): string {
      visible empty track would have read as a window sitting idle at 0% — the one misreading this
      page must never invite, and the same confusion the 本轮无数据 badge exists to prevent. */
   .bar.ghost { visibility: hidden; }
+
+  /* ── 表格视图 ─────────────────────────────────────────────────────────────────────────────────
+     The same payload, one row per account, for the question the cards answer badly: with fifteen
+     accounts in the pool, which of them still has room. Every cell reuses .pct / .reset / .badge /
+     .fill wholesale — a table that grew its own type scale and its own bar tones would be a second
+     product rather than a second view of this one. */
+  #rows.table { display: block; overflow-x: auto; border: 1px solid var(--card-border);
+                border-radius: 14px; background: var(--card-bg);
+                box-shadow: 0 1px 2px rgba(31,30,29,0.04); }
+  /* max-content with a 100% floor, so the table FILLS a wide page and SCROLLS a narrow one inside
+     #rows.table. A plain width:100% squeezes instead: every column gives up width until the cells
+     break, which on this page means CJK badges and countdowns breaking between characters. */
+  table { width: max-content; min-width: 100%; border-collapse: collapse; font: 13px/1.45 var(--sans); }
+  th { padding: 11px 12px; text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+       text-transform: uppercase; color: var(--text-3); white-space: nowrap; background: var(--chip-bg); }
+  td { padding: 12px 12px; vertical-align: middle; }
+  th:first-child, td:first-child { padding-left: 16px; }
+  th:last-child, td:last-child { padding-right: 16px; }
+  tbody tr { border-top: 1px solid var(--card-border); }
+  /* The row's own version of the card's mark: a row is ~50px tall, where a 124px glyph would be
+     noise rather than information, so the two states are carried as the faintest possible wash —
+     死 darker than 危, the same ranking the bar tones use. */
+  tr.wei { background: rgba(224,36,26,0.03); }
+  tr.si { background: rgba(142,20,8,0.035); }
+  .tlabel { font-size: 14px; font-weight: 600; white-space: nowrap; }
+  .ttoken { color: var(--text-2); white-space: nowrap; }
+  /* WRAPS for the same reason .tcrew does: a row may grow taller, and an account can legitimately
+     carry three of these at once (冷却中 + 额度已满 + 不自动切) without squeezing its neighbours. */
+  .tmarks { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .ok { font-size: 12px; color: var(--text-3); }
+  /* WRAPS, unlike the card's .crew: a table row may grow taller without breaking anything, while a
+     card in a grid may not — which is the whole reason .crew is pinned to one scrolling line. */
+  .tcrew { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .tcrew .badge { flex: 0 0 auto; }
+  .cell { display: flex; flex-direction: column; gap: 5px; min-width: 84px; }
+  .cell-top { display: flex; align-items: baseline; gap: 8px; }
+  /* Two windows reported under ONE label stack inside the single column that label owns, instead of
+     one of them being dropped to keep the row tidy. */
+  .cell + .cell { margin-top: 7px; }
+  .cell .pct { font-size: 13px; }
+  .cell .reset { font-size: 11px; }
+  .bar.mini { width: 84px; height: 5px; }
 
   .empty { font-size: 13px; color: var(--text-3); }
   footer { margin: 4px 0 0; font-size: 13px; color: var(--text-3); line-height: 1.6; }
@@ -316,6 +401,10 @@ export function dashboardHtml(config: DashboardConfig): string {
       <p id="meta">加载中…</p>
     </div>
     <div class="actions">
+      <button id="view" type="button" title="在卡片视图和表格视图之间切换">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3.4h12"></path><path d="M2 8h12"></path><path d="M2 12.6h12"></path><path d="M6.2 3.4v9.2"></path></svg>
+        <span id="view-label">表格视图</span>
+      </button>
       <button id="add" type="button">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 3.2v9.6"></path><path d="M3.2 8h9.6"></path></svg>
         <span>添加账号</span>
@@ -334,7 +423,7 @@ export function dashboardHtml(config: DashboardConfig): string {
       </button>
     </div>
   </header>
-  <div id="rows"></div>
+  <div id="rows" class="grid"></div>
   <footer>本页不展示任何 token 明文。「删除账号」是不可撤销的：删除前 master 会把该账号的记录备份到 claude-accounts.json 同目录下，恢复只能靠这份备份或重新走一次授权。</footer>
 </div>
 <div id="veil" hidden>
@@ -438,11 +527,23 @@ export function dashboardHtml(config: DashboardConfig): string {
   };
   var owns = Object.prototype.hasOwnProperty;
 
+  // The two windows the 危 / 死 marks name, matched EXACTLY rather than by prefix: a scoped weekly
+  // window such as seven_day_opus is a per-model quota, and a pool that ran a model out of its own
+  // weekly allowance is not the pool being out of accounts.
+  var WEI_WINDOW = "five_hour";
+  var SI_WINDOW = "seven_day";
+
   var rows = document.getElementById("rows");
   var meta = document.getElementById("meta");
   var button = document.getElementById("refresh");
   var buttonLabel = document.getElementById("refresh-label");
   var delButton = document.getElementById("del");
+  var viewButton = document.getElementById("view");
+  var viewLabelNode = document.getElementById("view-label");
+  // Held in memory only, for the same reason the page keeps no other preference: an operator's tab
+  // stays open for hours across dozens of re-renders, and a stored view would be one more piece of
+  // state that can disagree with what they are looking at.
+  var tableView = false;
   var latest = null;
   var sweeping = false;
   // Set when the server refuses a press; while it is in the future the meta line says how long is
@@ -573,6 +674,41 @@ export function dashboardHtml(config: DashboardConfig): string {
     delButton.disabled = !latest || latest.accounts.length === 0;
   }
 
+  // Does this account have a SPECIFIC window at or past its ceiling. Anthropic reports utilization
+  // per window, and 100 is the ceiling rather than a warning line: at that point the window refuses
+  // work until it resets.
+  function maxed(account, label) {
+    for (var i = 0; i < account.windows.length; i++) {
+      if (account.windows[i].label === label && account.windows[i].utilization >= 100) return true;
+    }
+    return false;
+  }
+
+  // Which mark the account carries, and whether it belongs at the BACK of the list. The two answers
+  // are deliberately not the same test: a mark names the window that is spent, so it can only come
+  // from the snapshot's own numbers, while 冷却中 is the master's verdict on a 429 a worker actually
+  // hit — an account nobody can lease right now, whose window may not have caught up yet. Both mean
+  // "not available", which is what the ordering is about; only the first can say 危 or 死.
+  function limitOf(account) {
+    var si = maxed(account, SI_WINDOW);
+    var wei = maxed(account, WEI_WINDOW);
+    return { mark: si ? "si" : wei ? "wei" : "", limited: si || wei || account.coolingDown === true };
+  }
+
+  // A STABLE PARTITION, not a sort by utilization: within each half the roster's own order is kept,
+  // so an account only ever moves when it crosses the one line that matters — and a pool that is
+  // merely rotating does not look like one that is churning (the reason buildUsageView leaves the
+  // payload in roster order in the first place).
+  function displayOrder(accounts) {
+    var free = [];
+    var spent = [];
+    for (var i = 0; i < accounts.length; i++) {
+      if (limitOf(accounts[i]).limited) spent.push(accounts[i]);
+      else free.push(accounts[i]);
+    }
+    return free.concat(spent);
+  }
+
   function renderWindow(win) {
     var used = win.utilization;
     var tone = used >= 100 ? " max" : used >= 70 ? " high" : used > 0 ? "" : " zero";
@@ -638,28 +774,25 @@ export function dashboardHtml(config: DashboardConfig): string {
     return row;
   }
 
-  function renderAccount(account, order) {
-    var card = el("article", "card" + (account.coolingDown ? " cooling" : ""));
-    var head = el("div", "head");
-    var who = el("div", "who");
-    who.appendChild(el("h2", "label", account.label));
-    if (account.coolingDown) who.appendChild(el("span", "badge cool", "冷却中"));
-    if (account.needsReauth) who.appendChild(el("span", "badge reauth", "需重新登录"));
-    if (account.excluded) who.appendChild(el("span", "badge muted", "不自动切"));
+  // Returned as a LIST rather than appended into a parent, because the two views need the same four
+  // badges in different company: beside the account's name on a card, alone in a table cell where an
+  // empty list has to become 可用. One builder, so the states cannot drift between the views.
+  function statusBadges(account) {
+    var out = [];
+    if (account.coolingDown) out.push(el("span", "badge cool", "冷却中"));
+    if (account.needsReauth) out.push(el("span", "badge reauth", "需重新登录"));
+    if (account.excluded) out.push(el("span", "badge muted", "不自动切"));
     // Without this badge an account the poller could not reach would look exactly like a healthy
     // one sitting at 0%. That confusion is the whole reason this page exists.
-    if (!account.hasUsage) who.appendChild(el("span", "badge muted", "本轮无数据"));
-    head.appendChild(who);
-    head.appendChild(el("span", "token", account.expiresAt ? "access token " + fmtLeft(account.expiresAt - Date.now()) : "access token 到期时间未知"));
-    // ONE BADGE PER HOLDER, naming the worker rather than counting them: a count is a number the
-    // operator then has to go and resolve into machines, and the names are what they were going to
-    // ask for next anyway.
-    //
-    // The row is appended UNCONDITIONALLY so its fixed height applies to every card. A master that
-    // predates holder tracking sends no holders field at all, which is NOT the same fact as "nobody
-    // holds this" — but both render as an empty row here, because the alternative is a page that
-    // states a holder count the master never computed while selection is not ranking by one either.
-    var crew = el("div", "crew");
+    if (!account.hasUsage) out.push(el("span", "badge muted", "本轮无数据"));
+    return out;
+  }
+
+  // ONE BADGE PER HOLDER, naming the worker rather than counting them: a count is a number the
+  // operator then has to go and resolve into machines, and the names are what they were going to ask
+  // for next anyway.
+  function holderChips(account) {
+    var out = [];
     var holders = account.holders || [];
     // pinnedBy is a SUBSET of holders by construction (see the protocol type), so a pin DECORATES the
     // holder it belongs to instead of adding a second chip — one list, one chip per machine.
@@ -672,8 +805,32 @@ export function dashboardHtml(config: DashboardConfig): string {
       // Both glyphs survive when both apply, but 未登记 owns the COLOUR: "we cannot say whose machine
       // this is" is the one thing on the row an operator has to act on rather than merely expect.
       var tone = stranger ? "badge alien" : sticky ? "badge pin" : "badge busy";
-      crew.appendChild(el("span", tone, (sticky ? "📌 " : "") + (stranger ? "⚠ " : "") + holders[h]));
+      out.push(el("span", tone, (sticky ? "📌 " : "") + (stranger ? "⚠ " : "") + holders[h]));
     }
+    return out;
+  }
+
+  function renderAccount(account, order) {
+    var state = limitOf(account);
+    var card = el("article", "card" + (account.coolingDown ? " cooling" : "") + (state.mark ? " " + state.mark : ""));
+    var head = el("div", "head");
+    var who = el("div", "who");
+    who.appendChild(el("h2", "label", account.label));
+    var badges = statusBadges(account);
+    for (var b = 0; b < badges.length; b++) who.appendChild(badges[b]);
+    head.appendChild(who);
+    head.appendChild(el("span", "token", account.expiresAt ? "access token " + fmtLeft(account.expiresAt - Date.now()) : "access token 到期时间未知"));
+    // ONE BADGE PER HOLDER, naming the worker rather than counting them: a count is a number the
+    // operator then has to go and resolve into machines, and the names are what they were going to
+    // ask for next anyway.
+    //
+    // The row is appended UNCONDITIONALLY so its fixed height applies to every card. A master that
+    // predates holder tracking sends no holders field at all, which is NOT the same fact as "nobody
+    // holds this" — but both render as an empty row here, because the alternative is a page that
+    // states a holder count the master never computed while selection is not ranking by one either.
+    var crew = el("div", "crew");
+    var chips = holderChips(account);
+    for (var c = 0; c < chips.length; c++) crew.appendChild(chips[c]);
     head.appendChild(crew);
     card.appendChild(head);
     if (account.windows.length === 0) {
@@ -699,17 +856,135 @@ export function dashboardHtml(config: DashboardConfig): string {
     return card;
   }
 
+  // ── 表格视图 ────────────────────────────────────────────────────────────────────────────────────
+  // One row per account over the SAME payload and the same window order the cards use, so the two
+  // views can never disagree about what the pool looks like. The percentage keeps its own bar here,
+  // shrunk to 84px: a number alone makes the reader compare fifteen digits, where the bars answer
+  // "who has room" at a glance, which is the question that brought them to the table.
+  function windowBox(win) {
+    var used = win.utilization;
+    var tone = used >= 100 ? " max" : used >= 70 ? " high" : used > 0 ? "" : " zero";
+    var quiet = used > 0 ? "" : " dim";
+    var box = el("div", "cell");
+    var top = el("div", "cell-top");
+    top.appendChild(el("span", "pct" + quiet, Math.round(used) + "%"));
+    // The glyph, not the card's 重置, and for the same reason the countdown itself is abbreviated:
+    // this cell is 84px wide. A window with no resetsAt still renders nothing at all — see
+    // renderWindow for why a placeholder there would be worse than silence.
+    top.appendChild(el("span", "reset" + quiet, win.resetsAt ? "↻ " + resetIn(win.resetsAt) : ""));
+    box.appendChild(top);
+    var bar = el("div", "bar mini");
+    var fill = el("div", "fill" + tone);
+    fill.style.width = Math.max(0, Math.min(100, used)) + "%";
+    bar.appendChild(fill);
+    box.appendChild(bar);
+    return box;
+  }
+
+  // The cell for a window this row has no measurement for, and the two reasons are NOT the same
+  // fact: a standard seat carries no Fable quota (不适用), while a poller that could not reach the
+  // account this round knows nothing about any of its windows (未知). The card view draws the same
+  // distinction with missingWindow and the 本轮无数据 badge; collapsing either into 0% is the one
+  // misreading this page must never invite.
+  function missingBox(account) {
+    var box = el("div", "cell");
+    var top = el("div", "cell-top");
+    top.appendChild(el("span", "pct dim", account.hasUsage ? "不适用" : "未知"));
+    box.appendChild(top);
+    return box;
+  }
+
+  function windowCell(account, label) {
+    var td = el("td", "");
+    var hits = 0;
+    for (var i = 0; i < account.windows.length; i++) {
+      if (account.windows[i].label === label) {
+        td.appendChild(windowBox(account.windows[i]));
+        hits++;
+      }
+    }
+    if (hits === 0) td.appendChild(missingBox(account));
+    return td;
+  }
+
+  function renderRow(account, order) {
+    var state = limitOf(account);
+    var row = el("tr", state.mark);
+    row.appendChild(el("td", "tlabel", account.label));
+    var status = el("td", "");
+    var marks = el("div", "tmarks");
+    var badges = statusBadges(account);
+    // 可用 only when there is nothing else to say about the account — it is the ABSENCE of every
+    // other state, never a state of its own, so it cannot contradict one of them. The spent test
+    // belongs in it: a row reading 可用 beside its own 100% cell is the page contradicting itself
+    // in a single line, which is what this said before the mark was taken into account.
+    if (badges.length === 0 && !state.mark) marks.appendChild(el("span", "ok", "可用"));
+    for (var b = 0; b < badges.length; b++) marks.appendChild(badges[b]);
+    // TABLE-ONLY, and the card's mark is the reason: a spent card carries 危 or 死 across its whole
+    // face, while a row can only afford the faintest wash, so the row has to SAY it. Accent, like
+    // 冷却中, because the two mean the same thing to whoever is looking for an account to lease.
+    if (state.mark) marks.appendChild(el("span", "badge cool", "额度已满"));
+    status.appendChild(marks);
+    row.appendChild(status);
+    for (var k = 0; k < order.length; k++) row.appendChild(windowCell(account, order[k]));
+    row.appendChild(el("td", "ttoken", account.expiresAt ? fmtLeft(account.expiresAt - Date.now()) : "到期时间未知"));
+    var crewCell = el("td", "");
+    var crew = el("div", "tcrew");
+    var chips = holderChips(account);
+    if (chips.length === 0) crew.appendChild(el("span", "empty", "—"));
+    for (var c = 0; c < chips.length; c++) crew.appendChild(chips[c]);
+    crewCell.appendChild(crew);
+    row.appendChild(crewCell);
+    return row;
+  }
+
+  function renderTable(accounts, order) {
+    var table = el("table", "");
+    var head = el("tr", "");
+    head.appendChild(el("th", "", "账号"));
+    head.appendChild(el("th", "", "状态"));
+    // Walked in the SNAPSHOT's order, exactly as the cards are, so one column per label the pool
+    // knows about and a scoped window that only some accounts carry still gets a place.
+    for (var k = 0; k < order.length; k++) head.appendChild(el("th", "", shortLabel(order[k])));
+    head.appendChild(el("th", "", "access token"));
+    head.appendChild(el("th", "", "持有 worker"));
+    var thead = el("thead", "");
+    thead.appendChild(head);
+    table.appendChild(thead);
+    var tbody = el("tbody", "");
+    for (var i = 0; i < accounts.length; i++) tbody.appendChild(renderRow(accounts[i], order));
+    table.appendChild(tbody);
+    return table;
+  }
+
+  // Says what the press will DO, not where the page is now: the icon and the title carry the mode,
+  // and a button labelled with the state it is already in is the one every operator presses twice.
+  function syncView() {
+    viewLabelNode.textContent = tableView ? "卡片视图" : "表格视图";
+  }
+
   function render() {
     renderMeta();
     syncButton();
+    syncView();
     if (!latest) return;
     rows.textContent = "";
     if (latest.accounts.length === 0) {
+      rows.className = "grid";
       rows.appendChild(el("div", "empty", "池内没有 anthropic 账号。"));
       return;
     }
+    rows.className = tableView ? "table" : "grid";
     var order = windowOrder(latest.accounts);
-    for (var i = 0; i < latest.accounts.length; i++) rows.appendChild(renderAccount(latest.accounts[i], order));
+    // SPENT ACCOUNTS LAST, in both views: the page is opened to find out which account still has
+    // room, and nobody should have to read past a screenful of maxed rows to reach the ones that can
+    // answer that.
+    var shown = displayOrder(latest.accounts);
+    if (tableView) {
+      rows.appendChild(renderTable(shown, order));
+      return;
+    }
+    for (var i = 0; i < shown.length; i++) rows.appendChild(renderAccount(shown[i], order));
   }
 
   function load() {
@@ -782,6 +1057,13 @@ export function dashboardHtml(config: DashboardConfig): string {
   }
 
   button.addEventListener("click", refresh);
+
+  // Re-renders the snapshot ALREADY IN HAND rather than refetching: a view is a way of looking at the
+  // payload, and a toggle that went to the network would let the two views land on different sweeps.
+  viewButton.addEventListener("click", function () {
+    tableView = !tableView;
+    render();
+  });
 
   // ── 添加账号 ──────────────────────────────────────────────────────────────────────────────────
   // A four-stage dialog (loading / ready / done / fatal) over the two onboarding routes. The split
