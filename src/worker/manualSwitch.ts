@@ -8,6 +8,7 @@
 //
 // It therefore holds no roster, no token and no policy. Ask, validate, write, say what happened.
 import type { LeaseRefusal } from "../cloud/protocol.ts"
+import { MAX_ACCOUNT_HOLDERS } from "../constants.ts"
 import { log } from "../logger.ts"
 import type { LeaseFailure, LeaseOutcome } from "./leaseClient.ts"
 
@@ -65,6 +66,7 @@ const REFUSAL_MESSAGE: Record<LeaseRefusal, (label: string) => string> = {
   ambiguous: () => "有多个账号的 id 前缀相同，无法确定要切到哪一个，请在 master 上核对账号库",
   cooling: (label) => `「${label}」额度已满正在冷却，未切号`,
   "needs-reauth": (label) => `「${label}」需要在 master 上重新登录，未切号`,
+  "at-capacity": (label) => `「${label}」已经有 ${MAX_ACCOUNT_HOLDERS} 台机器在用，账号池不再往上加人，未切号`,
 }
 
 function messageFor(failure: LeaseFailure, label: string): string {

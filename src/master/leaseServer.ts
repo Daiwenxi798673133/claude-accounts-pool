@@ -73,6 +73,10 @@ export type LeaseServerDeps = {
     // reason pickPreferred is one: that function's job is to rank and rotate, and this one's job is
     // to do neither.
     pickIncumbent(input: IncumbentInput): StoredAccount | undefined
+    // What the renewal above feeds pickIncumbent when the WORKER could not say which account it holds.
+    // Required rather than optional: a master that silently lacked it would answer every restarted
+    // worker with a fresh election, which is the exact regression this book was added to close.
+    recallAffinity(workerId: string): string | undefined
     reportRateLimit(accountId: string, resetsAt?: number, workerId?: string): void
     justAdopted(workerId: string, accountId: string): boolean
     // The two READ-ONLY halves of the dashboard's payload. Required, not optional: a master serving
@@ -217,6 +221,7 @@ const LEASE_REFUSAL_DETAIL: Record<LeaseRefusal, string> = {
   ambiguous: "account prefix matches more than one account",
   cooling: "account is rate-limited",
   "needs-reauth": "account needs re-authentication",
+  "at-capacity": "account already has the maximum number of workers on it",
 }
 
 // Copies string entries only. The headers are quota telemetry the master logs by KEY, so a
@@ -334,7 +339,11 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // Naming the account a `ratelimit` report just cooled therefore comes back as a `cooling`
     // refusal rather than re-issuing a spent account, because the report lands before this request.
     if (request.preferredAccountIdPrefix !== undefined) {
-      const preferred = deps.scheduler.pickPreferred({ accounts, prefix: request.preferredAccountIdPrefix })
+      const preferred = deps.scheduler.pickPreferred({
+        accounts,
+        prefix: request.preferredAccountIdPrefix,
+        workerId,
+      })
       if (!preferred.ok) {
         // 409, deliberately none of the statuses above: 503 would tell the worker's client "the pool
         // is momentarily spent, retry", when the truth is that THIS account is unservable and
@@ -378,16 +387,34 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // pool owner asked to stop. Only pickIncumbent may answer here, and it refuses exactly when
     // keeping the account is impossible; every refusal falls through to the ranked pick below, so a
     // spent account still rotates without the worker having to classify anything.
-    if (request.reason === "prelease" && request.currentAccountId !== undefined) {
-      const incumbent = deps.scheduler.pickIncumbent({
-        accounts,
-        accountId: request.currentAccountId,
-        ...(request.excludeAccountIds === undefined ? {} : { excludeIds: request.excludeAccountIds }),
-      })
-      if (incumbent) {
-        log.info("master:lease-incumbent", { workerId, accountId: incumbent.id })
-        // `false`: a pin only ever arrives WITH a named prefix, which the branch above already served.
-        return serveLease(workerId, incumbent, false)
+    //
+    // THE WORKER'S OWN CLAIM FIRST, THE MASTER'S BOOK ONLY WHEN THE WORKER HAD NONE. A live process
+    // knows which account it is actually holding; the book knows only what was last served to that
+    // label. They agree in the steady state, and where they do not, the worker is the fresher of the
+    // two. The fallback exists because `currentAccountId` is absent exactly when it matters most — a
+    // worker whose process just restarted has forgotten it, and without the book that renewal becomes
+    // a fresh election that moves a live session onto a cold prompt cache (see scheduler.ts on the
+    // affinity book, and on the 59.3% of leases that took the election path because of this).
+    if (request.reason === "prelease") {
+      const remembered = request.currentAccountId ?? deps.scheduler.recallAffinity(workerId)
+      if (remembered !== undefined) {
+        const incumbent = deps.scheduler.pickIncumbent({
+          accounts,
+          accountId: remembered,
+          ...(request.excludeAccountIds === undefined ? {} : { excludeIds: request.excludeAccountIds }),
+        })
+        if (incumbent) {
+          // `source` so the log can still tell the two apart: this is the one field that says whether
+          // the fallback is doing any work, and the whole change is justified by a ratio measured from
+          // these lines.
+          log.info("master:lease-incumbent", {
+            workerId,
+            accountId: incumbent.id,
+            source: request.currentAccountId === undefined ? "affinity" : "worker",
+          })
+          // `false`: a pin only ever arrives WITH a named prefix, which the branch above already served.
+          return serveLease(workerId, incumbent, false)
+        }
       }
     }
     const account = deps.scheduler.pickAccount({

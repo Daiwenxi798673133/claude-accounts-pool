@@ -161,6 +161,7 @@ export type LeaseRefusal =
   | "ambiguous" // it matches more than one, so which row the operator meant is not knowable
   | "cooling" // the account is rate-limited; its quota is spent even though its token is fine
   | "needs-reauth" // its refresh chain is broken, so no access token can be minted for it at all
+  | "at-capacity" // MAX_ACCOUNT_HOLDERS workers are already on it; a fourth would burn one window at 4x
 
 // `refused` is the field the worker branches on; `error` stays human-readable for anything reading
 // this route with curl.

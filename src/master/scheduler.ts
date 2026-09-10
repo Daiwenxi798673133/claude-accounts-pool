@@ -1,8 +1,8 @@
 import { providerOf, type StoredAccount } from "../accounts.ts"
 import type { LeaseRefusal } from "../cloud/protocol.ts"
-import { MASTER_USAGE_POLL_INTERVAL_MS } from "../constants.ts"
+import { MASTER_USAGE_POLL_INTERVAL_MS, MAX_ACCOUNT_HOLDERS } from "../constants.ts"
 import { log } from "../logger.ts"
-import { latestMaxedReset, PROVIDERS, scoreWindows } from "../providers.ts"
+import { latestMaxedReset, type NormalizedWindow, PROVIDERS, scoreWindows } from "../providers.ts"
 import type { UsageResponse } from "../usage.ts"
 
 // Which account should the next lease use? That is the whole job of this module: no network, no
@@ -42,8 +42,66 @@ import type { UsageResponse } from "../usage.ts"
 // stop racing to the same "emptiest" account and burning one subscription window at double rate while
 // the rest of the pool idles. Affinity would pull a worker BACK to the account it left; this pushes
 // every worker apart. Do not let it grow into the former.
+//
+// AND NOW THERE IS AN AFFINITY BOOK — added as a SECOND map rather than by loosening the one above,
+// so the instruction in that paragraph still holds literally: the two books answer different
+// questions ("who is on this account right now" vs "where was this worker working") and must be able
+// to disagree.
+//
+// MEASURED CAUSE, not a preference. pickIncumbent can only fire when the RENEWAL CARRIES
+// `currentAccountId`, and that value lives in a worker process's memory (`heldAccountId` in
+// src/worker/leaseKeeper.ts), seeded at startup only when a still-warm lease is found. A machine that
+// slept, or an omo host restarted past its lease horizon, therefore renews with NO incumbent hint and
+// gets a fresh election. Over six weeks of master log the election path took 59.3% of all leases while
+// the documented sticky path took 17.2%, and 518 of the last 639 elections had no rate limit anywhere
+// near them. So the master remembers the binding ITSELF instead of trusting the worker to.
+//
+// WHY IT IS WORTH A PERSISTED MAP: Anthropic caches prompt prefixes per ORGANIZATION ("Different
+// organizations never share caches, even if they use identical prompts"), and every pooled account is
+// its own organization. Each of those elections moved a live session onto a cold cache, making the new
+// account pay a full-context cache WRITE at 2x base input against 0.1x for a read — a switch during
+// active work costs roughly twenty ordinary turns of that account's window.
+//
+// STILL NOT A RESERVATION, and every existing refusal outranks it: the recalled id goes through
+// pickIncumbent unchanged, so cooling, needsReauth, excluded, and "another slot of this worker already
+// holds it" all still move the worker. This book only supplies the hint the worker forgot.
+//
+// KEYED BY workerId, exactly as the lease book is, which inherits the same multi-slot limitation:
+// senpi runs several slots under ONE workerId, so a recall serves whichever slot asks first and the
+// siblings fall through to the ranked pick via `excludeIds`. Strictly better than forgetting outright,
+// never worse — and NOT a reason to put slot identity on the wire, which is a protocol change.
 
 const COOLDOWN_KV_KEY = "claude-accounts-usage.master.cooldown"
+
+// A SEPARATE key from the cooldown book on purpose: one holds "which accounts are spent", the other
+// "who was working where". Sharing a record would let one malformed half discard the other.
+const AFFINITY_KV_KEY = "claude-accounts-usage.master.affinity"
+
+// How long a binding still answers after that worker was last served. Covers the gap this book exists
+// for — an overnight sleep or an editor restart; every cold start observed in the log was past three
+// hours — while still letting a worker gone for a day rejoin through the ranked pick, which is where
+// the pool gets its chance to rebalance. It also bounds the stored object: a label that never comes
+// back leaves at most a day of entries behind.
+//
+// DELIBERATELY NOT the prompt cache's own lifetime, which is an hour on a subscription. A binding
+// older than that no longer saves a cache write, but it still keeps one worker's usage on ONE
+// subscription instead of smeared across the pool, and that is worth keeping past the point where the
+// cache has gone cold.
+const AFFINITY_TTL_MS = 24 * 60 * 60_000
+
+// How much of the utilization series to keep per account. The poller sweeps every
+// MASTER_USAGE_POLL_INTERVAL_MS, so an hour is about a dozen samples — enough that one noisy sweep
+// cannot dominate the slope, short enough that the answer describes what this account is doing NOW
+// rather than what it did before lunch. Derived from the poll interval for the same reason
+// USAGE_CACHE_TTL_MS is: changing the cadence must not silently change what "recent" means.
+const BURN_HISTORY_MS = 12 * MASTER_USAGE_POLL_INTERVAL_MS
+
+// A drop this large reads as a WINDOW RESET rather than as negative consumption, and the series
+// restarts there. Quota does not un-spend itself, so a real decline can only mean the window rolled
+// over; averaging across that boundary would report a negative burn rate for an account that just
+// got its capacity back — the single most dangerous number to be wrong about, because it makes an
+// account look infinitely durable exactly when it is about to be handed to somebody.
+const BURN_RESET_DROP = 5
 
 // A snapshot older than two whole poll intervals means POLLING is broken, not that the accounts are
 // idle — `/api/oauth/usage` is known to stay angry long past the request that upset it. Ranking by
@@ -110,6 +168,10 @@ export type PreferredInput = {
   accounts: StoredAccount[]
   // The prefix as the usage view published it (UsageAccountView.idPrefix), not a full account id.
   prefix: string
+  // Whose request this is, so the capacity check can DISCOUNT this worker's own outstanding lease.
+  // Without it an operator re-naming the account a worker already holds would be refused for a hold
+  // that is about to be replaced rather than added to.
+  workerId?: string
 }
 
 export type IncumbentInput = {
@@ -148,6 +210,18 @@ export type Scheduler = {
   // The subset of holdersOf that PINNED this account. A subset by construction — the flag lives on the
   // lease record — which is the invariant both renderers of UsageAccountView.pinnedBy rely on.
   pinnersOf: (accountId: string) => string[]
+  // The account this worker was last SERVED, for a renewal that arrives without `currentAccountId` —
+  // which is what a worker that just restarted sends. Answers undefined past AFFINITY_TTL_MS, so a
+  // long-absent label rejoins through ranking rather than being pulled back to a day-old account.
+  recallAffinity: (workerId: string) => string | undefined
+  // What this account's quota is DOING, not merely where it stands: utilization points per hour over
+  // the retained series, plus when it reaches 100 at that rate. A level gauge cannot tell a 90%-and-idle
+  // account from a 60%-and-collapsing one, and it is the SECOND that is about to refuse every request —
+  // which is why ranking by level alone kept handing out accounts that died within the hour.
+  //
+  // undefined while the series is too short to have a slope. That is the honest answer and deliberately
+  // NOT zero, which a caller would read as "idle, safe to load up".
+  burnOf: (accountId: string) => { util: number; ratePerHour: number; exhaustsInMs?: number } | undefined
 }
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
@@ -176,6 +250,14 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // from looping — a worker whose account really IS spent gets it handed straight back once, and the
   // second report lands outside the grace window and is believed.
   const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean; adoptedAt: number }>()
+  // WORKER → WHERE IT WAS WORKING. Unlike the lease book above this one IS persisted: its entire
+  // purpose is to survive the restart that loses the worker's own copy of the same fact. `at` is the
+  // last time this worker was served, which is what AFFINITY_TTL_MS is measured against.
+  const affinity = new Map<string, { accountId: string; at: number }>()
+  // Per-account utilization series, the raw material for burnOf. Bounded by BURN_HISTORY_MS and pruned
+  // on write, so a master running for weeks holds at most an hour of samples per account. NOT persisted:
+  // a slope stitched across a restart gap would span however long the process was down.
+  const burnHistory = new Map<string, { at: number; util: number }[]>()
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   // Rotation cursor for the no-usage-data path. An id, not an index, so it stays meaningful when
   // the caller's account list changes shape between picks.
@@ -186,6 +268,34 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     const snapshot: Record<string, number> = {}
     for (const [id, until] of cooldown) if (until > at) snapshot[id] = until
     deps.kv.set(COOLDOWN_KV_KEY, snapshot)
+  }
+
+  // Lapsed entries leave on the way out, so the stored object stays bounded without a sweep timer —
+  // the same shape persistCooldown uses. Deleting from a Map while iterating it is well-defined.
+  function persistAffinity(): void {
+    const at = now()
+    const snapshot: Record<string, { accountId: string; at: number }> = {}
+    for (const [workerId, bound] of affinity) {
+      if (at - bound.at > AFFINITY_TTL_MS) {
+        affinity.delete(workerId)
+        continue
+      }
+      snapshot[workerId] = bound
+    }
+    deps.kv.set(AFFINITY_KV_KEY, snapshot)
+  }
+
+  // Swept on read as well as on write: a master that serves nobody for a day would otherwise keep
+  // answering with bindings it has had no occasion to persist past.
+  function recallAffinity(workerId: string): string | undefined {
+    const bound = affinity.get(workerId)
+    if (!bound) return undefined
+    if (now() - bound.at > AFFINITY_TTL_MS) {
+      affinity.delete(workerId)
+      persistAffinity()
+      return undefined
+    }
+    return bound.accountId
   }
 
   // Estimated recovery, exactly as in autoswitch: the deadline came from the caller (or from a
@@ -367,7 +477,13 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         input.excludeIds?.includes(account.id) !== true &&
         !isCoolingDown(account.id) &&
         !account.excluded &&
-        !account.needsReauth,
+        !account.needsReauth &&
+        // THE HARD CEILING, and deliberately a REFUSAL rather than another narrowing pass like
+        // fewestHolders below: that one only decides which account is nicer when several are free,
+        // and it happily hands out a fifth seat on the emptiest account when every account is busy.
+        // Past MAX_ACCOUNT_HOLDERS the answer has to be "not this one" even if the alternative is
+        // no lease at all — a 503 costs one worker a retry, a shared window costs everyone on it.
+        activeHolders(account.id, at, input.workerId).length < MAX_ACCOUNT_HOLDERS,
     )
     if (candidates.length === 0) return undefined
     // Narrowed by holder count FIRST, then ranked within that tier by the existing rules. Applying the
@@ -403,6 +519,13 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     const account = matches[0]
     if (account.needsReauth === true) return { ok: false, refusal: "needs-reauth" }
     if (isCoolingDown(account.id)) return { ok: false, refusal: "cooling" }
+    // A THIRD REFUSAL THAT IS NOT ABOUT THIS ACCOUNT BEING BROKEN, unlike the two above: the account
+    // is perfectly servable, there is just no seat left on it. Refused rather than deferred to the
+    // human because a cap a name can walk through is not a cap — the operator would simply move the
+    // fourth machine onto the account by hand and rediscover why the ceiling exists.
+    if (activeHolders(account.id, now(), input.workerId).length >= MAX_ACCOUNT_HOLDERS) {
+      return { ok: false, refusal: "at-capacity" }
+    }
     // The rotation cursor names whoever was handed out LAST, and that is now this account. Leaving it
     // stale would make the next round-robin walk start from an account nobody holds. A cursor, not
     // affinity: see the no-stickiness note at the top of this file.
@@ -435,6 +558,51 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     return account
   }
 
+  // THE BINDING WINDOW, not the five-hour one: an account refuses requests when ANY of its windows
+  // reaches 100, so the peak across windows is what actually decides when it dies. Tracking only
+  // five_hour would call a weekly-exhausted account healthy right up until it refuses everything.
+  function peakUtilization(windows: readonly NormalizedWindow[]): number | undefined {
+    let peak: number | undefined
+    for (const win of windows) {
+      if (!Number.isFinite(win.utilization)) continue
+      if (peak === undefined || win.utilization > peak) peak = win.utilization
+    }
+    return peak
+  }
+
+  function recordBurnSample(id: string, windows: readonly NormalizedWindow[], at: number): void {
+    const util = peakUtilization(windows)
+    if (util === undefined) return
+    const series = burnHistory.get(id) ?? []
+    const last = series[series.length - 1]
+    // A reset ROLLS THE SERIES OVER rather than bending its slope — see BURN_RESET_DROP.
+    const rolled = last !== undefined && util < last.util - BURN_RESET_DROP ? [] : series
+    rolled.push({ at, util })
+    burnHistory.set(
+      id,
+      rolled.filter((sample) => at - sample.at <= BURN_HISTORY_MS),
+    )
+  }
+
+  function burnOf(accountId: string): { util: number; ratePerHour: number; exhaustsInMs?: number } | undefined {
+    const series = burnHistory.get(accountId)
+    if (series === undefined || series.length < 2) return undefined
+    const first = series[0]
+    const last = series[series.length - 1]
+    const elapsed = last.at - first.at
+    if (elapsed <= 0) return undefined
+    const ratePerHour = ((last.util - first.util) / elapsed) * 3_600_000
+    // A flat or falling series has NO exhaustion instant, and omitting the field is how that is said.
+    // Reporting one anyway — a huge number, or a negative one — reads as "this account lasts forever"
+    // to a caller that only checks whether the field is there.
+    if (ratePerHour <= 0) return { util: last.util, ratePerHour }
+    return {
+      util: last.util,
+      ratePerHour,
+      exhaustsInMs: Math.max(0, ((100 - last.util) / ratePerHour) * 3_600_000),
+    }
+  }
+
   function setUsageCache(entries: UsageSnapshotEntry[]): void {
     const byId = new Map<string, UsageResponse>()
     for (const entry of entries) byId.set(entry.id, entry.usage)
@@ -451,10 +619,24 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     // account rejoining selection while under-cooling costs a second burn. An account MISSING from
     // the snapshot taught us nothing and keeps cooling — absence of data is not evidence of recovery.
     for (const [id, usage] of byId) {
-      const resetsAt = latestMaxedReset(PROVIDERS.anthropic.normalize(usage), now())
+      // Normalized ONCE and shared: the burn series and the cooldown verdict must be reading the same
+      // windows, or the dashboard could show an account burning toward a limit this loop already cooled.
+      const windows = PROVIDERS.anthropic.normalize(usage)
+      recordBurnSample(id, windows, usageCache.at)
+      const resetsAt = latestMaxedReset(windows, now())
       if (resetsAt !== undefined) markCooldown(id, resetsAt)
       else if (cooldownPending.has(id)) clearCooldown(id)
     }
+    // ONE line per sweep, not one per account. This is the calibration data for a capacity check that
+    // does not exist yet — the numbers a safety margin would have to be chosen from — and a single
+    // greppable line per sweep is what makes it readable out of the same log everything else came from.
+    // Id prefixes only, per this file's display convention.
+    const observed: Record<string, number> = {}
+    for (const id of byId.keys()) {
+      const burn = burnOf(id)
+      if (burn !== undefined && burn.ratePerHour !== 0) observed[id.slice(0, 8)] = Math.round(burn.ratePerHour * 10) / 10
+    }
+    if (Object.keys(observed).length > 0) log.info("master:burn-observed", observed)
   }
 
   // A FRESH Map every call: the next sweep replaces `usageCache` wholesale, so handing out the live
@@ -478,10 +660,23 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     scheduleRecovery(id, until)
   }
 
+  // Same claim-not-proof treatment as the cooldown book, but validated PER ENTRY rather than
+  // all-or-nothing: one malformed record must not cost every other worker its binding. Entries already
+  // past the window are dropped rather than restored — restoring them would answer one recall with a
+  // stale account before the first persist had a chance to sweep them.
+  const storedAffinity = deps.kv.get<Record<string, { accountId: string; at: number }>>(AFFINITY_KV_KEY, {})
+  for (const [workerId, bound] of Object.entries(storedAffinity ?? {})) {
+    if (typeof bound?.accountId !== "string" || typeof bound?.at !== "number") continue
+    if (startedAt - bound.at > AFFINITY_TTL_MS) continue
+    affinity.set(workerId, { accountId: bound.accountId, at: bound.at })
+  }
+
   return {
     pickAccount,
     pickPreferred,
     pickIncumbent,
+    recallAffinity,
+    burnOf,
     reportRateLimit: (accountId: string, resetsAt?: number, workerId?: string) => {
       if (workerId !== undefined && justAdopted(workerId, accountId)) {
         log.info("master:ratelimit-misattributed", { workerId, accountId })
@@ -501,6 +696,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         pinned: input.pinned,
         adoptedAt,
       })
+      // The binding is refreshed on EVERY serve, not only on a move: `at` measures how recently this
+      // worker was active, which is what decides whether the recall is still worth answering. Writing
+      // it here rather than at pick time inherits this function's contract — a pick whose mint failed
+      // never reaches it, so the book never claims a worker went somewhere it was never sent.
+      affinity.set(input.workerId, { accountId: input.accountId, at: now() })
+      persistAffinity()
     },
     justAdopted,
     holdersOf: (accountId: string) => activeHolders(accountId, now()),

@@ -96,6 +96,7 @@ function startHarness(options?: {
   const picks: Harness["picks"] = []
   const preferred: Harness["preferred"] = []
   const leases = new Map<string, { accountId: string; expiresAt: number; pinned: boolean; adoptedAt: number }>()
+  const affinity = new Map<string, string>()
   const controller = new AbortController()
   if (options?.preAborted) controller.abort()
 
@@ -181,7 +182,14 @@ function startHarness(options?: {
           pinned,
           adoptedAt: held?.accountId === accountId ? held.adoptedAt : clock(),
         })
+        // A SECOND book, exactly as the real scheduler keeps: it outlives the lease above, which is
+        // the entire point — these cases drive a worker that came back having forgotten what it held.
+        affinity.set(workerId, accountId)
       },
+      // NO TTL here on purpose. The window past which a binding stops answering is scheduler policy
+      // and scheduler.test.ts owns proving it; what the ROUTE owes is "consult the book only when the
+      // worker said nothing", which is what these cases observe.
+      recallAffinity: (workerId) => affinity.get(workerId),
       // Mirrors the real rule (scheduler.test.ts owns proving it) so the HTTP cases can drive the
       // whole misattribution route — report discarded AND rotation skipped — from the outside.
       justAdopted: (workerId, accountId) => {
@@ -716,6 +724,69 @@ test("当前账号撞限额冷却后，续租不再保它而是轮换", async ()
     // worker to classify anything as a ratelimit request.
     expect(res.status).toBe(200)
     expect(((await res.json()) as LeaseResponse).accountId).toBe("acct-b")
+    expect(harness.picks).toHaveLength(1)
+  } finally {
+    harness.stop()
+  }
+})
+
+test("worker 重启后不带 currentAccountId 续租，master 用亲和账本把它留在原账号", async () => {
+  // Given: this worker was last served acct-b, which ranked selection would never choose (the fake
+  // answers the first servable account, acct-a)
+  const harness = startHarness()
+  try {
+    const first = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      currentAccountId: "acct-b",
+    } satisfies LeaseRequest)
+    expect(((await first.json()) as LeaseResponse).accountId).toBe("acct-b")
+
+    // When: the process restarts and renews having FORGOTTEN what it held — `currentAccountId` absent,
+    // which is exactly the shape a freshly started worker sends, because that value lives in process
+    // memory and is seeded only from a still-warm lease
+    const res = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+    } satisfies LeaseRequest)
+
+    // Then: it stays on acct-b, and ranked selection was never consulted. Without the book this
+    // renewal is a fresh election that moves a live session onto a cold prompt cache — caches are
+    // per-organization and every pooled account is its own, so the new account pays a full-context
+    // cache write. The master is the only party that still knows where this worker was working.
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as LeaseResponse).accountId).toBe("acct-b")
+    expect(harness.picks).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("亲和账本记着的账号正在冷却时不被保留，续租照常轮换", async () => {
+  const harness = startHarness()
+  try {
+    // Given: the worker was last served acct-b, and SOMEBODY ELSE then reported it spent — a report
+    // from this worker inside the adoption grace window would be discarded as misattributed
+    const first = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+      currentAccountId: "acct-b",
+    } satisfies LeaseRequest)
+    expect(((await first.json()) as LeaseResponse).accountId).toBe("acct-b")
+    const report: RateLimitReport = { workerId: "other-worker", accountId: "acct-b", headers: {} }
+    expect((await post(harness.base, CLOUD_ROUTES.ratelimit, report)).status).toBe(204)
+
+    // When: the restarted worker renews with nothing to say about where it was
+    const res = await post(harness.base, CLOUD_ROUTES.lease, {
+      workerId: WORKER_ID,
+      reason: "prelease",
+    } satisfies LeaseRequest)
+
+    // Then: it rotates. THE BOOK IS A HINT, NEVER A RESERVATION — a recalled id goes through the same
+    // pickIncumbent refusals as a worker-supplied one, so cooling still moves the worker and a
+    // remembered binding can never pin a worker to a spent account.
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as LeaseResponse).accountId).toBe("acct-a")
     expect(harness.picks).toHaveLength(1)
   } finally {
     harness.stop()
