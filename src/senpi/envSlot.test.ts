@@ -145,3 +145,33 @@ test("parseSlotCount defaults to one slot and clamps to senpi's ceiling", () => 
   // worker — an unreadable count must not stop a machine from leasing at all.
   for (const raw of ["", "abc", "0", "-3", "2.5"]) expect(parseSlotCount(raw)).toBe(1)
 })
+
+// adoptedAt 回答的是"这个账号在槽里待了多久",不是"上次写入是什么时候"。区别是硬的:续租同一个号
+// 如果推进它,一个真的被打爆的号每次续租都会给自己续一段宽限,永远熬不到\"该信这个封锁\"的年龄 ——
+// 误判守卫就从防活锁变成造活锁。镜像 master 的 adoptedAt(src/master/scheduler.ts)。
+test("adoptedAt 记录账号搬进来的时刻，续租同一个号不推进它", async () => {
+  let nowMs = 1_000
+  const slot = createEnvSlot({ env: env(), now: () => nowMs })
+
+  expect(slot.adoptedAt()).toBeUndefined()
+
+  await slot.writeLease({ access: "t1", expires: 9_000_000, accountId: "a" })
+  expect(slot.adoptedAt()).toBe(1_000)
+
+  // 同一个号换了一枚令牌,仍然是同一次入住。
+  nowMs = 60_000
+  await slot.writeLease({ access: "t2", expires: 9_000_000, accountId: "a" })
+  expect(slot.adoptedAt()).toBe(1_000)
+
+  // 换号才是新的入住。
+  nowMs = 90_000
+  await slot.writeLease({ access: "t3", expires: 9_000_000, accountId: "b" })
+  expect(slot.adoptedAt()).toBe(90_000)
+})
+
+test("作废槽位后 adoptedAt 归于未知，因为槽里已经没有占用者", async () => {
+  const slot = createEnvSlot({ env: env(), now: () => 1_000 })
+  await slot.writeLease({ access: "t1", expires: 9_000_000, accountId: "a" })
+  slot.invalidate()
+  expect(slot.adoptedAt()).toBeUndefined()
+})

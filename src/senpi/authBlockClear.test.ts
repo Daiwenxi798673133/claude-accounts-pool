@@ -6,6 +6,7 @@ import { initLogger } from "../logger.ts"
 import {
   auditSlotBlocks,
   blockClearScope,
+  blockDescribesOccupant,
   clearEnvSlotBlock,
   describeCandidates,
   senpiAuthPath,
@@ -261,7 +262,7 @@ test("auditSlotBlocks clears our slot's sticky auth_error and records the table"
     const path = join(box.dir, "auth.json")
     writeFileSync(path, authFile({ env: { blockReason: "auth_error" } }))
 
-    expect(await auditSlotBlocks(["env"], box.env)).toEqual(["env"])
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual([{ slotName: "env", reason: "auth_error" }])
 
     expect("slotState" in JSON.parse(readFileSync(path, "utf-8"))[PROVIDER]).toBe(false)
     const record = entries.find((entry) => entry.message.includes("senpi:candidates-blocked"))
@@ -288,7 +289,9 @@ test("auditSlotBlocks leaves a rate-limit block standing but hands the slot back
     const path = join(box.dir, "auth.json")
     const original = authFile({ env: { blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 } })
     writeFileSync(path, original)
-    expect(await auditSlotBlocks(["env"], box.env)).toEqual(["env"])
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual([
+      { slotName: "env", reason: "rate_limit", blockedUntil: 1_800_000_100_000 },
+    ])
     expect(readFileSync(path, "utf-8")).toBe(original)
   } finally {
     box.cleanup()
@@ -353,7 +356,10 @@ test("auditSlotBlocks reports the env slots senpi auth-blocked", async () => {
   try {
     const blocks = { env: { blockReason: "auth_error" }, "env-2": { blockReason: "auth_error" } }
     writeFileSync(join(box.dir, "auth.json"), authFile(blocks))
-    expect(await auditSlotBlocks(["env", "env-2"], box.env)).toEqual(["env", "env-2"])
+    expect(await auditSlotBlocks(["env", "env-2"], box.env)).toEqual([
+      { slotName: "env", reason: "auth_error" },
+      { slotName: "env-2", reason: "auth_error" },
+    ])
   } finally {
     box.cleanup()
   }
@@ -370,7 +376,10 @@ test("auditSlotBlocks reports the env slot for a rate-limit block, to re-lease i
   try {
     const blocks = { env: { blockReason: "rate_limit", blockedUntil: 1_800_000_100_000 } }
     writeFileSync(join(box.dir, "auth.json"), authFile(blocks))
-    expect(await auditSlotBlocks(["env"], box.env)).toEqual(["env"])
+    // 带上解封时刻,而不只是槽名:调用方靠它决定这个账号要被排除到什么时候,少了它就只能当成永久尸体。
+    expect(await auditSlotBlocks(["env"], box.env)).toEqual([
+      { slotName: "env", reason: "rate_limit", blockedUntil: 1_800_000_100_000 },
+    ])
   } finally {
     box.cleanup()
   }
@@ -431,4 +440,26 @@ test("auditSlotBlocks 对 rate_limit 块取证一次,同一次阻塞不重复探
     initLogger(undefined)
     box.cleanup()
   }
+})
+
+// 实测:49 次槽位作废里有 29 次打在"进槽不到 15 秒"的号上,中位持有 7 秒。那不是这个号烧掉的额度,
+// 也不是它的令牌被吊销 —— 是上一个号飞在半路的请求回来了,而 senpi 的封锁按槽名记,于是记在了刚
+// 搬进来的号头上。
+test("blockDescribesOccupant 不相信刚接手 15 秒内的封锁", () => {
+  const adoptedAt = 1_000_000
+  expect(blockDescribesOccupant(adoptedAt, adoptedAt)).toBe(false)
+  expect(blockDescribesOccupant(adoptedAt, adoptedAt + 7_000)).toBe(false)
+  expect(blockDescribesOccupant(adoptedAt, adoptedAt + 14_999)).toBe(false)
+})
+
+// 宽限必须会到期,否则真的被打爆的号永远等不到该信的那一刻,守卫本身变成活锁。
+test("blockDescribesOccupant 过了宽限就相信封锁", () => {
+  const adoptedAt = 1_000_000
+  expect(blockDescribesOccupant(adoptedAt, adoptedAt + 15_000)).toBe(true)
+  expect(blockDescribesOccupant(adoptedAt, adoptedAt + 60_000)).toBe(true)
+})
+
+// 没有占用者就没有会被冤枉的对象,答"相信"既安全又诚实:没证据不等于有误判。
+test("blockDescribesOccupant 在槽里没有占用者时照常相信封锁", () => {
+  expect(blockDescribesOccupant(undefined, 1_000_000)).toBe(true)
 })

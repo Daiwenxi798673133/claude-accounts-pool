@@ -41,7 +41,12 @@
 //
 // The race that this file DID own — a turn starting before the first lease landed — is fixed in the
 // turn_start handler below.
-import { auditSlotBlocks, blockClearScope, clearEnvSlotBlock } from "./src/senpi/authBlockClear.ts"
+import {
+  auditSlotBlocks,
+  blockClearScope,
+  blockDescribesOccupant,
+  clearEnvSlotBlock,
+} from "./src/senpi/authBlockClear.ts"
 import { createAutoResume, readRunEnd } from "./src/senpi/autoResume.ts"
 import { leaseLiveAccess } from "./src/senpi/deadLease.ts"
 import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
@@ -209,7 +214,13 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     writeLease: (input: { access: string; expires: number; accountId: string }) => Promise<void>
     pin: PinStore
     // Retained for the block audit: it is what turns senpi's auth_error report into a renewal.
-    invalidate: () => void
+    // `poison` says whether the dropped token also goes into the corpse set — see invalidateSlot.
+    invalidate: (poison: boolean) => void
+    // The other half of that split: a rate limit is a deadline on an ACCOUNT, recorded here so the
+    // next lease steers around it and stops doing so the moment senpi's own block expires.
+    throttle: (accountId: string, until: number) => void
+    // When this slot's CURRENT account moved in, for the misattribution guard below.
+    adoptedAt: () => number | undefined
   }[] = []
   const toasts: QueuedToast[] = []
   // Filled from a switch the operator performed, which is the one moment the label and the prefix are
@@ -287,9 +298,30 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // without this set the recovery would forget a dead token and adopt the very same bytes straight
     // back out of the cache — the livelock with one extra hop.
     const deadAccess = new Set<string>()
-    const invalidateSlot = (): void => {
+    // A RATE LIMIT IS NOT A CORPSE, and keeping the two in one set was measurably expensive. Both
+    // kinds of block have to swap the slot's occupant, so both used to drop their token in here —
+    // but this set never expires, so one 429 made the master's answer for that account permanently
+    // unacceptable: every renewal the master handed the account back (correctly — its quota is fine
+    // and its token is alive), the guard read it as dead, and the slot rotated onto a cold prompt
+    // cache instead. Measured on this worker over three days: 57 of 76 dead-access rejections had a
+    // rate_limit block behind them, not a 401, and 32 of 47 account switches came from that path.
+    //
+    // So the deadline-bearing half lives here instead, keyed by ACCOUNT because that is what the
+    // limit is about, and expiring on senpi's own `blockedUntil` because that is when it stops being
+    // true. `deadAccess` keeps only what it was always documented to hold: tokens senpi answered 401
+    // on, which genuinely never come back.
+    const throttledUntil = new Map<string, number>()
+    const throttledAccountIds = (at: number): string[] => {
+      const live: string[] = []
+      for (const [accountId, until] of throttledUntil) {
+        if (until > at) live.push(accountId)
+        else throttledUntil.delete(accountId)
+      }
+      return live
+    }
+    const invalidateSlot = (poison: boolean): void => {
       const dropped = envSlot.invalidate()
-      if (dropped !== undefined) deadAccess.add(dropped)
+      if (poison && dropped !== undefined) deadAccess.add(dropped)
     }
 
     // The roster's section: the ONLY place a lease for this slot may be minted.
@@ -321,7 +353,13 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         // See deadLease.ts; `deadAccess` is read live because the audit fills it mid-turn.
         const outcome = await leaseLiveAccess(
           { lease: (request) => client.lease(request), deadAccess },
-          { ...input, excludeAccountIds: section.excludeAccountIds },
+          // Two different "not this one"s, and they are both exclusions rather than one being a
+          // corpse: the roster's entries are accounts a SIBLING SLOT holds, the throttled ones are
+          // accounts this slot may not go back to until senpi's block on them lapses.
+          {
+            ...input,
+            excludeAccountIds: [...section.excludeAccountIds, ...throttledAccountIds(Date.now())],
+          },
         )
         // Claimed only on success, and inside the section: a pick that failed to mint leaves this
         // slot on whatever it had, and recording it would make every other slot steer around a
@@ -382,7 +420,15 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // avoids it by adopting the recorded id before its first tick (see src/worker/install.ts).
     if (warm) keeper.adoptAccount(warm.accountId)
     joiners.push(createLeaseJoiner(keeper.tickOnce))
-    slotUnits.push({ slotName, keeper, writeLease: writeSlotLease, pin, invalidate: invalidateSlot })
+    slotUnits.push({
+      slotName,
+      keeper,
+      writeLease: writeSlotLease,
+      pin,
+      invalidate: invalidateSlot,
+      throttle: (accountId, until) => throttledUntil.set(accountId, until),
+      adoptedAt: envSlot.adoptedAt,
+    })
   }
 
   // allSettled, NOT all: senpi selects among whatever slots currently carry a token, so one slot's
@@ -496,13 +542,46 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
     // bytes, horizon still in the future), so the block IS the evidence; clearing alone puts that dead
     // token straight back into selection and the pair oscillates for the rest of the session. After a
     // rate limit the account is simply unusable for as long as the limit lasts, and one blocked slot is
-    // senpi's "All Claude accounts are currently blocked" for the whole machine. Both answers are the
-    // same: invalidating drops the remembered lease, so the ensureLeased() that follows in this same
-    // turn leases a different account — which is the only reason the pool holds more than one.
+    // senpi's "All Claude accounts are currently blocked" for the whole machine. So both invalidate:
+    // dropping the remembered lease is what makes the ensureLeased() that follows in this same turn
+    // reach for a different account — the only reason the pool holds more than one.
+    //
+    // WHERE THEY PART IS HOW LONG THE OLD OCCUPANT STAYS UNACCEPTABLE, and conflating that was the
+    // expensive half. A 401 condemns the TOKEN forever, so it goes into deadAccess. A rate limit
+    // condemns the ACCOUNT until `blockedUntil`, so it goes into the throttle book and lapses on its
+    // own — treating it as a corpse kept a healthy account out of reach for the whole life of a token
+    // whose quota had long since reset.
     auditBlocks: async (): Promise<readonly string[]> => {
       const stranded = await auditSlotBlocks(slotUnits.map((slot) => slot.slotName))
-      for (const slotName of stranded) slotUnits.find((slot) => slot.slotName === slotName)?.invalidate()
-      return stranded
+      for (const block of stranded) {
+        const unit = slotUnits.find((slot) => slot.slotName === block.slotName)
+        if (unit === undefined) continue
+        // THE ADOPTION GRACE, and the reason it belongs HERE rather than in the audit: only this
+        // process knows when it moved an account into the slot. senpi keys blocks by SLOT, and the
+        // request that failed left before the swap that answered the PREVIOUS failure — so a block
+        // stamped seconds after a swap is the outgoing account's failure wearing the incoming
+        // account's name. Believing it condemns a healthy account and throws away its prompt cache.
+        //
+        // NOTHING IS DONE TO THE OCCUPANT: no poison, no throttle, no invalidate. The one thing that
+        // must still happen is dropping the block itself, because a rate-limit block is deliberately
+        // LEFT STANDING by the audit — and standing over an account it does not describe, it is
+        // senpi's "All Claude accounts are currently blocked" for a slot with nothing wrong with it.
+        // `account-changed` is the literal truth here: the block's subject has already left.
+        // An auth_error needs no clear — the audit always drops that one on its way out.
+        if (!blockDescribesOccupant(unit.adoptedAt(), Date.now())) {
+          log.warn("senpi:block-misattributed", { slotName: block.slotName, reason: block.reason })
+          if (block.reason === "rate_limit") await clearEnvSlotBlock(block.slotName, "account-changed")
+          continue
+        }
+        // The occupant being condemned. Absent only before this slot's first successful lease, where
+        // there is no account to steer away from and nothing to record.
+        const accountId = unit.keeper.heldAccountId()
+        if (block.reason === "rate_limit" && accountId !== undefined && block.blockedUntil !== undefined) {
+          unit.throttle(accountId, block.blockedUntil)
+        }
+        unit.invalidate(block.reason === "auth_error")
+      }
+      return stranded.map((block) => block.slotName)
     },
     heldAccounts: () => slotUnits.map((slot) => slot.keeper.heldAccountId()),
     drainToasts: () => toasts.splice(0, toasts.length),

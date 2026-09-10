@@ -122,6 +122,59 @@ export type CandidateBlock = {
   blockedUntil?: number
 }
 
+// A slot whose occupant must be replaced, CARRYING THE REASON rather than just the name.
+//
+// The two reasons need different remedies and the caller is the only place that can apply either, so
+// collapsing them into a name — as this used to — forces it to treat every block as the worst case.
+// It did: a rate-limited token went into the same permanent "this token is a corpse" set as a 401,
+// and the account stayed unleasable for the whole life of that token, long after the window reset.
+// `auth_error` is a fact about the TOKEN and never expires; `rate_limit` is a fact about the ACCOUNT
+// and comes with the instant it stops being true.
+export type StrandedSlot = {
+  slotName: string
+  reason: "auth_error" | "rate_limit"
+  // Only a rate limit has one. senpi's auth blocks are sticky by construction — no deadline exists.
+  blockedUntil?: number
+}
+
+// How long after an account MOVES INTO a slot this worker refuses to believe a block against it.
+//
+// A byte-for-byte mirror of the master's RATELIMIT_ADOPTION_GRACE_MS (src/master/scheduler.ts), and a
+// SECOND constant rather than an import for the reason the whole src/senpi tree keeps its own copies:
+// the two measure the same physics from different clocks — the master's from the instant it SERVED a
+// lease, this one from the instant this process PUBLISHED one into the environment — so they must be
+// able to diverge, and importing master code into the extension would drag a headless server's
+// dependency tree into every senpi host.
+//
+// WHAT IT GUARDS. senpi stamps a block against a SLOT, never against the account whose token was in
+// it, and the failing turn's request left before the swap that answered the previous failure. So a
+// 401 or 429 raised on the account this slot just left arrives stamped on the account that just moved
+// in. Measured on this worker over three days: 29 of 49 slot invalidations condemned an account that
+// had been in the slot for a MEDIAN OF 7 SECONDS — nothing this worker did in seven seconds spent a
+// five-hour window or revoked a token.
+//
+// LONG RATHER THAN SHORT, exactly as the master's window is: over-waiting costs at most one wasted
+// turn against an account that really was spent, because the block is stamped again and the next
+// audit is outside the window and believed. Under-waiting costs a healthy account and a whole prompt
+// cache with it.
+const SLOT_ADOPTION_GRACE_MS = 15_000
+
+/**
+ * Can a block observed now be believed to describe the account CURRENTLY in the slot?
+ *
+ * `adoptedAt` is when that account moved in (EnvSlot.adoptedAt), which does not advance on a renewal
+ * of the same account — so an account that really is spent ages past this window and its block is
+ * believed, rather than the guard refreshing itself into a livelock.
+ *
+ * NO OCCUPANT MEANS NOTHING TO PROTECT: with no publish behind us there is no account this block
+ * could be misattributed TO, so the answer is yes and the caller's ordinary remedy runs. That is also
+ * the honest answer — absence of evidence is not evidence of misattribution.
+ */
+export function blockDescribesOccupant(adoptedAt: number | undefined, at: number): boolean {
+  if (adoptedAt === undefined) return true
+  return at - adoptedAt >= SLOT_ADOPTION_GRACE_MS
+}
+
 /**
  * The candidate table as auth.json describes it, in senpi's own order (stored accounts first, then
  * env slots — see its listAccounts).
@@ -165,8 +218,9 @@ export function describeCandidates(raw: string, slotNames: readonly string[]): C
  *
  * ONLY OUR OWN SLOTS. A stored account's block is left exactly where it is.
  *
- * RETURNS EVERY SLOT WHOSE OCCUPANT MUST BE REPLACED, because clearing a block is only ever half the
- * recovery — and against a rate limit it is not even half.
+ * RETURNS EVERY SLOT WHOSE OCCUPANT MUST BE REPLACED, WITH THE REASON, because clearing a block is
+ * only ever half the recovery — and against a rate limit it is not even half. The reason travels with
+ * the name because only the caller can apply the remedy and the two remedies differ; see StrandedSlot.
  *
  * auth_error: senpi blocked after a 401, which is the one piece of evidence this machine ever gets that
  * a published token is dead — a revoked token is byte-identical to a live one and its lease horizon is
@@ -221,7 +275,7 @@ export async function auditSlotBlocks(
   slotNames: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
   fetchImpl: typeof fetch = fetch,
-): Promise<readonly string[]> {
+): Promise<readonly StrandedSlot[]> {
   const path = senpiAuthPath(env)
   if (path === undefined) return []
   let raw: string
@@ -242,18 +296,24 @@ export async function auditSlotBlocks(
   // an empty stored list is what turns one blocked slot into "all accounts blocked".
   log.warn("senpi:candidates-blocked", { candidates })
   probeRateLimitBlocks(blocked, slotNames, env, fetchImpl)
-  const stranded: string[] = []
+  const stranded: StrandedSlot[] = []
   for (const candidate of blocked) {
     // A stored account's block is senpi's own login failure and never ours to act on.
     if (candidate.source !== "env") continue
     if (candidate.blockReason === "auth_error") {
-      stranded.push(candidate.name)
+      stranded.push({ slotName: candidate.name, reason: "auth_error" })
       // Sticky by construction: no login can lift it off a pool-fed slot, so drop it here.
       await clearEnvSlotBlock(candidate.name, "auth-only", env)
       continue
     }
     // No clear: the block describes the account still sitting in the slot, and it is accurate.
-    if (candidate.blockReason === "rate_limit") stranded.push(candidate.name)
+    if (candidate.blockReason === "rate_limit") {
+      stranded.push({
+        slotName: candidate.name,
+        reason: "rate_limit",
+        ...(candidate.blockedUntil === undefined ? {} : { blockedUntil: candidate.blockedUntil }),
+      })
+    }
   }
   return stranded
 }
