@@ -104,6 +104,7 @@ test("junk, a wrong version and malformed members all read as nothing cached", (
 
 const AHEAD = NOW + LEASE_RENEW_BUFFER_MS + 1
 const noneDead: ReadonlySet<string> = new Set()
+const noneThrottled: ReadonlySet<string> = new Set()
 
 // WHY ADOPTION EXISTS AT ALL. omo runs several senpi hosts on one machine and they share this file,
 // one slot name and one workerId. Each host leasing for itself books N accounts out of the pool for
@@ -111,7 +112,7 @@ const noneDead: ReadonlySet<string> = new Set()
 // construction. Measured at five hosts.
 test("adoptableLease takes a cached lease with a full renewal window ahead of it", () => {
   const cached = new Map([["env", lease("acct-a", AHEAD)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW })).toEqual(
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, throttledAccounts: noneThrottled, pinnedPrefix: undefined, at: NOW })).toEqual(
     lease("acct-a", AHEAD),
   )
 })
@@ -120,7 +121,7 @@ test("adoptableLease takes a cached lease with a full renewal window ahead of it
 // publish and the cache write bought nothing.
 test("adoptableLease refuses a lease already inside its renewal window", () => {
   const cached = new Map([["env", lease("acct-a", NOW + LEASE_RENEW_BUFFER_MS - 1)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, throttledAccounts: noneThrottled, pinnedPrefix: undefined, at: NOW })).toBeUndefined()
 })
 
 // THE INTERACTION THAT WOULD OTHERWISE REVIVE THE LIVELOCK THIS BRANCH FIXES. A revoked token is
@@ -131,15 +132,53 @@ test("adoptableLease refuses a token this process already saw a 401 on", () => {
   const dead = lease("acct-a", AHEAD)
   const cached = new Map([["env", dead]])
   expect(
-    adoptableLease({ cached, slotName: "env", deadAccess: new Set([dead.access]), pinnedPrefix: undefined, at: NOW }),
+    adoptableLease({ cached, slotName: "env", deadAccess: new Set([dead.access]), throttledAccounts: noneThrottled, pinnedPrefix: undefined, at: NOW }),
   ).toBeUndefined()
+})
+
+// THE LIVELOCK'S EXPENSIVE HALF, and the one `deadAccess` structurally cannot see: a rate limit
+// leaves the token's bytes untouched, so only the ACCOUNT identifies it. The turn audit books the
+// account into the throttle book and invalidates the slot — and without this refusal the very next
+// renewal adopted that same spent account straight back out of this file, so the master, which had
+// healthy accounts and an exclusion list to steer by, was never asked at all. Measured on this
+// worker 2026-09-10: 40 invalidate/re-adopt cycles on one exhausted account inside an hour, every
+// turn dying with "All Claude accounts are currently blocked", while a manual switch leased a
+// healthy account on the first try.
+test("adoptableLease refuses a cached lease for an account senpi has rate-limited", () => {
+  const cached = new Map([["env", lease("acct-a", AHEAD)]])
+  expect(
+    adoptableLease({
+      cached,
+      slotName: "env",
+      deadAccess: noneDead,
+      throttledAccounts: new Set(["acct-a"]),
+      pinnedPrefix: undefined,
+      at: NOW,
+    }),
+  ).toBeUndefined()
+})
+
+// Keyed by ACCOUNT, so a sibling slot's throttled account is no reason to refuse this slot's lease:
+// the book holds a deadline on one account, never a verdict on the pool.
+test("adoptableLease adopts while the throttle book names a different account", () => {
+  const cached = new Map([["env", lease("acct-a", AHEAD)]])
+  expect(
+    adoptableLease({
+      cached,
+      slotName: "env",
+      deadAccess: noneDead,
+      throttledAccounts: new Set(["acct-b"]),
+      pinnedPrefix: undefined,
+      at: NOW,
+    }),
+  ).toEqual(lease("acct-a", AHEAD))
 })
 
 // A pin is an instruction the operator gave by hand, so another host's pick must not silently replace
 // it. The account the operator NAMED is not somebody else's pick, though — it is the instruction.
 test("adoptableLease refuses another host's pick while a pin names a different account", () => {
   const cached = new Map([["env", lease("acct-a", AHEAD)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: "acct-b", at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, throttledAccounts: noneThrottled, pinnedPrefix: "acct-b", at: NOW })).toBeUndefined()
 })
 
 // THE CONVERGENCE A PINNED SLOT USED TO OPT OUT OF. Refusing every adoption left the pinning host
@@ -147,7 +186,7 @@ test("adoptableLease refuses another host's pick while a pin names a different a
 // two accounts and whichever token the master had displaced was answered 401. See slotPin.ts.
 test("adoptableLease adopts the pinned account another host already published", () => {
   const cached = new Map([["env", lease("acct-a", AHEAD)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: "acct-a", at: NOW })).toEqual(
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, throttledAccounts: noneThrottled, pinnedPrefix: "acct-a", at: NOW })).toEqual(
     lease("acct-a", AHEAD),
   )
 })
@@ -156,13 +195,13 @@ test("adoptableLease adopts the pinned account another host already published", 
 // the master is only asked when nobody adopts — which is exactly what the renewal window brings about.
 test("adoptableLease stops adopting a pinned account once its renewal window opens", () => {
   const cached = new Map([["env", lease("acct-a", NOW + LEASE_RENEW_BUFFER_MS - 1)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: "acct-a", at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, throttledAccounts: noneThrottled, pinnedPrefix: "acct-a", at: NOW })).toBeUndefined()
 })
 
 test("adoptableLease reads only its own slot, and an empty cache is a cold start", () => {
   const cached = new Map([["env-2", lease("acct-b", AHEAD)]])
-  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW })).toBeUndefined()
+  expect(adoptableLease({ cached, slotName: "env", deadAccess: noneDead, throttledAccounts: noneThrottled, pinnedPrefix: undefined, at: NOW })).toBeUndefined()
   expect(
-    adoptableLease({ cached: new Map(), slotName: "env", deadAccess: noneDead, pinnedPrefix: undefined, at: NOW }),
+    adoptableLease({ cached: new Map(), slotName: "env", deadAccess: noneDead, throttledAccounts: noneThrottled, pinnedPrefix: undefined, at: NOW }),
   ).toBeUndefined()
 })
