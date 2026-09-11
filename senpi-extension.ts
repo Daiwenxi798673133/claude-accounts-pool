@@ -53,6 +53,7 @@ import { createEnvSlot, senpiEnvSlot } from "./src/senpi/envSlot.ts"
 import { detectExternalSwitches, externalSwitchNotice } from "./src/senpi/externalSwitch.ts"
 import { adoptableLease, type CachedLease, readLeaseCache, writeLeaseCache } from "./src/senpi/leaseCache.ts"
 import { createLeaseJoiner } from "./src/senpi/leaseJoiner.ts"
+import { createLimitReporter } from "./src/senpi/limitReport.ts"
 import { createFileLogClient } from "./src/senpi/logSink.ts"
 import { withSlotLock } from "./src/senpi/slotLock.ts"
 import { readSlotPin, writeSlotPin } from "./src/senpi/slotPin.ts"
@@ -541,6 +542,12 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
 
   const usage = createUsageClient({ fetchImpl: fetch, masterUrl })
 
+// ONE BOOK PER WORKER, not per slot: a rate limit is a fact about an ACCOUNT, and with K slots the
+  // same spent account can be blocked in two of them within seconds. Sharing the dedupe across slots
+  // is what keeps that one report from becoming K.
+  const limitReporter = createLimitReporter({ reportRateLimit: (input) => client.reportRateLimit(input) })
+
+
   return {
     ensureLeased,
     statusText: () => formatStatusText({ held: held(), labelByPrefix }),
@@ -583,8 +590,21 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
         // The occupant being condemned. Absent only before this slot's first successful lease, where
         // there is no account to steer away from and nothing to record.
         const accountId = unit.keeper.heldAccountId()
-        if (block.reason === "rate_limit" && accountId !== undefined && block.blockedUntil !== undefined) {
-          unit.throttle(accountId, block.blockedUntil)
+        if (block.reason === "rate_limit" && accountId !== undefined) {
+          if (block.blockedUntil !== undefined) unit.throttle(accountId, block.blockedUntil)
+          // AND TELL THE MASTER, which this lane never did: the throttle book above only steers THIS
+          // machine, so the spent account stayed a candidate for every other worker until each one
+          // had hit the same wall itself. Reported here rather than from the transport because this
+          // is the one place the block has been judged to describe the occupant — the same evidence
+          // the throttle acts on, plus the master's own adoption guard behind it.
+          //
+          // NOT AWAITED. The report is telemetry for other machines and the transport swallows its
+          // own faults (so nothing here can reject), while the lease that actually rescues THIS turn
+          // is next in line — it must not queue behind a 15s network timeout.
+          void limitReporter.report({
+            accountId,
+            ...(block.blockedUntil === undefined ? {} : { blockedUntil: block.blockedUntil }),
+          })
         }
         unit.invalidate(block.reason === "auth_error")
       }
