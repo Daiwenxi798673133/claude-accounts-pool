@@ -375,3 +375,32 @@ test("mergeTuiConfig never reorders or dedupes a neighbour", () => {
 
   expect(merged).toEqual({ ok: true, config: { plugin: ["dup@1", "dup@1", entry, "dup@2"] } })
 })
+
+// 目录名不含项目名的 clone(用户自己挑的路径,或者一个 git worktree)此前一次都认不出自己的条目:第二次
+// 运行就再追加一条,OpenCode 于是把插件加载两遍。2026-09-11 实测 —— 幂等性用例在一个以分支命名的
+// worktree 里直接挂掉,两条条目指向同一个 dist/tui.js。
+test("mergeTuiConfig 认得自己所在的 clone，哪怕目录名不含项目名", () => {
+  const entry: [string, JsonObject] = ["/Users/someone/cap/dist/tui.js", { mode: "cloud-worker" }]
+
+  const first = mergeTuiConfig({ plugin: ["neighbour"] }, entry)
+  expect(first).toEqual({ ok: true, config: { plugin: ["neighbour", entry] } })
+  if (!first.ok) throw new Error("unreachable")
+
+  expect(mergeTuiConfig(first.config, entry)).toEqual({ ok: true, config: { plugin: ["neighbour", entry] } })
+})
+
+// 同一个 clone 里指向源码的旧条目该被就地换掉,而不是与新条目并存 —— 并存同样是加载两遍。
+test("mergeTuiConfig 把同一个 clone 里的 tui.tsx 旧条目就地换成 dist/tui.js", () => {
+  const entry: [string, JsonObject] = ["/Users/someone/cap/dist/tui.js", { mode: "cloud-worker" }]
+  const config: JsonObject = { plugin: ["first", ["/Users/someone/cap/tui.tsx", { mode: "local" }], "last"] }
+
+  expect(mergeTuiConfig(config, entry)).toEqual({ ok: true, config: { plugin: ["first", entry, "last"] } })
+})
+
+// 别的目录里同名的文件不归我们认领:看不出是我们的东西就别动,改写机器上已经能跑的配置是这个脚本的禁忌。
+test("mergeTuiConfig 不认领别的目录里同名的 dist/tui.js", () => {
+  const entry: [string, JsonObject] = ["/Users/someone/cap/dist/tui.js", { mode: "cloud-worker" }]
+  const stranger: [string, JsonObject] = ["/elsewhere/dist/tui.js", { mode: "local" }]
+
+  expect(mergeTuiConfig({ plugin: [stranger] }, entry)).toEqual({ ok: true, config: { plugin: [stranger, entry] } })
+})

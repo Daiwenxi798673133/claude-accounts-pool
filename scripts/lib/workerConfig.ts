@@ -63,6 +63,31 @@ export function isOurTuiEntry(entry: unknown): boolean {
   return named && BUILT_SUFFIXES.some((suffix) => path.endsWith(suffix))
 }
 
+// THE SAME CLONE, whatever its directory happens to be called. The check above asks whether a path
+// is NAMED after this package, which is all that can be asked of a stranger's entry — but it answers
+// NO for a clone the user put somewhere of their own choosing (or a git worktree), and then every run
+// of this script appends another entry and OpenCode loads the plugin twice. Measured 2026-09-11 in a
+// worktree named after the branch: the idempotency test failed with two entries pointing at the same
+// dist/tui.js.
+//
+// The entry we are about to WRITE names the clone being configured, so "does this entry point into
+// that same clone" is answerable exactly rather than by guessing — and it also catches the operator
+// who wired up `tui.tsx` from the clone we are now pointing at `dist/tui.js`.
+function tuiRootOf(path: string): string | undefined {
+  const suffix = BUILT_SUFFIXES.find((candidate) => path.endsWith(candidate))
+  return suffix === undefined ? undefined : path.slice(0, path.length - suffix.length)
+}
+
+function isSameCloneEntry(entry: unknown, ours: string): boolean {
+  const path = entryPath(entry)
+  if (path === undefined) return false
+  const root = tuiRootOf(ours)
+  // An empty root would be a bare "tui.tsx" with no directory at all, which matches every other
+  // bare entry — never ours to claim.
+  if (root === undefined || root.length === 0) return false
+  return tuiRootOf(path) === root
+}
+
 // Missing `plugin` is legal (a config may only carry mcp/theme), an absent array is just an
 // empty one. A `plugin` of any other type means we do not understand this file and must not
 // guess. The legacy check lives here so BOTH config files inherit it for free.
@@ -96,7 +121,7 @@ export function mergeOpencodeConfig(config: JsonObject): MergeOutcome {
 export function mergeTuiConfig(config: JsonObject, entry: TuiEntry): MergeOutcome {
   const plugins = readPluginList(config)
   if (!plugins.ok) return plugins
-  const index = plugins.list.findIndex(isOurTuiEntry)
+  const index = plugins.list.findIndex((candidate) => isOurTuiEntry(candidate) || isSameCloneEntry(candidate, entry[0]))
   const list = [...plugins.list]
   // Replace IN PLACE: plugin load order is observable, and the neighbours (including the
   // same package listed twice at two versions) must keep the indices their owner gave them.
