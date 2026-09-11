@@ -332,15 +332,22 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
       pinned?: boolean
     }) =>
       roster.withSlot(slotName, async (section) => {
+        // ONE READING OF THE THROTTLE BOOK for both halves of this section. The adoption below and
+        // the exclusion below that are the same question asked of two different answerers — the
+        // shared cache and the master — and a book read twice could let a deadline lapse between
+        // them, which is the one way this slot could still land back on the account it is escaping.
+        const at = Date.now()
+        const throttled = throttledAccountIds(at)
         // ADOPT BEFORE ASKING — see adoptableLease for when that is allowed and why each refusal is.
         const shared = adoptableLease({
           cached: readLeaseCache(process.env),
           slotName,
           deadAccess,
+          throttledAccounts: new Set(throttled),
           // The pin AS THIS REQUEST SAW IT, not a fresh read of the store: createPinnedLease decided
           // both fields together, and re-reading here could answer for a pin set since.
           pinnedPrefix: input.pinned === true ? input.preferredAccountIdPrefix : undefined,
-          at: Date.now(),
+          at,
         })
         if (shared !== undefined) {
           section.claim(shared.accountId)
@@ -358,7 +365,7 @@ function install(masterUrl: string, workerId: string, slots: number): Installed 
           // accounts this slot may not go back to until senpi's block on them lapses.
           {
             ...input,
-            excludeAccountIds: [...section.excludeAccountIds, ...throttledAccountIds(Date.now())],
+            excludeAccountIds: [...section.excludeAccountIds, ...throttled],
           },
         )
         // Claimed only on success, and inside the section: a pick that failed to mint leaves this

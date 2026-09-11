@@ -83,15 +83,24 @@ export type EnvSlot = {
   // token, and a caller that adopts from the cache would otherwise republish the credential it just
   // invalidated.
   invalidate: () => string | undefined
-  // WHEN THIS ACCOUNT MOVED IN, undefined before the first lease and after an invalidate. Not the
-  // lease's own `expires`, which says when the credential dies — this says how long this account has
-  // been the one on the hook, which is the only way to tell a failure this occupant caused from one
-  // that merely arrived while it was moving in. See blockDescribesOccupant.
+  // WHEN THIS ACCOUNT MOVED IN, undefined only before the first lease. Not the lease's own
+  // `expires`, which says when the credential dies — this says how long this account has been the
+  // one on the hook, which is the only way to tell a failure this occupant caused from one that
+  // merely arrived while it was moving in. See blockDescribesOccupant.
   //
   // A RENEWAL OF THE SAME ACCOUNT DOES NOT ADVANCE IT, exactly as the master's own `adoptedAt` does
   // not (src/master/scheduler.ts). If it did, a slot whose account is genuinely spent would refresh
   // its own grace window on every republish and never reach the age at which its block is believed —
   // the misattribution guard would become a livelock instead of preventing one.
+  //
+  // AN INVALIDATE DROPS THE CREDENTIAL, NOT THE OCCUPANT, and that distinction is the livelock above
+  // arriving through the recovery path instead: every recovery invalidates the slot before it
+  // re-publishes, so forgetting the occupant here made the republish of the SAME account look like a
+  // fresh move-in. Measured on this worker 2026-09-10: one spent account was invalidated and
+  // re-published 40 times in an hour, and each republish reset the grace window, so the standing
+  // rate-limit block was read as misattributed and cleared 29 times while the account never changed.
+  // The env variable still carries this account's token after an invalidate — it really is still the
+  // occupant — so only a publish naming a DIFFERENT account is a move-in.
   adoptedAt: () => number | undefined
 }
 
@@ -100,7 +109,11 @@ export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
   const now = deps.now ?? Date.now
   // The lease this slot last published, or undefined before the first one lands. Holds the access
   // token too — not to hand back out, but to detect the drift described below.
-  let written: { access: string; expires: number; accountId: string; at: number } | undefined
+  let written: { access: string; expires: number; accountId: string } | undefined
+  // WHO is on the hook and since when, kept apart from the credential above because the two have
+  // different lifetimes: invalidate() throws the credential away while the account stays exactly
+  // where it was. See EnvSlot.adoptedAt.
+  let occupant: { accountId: string; at: number } | undefined
 
   return {
     // FAIL CLOSED ON DRIFT. The expiry lives here while the token lives in the environment, so the
@@ -119,8 +132,10 @@ export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
     },
     writeLease: (input) => {
       deps.env[varName] = input.access
-      const at = written?.accountId === input.accountId ? written.at : now()
-      written = { access: input.access, expires: input.expires, accountId: input.accountId, at }
+      // Asked of the OCCUPANT, which an invalidate leaves standing — a republish of the account
+      // already in the slot is the same tenancy no matter how many times its credential was dropped.
+      if (occupant?.accountId !== input.accountId) occupant = { accountId: input.accountId, at: now() }
+      written = { access: input.access, expires: input.expires, accountId: input.accountId }
       // accountId and expiry only. `input.access` is a live credential and is never logged.
       log.info("senpi:env-slot-written", { accountId: input.accountId, expires: input.expires })
       return Promise.resolve()
@@ -132,6 +147,6 @@ export function createEnvSlot(deps: EnvSlotDeps): EnvSlot {
       written = undefined
       return dropped
     },
-    adoptedAt: () => written?.at,
+    adoptedAt: () => occupant?.at,
   }
 }

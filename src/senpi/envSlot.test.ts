@@ -169,9 +169,26 @@ test("adoptedAt 记录账号搬进来的时刻，续租同一个号不推进它"
   expect(slot.adoptedAt()).toBe(90_000)
 })
 
-test("作废槽位后 adoptedAt 归于未知，因为槽里已经没有占用者", async () => {
-  const slot = createEnvSlot({ env: env(), now: () => 1_000 })
+// 作废只丢凭证,不丢占用者:env 变量里仍然是这个号的令牌,它确实还占着这个槽。而恢复路径每一轮都先
+// invalidate 再重新发布,所以忘掉占用者就等于把"重新发布同一个号"当成一次新入住 —— 宽限窗口每轮自我
+// 续期,真正被打爆的号永远熬不到"该信这个封锁"的年龄。2026-09-10 实测:同一个号一小时内被作废并重新
+// 发布 40 次,期间 29 次把真实的限流封锁当成误判清掉。
+test("作废槽位不忘记占用者，重新发布同一个号不推进 adoptedAt", async () => {
+  let nowMs = 1_000
+  const slot = createEnvSlot({ env: env(), now: () => nowMs })
   await slot.writeLease({ access: "t1", expires: 9_000_000, accountId: "a" })
+  expect(slot.adoptedAt()).toBe(1_000)
+
   slot.invalidate()
-  expect(slot.adoptedAt()).toBeUndefined()
+  expect(slot.adoptedAt()).toBe(1_000)
+
+  // 恢复路径又拿回同一个号:还是那一次入住。
+  nowMs = 20_000
+  await slot.writeLease({ access: "t2", expires: 9_000_000, accountId: "a" })
+  expect(slot.adoptedAt()).toBe(1_000)
+
+  // 作废之后换成别的号,才是新入住。
+  nowMs = 30_000
+  await slot.writeLease({ access: "t3", expires: 9_000_000, accountId: "b" })
+  expect(slot.adoptedAt()).toBe(30_000)
 })

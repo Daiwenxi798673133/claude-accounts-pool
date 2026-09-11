@@ -78,7 +78,7 @@ export function readLeaseCache(env: NodeJS.ProcessEnv = process.env, at: number 
  * undefined. Called from inside the machine-wide slot lock, where a lease another senpi host published
  * is final — adopting it is what converges N hosts onto ONE account per slot instead of booking N.
  *
- * Four ways to answer no, and each is load-bearing:
+ * Five ways to answer no, and each is load-bearing:
  *   * nothing cached for this slot, which is an ordinary cold start.
  *   * `pinnedPrefix` names an account and the cache holds a DIFFERENT one, so adopting would reverse
  *     an instruction the operator gave by hand. A cached lease that IS the pinned account is adopted
@@ -89,12 +89,24 @@ export function readLeaseCache(env: NodeJS.ProcessEnv = process.env, at: number 
  *   * the token is one this process already saw a 401 on. A REVOKED token is byte-identical to a live
  *     one and its horizon is still in the future, so the cache cannot rule it out on its own; without
  *     this the recovery path would invalidate a dead token and adopt the same bytes straight back.
+ *   * the ACCOUNT is one senpi rate-limited and whose block has not lapsed yet. Same livelock as the
+ *     line above, arriving through the other kind of block and costing far more, because a rate limit
+ *     is the common one: the recovery invalidates the slot, this short-circuit hands the identical
+ *     spent account straight back out of the cache, and the master — which has healthy accounts and
+ *     an exclusion list to steer by — is never even asked. Measured on this worker 2026-09-10:
+ *     40 invalidate/re-adopt cycles on one exhausted account across an hour of turns that each died
+ *     with "All Claude accounts are currently blocked", while a manual switch leased a healthy
+ *     account on the first try. A throttled account is exactly what the master must be asked to
+ *     replace, so this refusal is what makes the exclusion below reachable at all.
  *   * already inside its own renewal window, where adopting would leave the slot due again at once.
  */
 export function adoptableLease(input: {
   cached: Map<string, CachedLease>
   slotName: string
   deadAccess: ReadonlySet<string>
+  // Accounts under a rate-limit block that has not expired, keyed by account id because that is what
+  // the limit is about — unlike deadAccess, which condemns one token's bytes forever.
+  throttledAccounts: ReadonlySet<string>
   pinnedPrefix: string | undefined
   at: number
 }): CachedLease | undefined {
@@ -102,6 +114,7 @@ export function adoptableLease(input: {
   if (shared === undefined) return undefined
   if (input.pinnedPrefix !== undefined && !shared.accountId.startsWith(input.pinnedPrefix)) return undefined
   if (input.deadAccess.has(shared.access)) return undefined
+  if (input.throttledAccounts.has(shared.accountId)) return undefined
   return shared.expires - input.at >= LEASE_RENEW_BUFFER_MS ? shared : undefined
 }
 
