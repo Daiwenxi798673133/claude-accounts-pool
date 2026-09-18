@@ -32,10 +32,15 @@
 // Everything else is best-effort: a lease must never fail because this could not run.
 import { chmodSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { lock } from "proper-lockfile"
+import properLockfile from "proper-lockfile"
 import { log, redactBody } from "../logger.ts"
 import { senpiEnvSlot } from "./envSlot.ts"
 import { probeRateLimit } from "./rateLimitProbe.ts"
+
+// `lock` off the default export rather than a named import: senpi loads this extension through a
+// virtual module namespace in which a CJS package's named exports are not statically detected, so
+// `import { lock }` fails at load time and takes the whole extension down with it
+const { lock } = properLockfile
 
 // senpi's provider id for the Claude Pro/Max OAuth pool. A stable string, not imported: the
 // extension takes no dependency on senpi (see senpi-extension.ts).

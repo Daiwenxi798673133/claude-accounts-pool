@@ -24,9 +24,14 @@
 // nobody else, so it gets its own parameters and its own lock target.
 import { mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { lock } from "proper-lockfile"
+import properLockfile from "proper-lockfile"
 import { log } from "../logger.ts"
 import { leaseCacheDir } from "./leaseCache.ts"
+
+// `lock` off the default export rather than a named import: senpi loads this extension through a
+// virtual module namespace in which a CJS package's named exports are not statically detected, so
+// `import { lock }` fails at load time and takes the whole extension down with it
+const { lock } = properLockfile
 
 // `stale` only matters when a holder DIES: proper-lockfile refreshes a held lock's mtime every
 // `update` ms, so a legitimate ten-minute hold is never stolen. 60s/15s therefore buys recovery from a
