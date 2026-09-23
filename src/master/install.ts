@@ -36,6 +36,7 @@ import { autoCapture, fetchUsage } from "../usage.ts"
 import { createAccountOnboard, type OnboardProfile } from "./accountOnboard.ts"
 import { createAccountRemove } from "./accountRemove.ts"
 import { installMasterKeeper, makeOnboardingCapture } from "./keeper.ts"
+import { startWithBindRetry } from "./bindRetry.ts"
 import { startLeaseServer } from "./leaseServer.ts"
 import { createRefresher, type MasterToken, type RefreshRevokedOutcome } from "./refresher.ts"
 import { createScheduler } from "./scheduler.ts"
@@ -193,22 +194,31 @@ export function installCloudMaster(
 
   // Started LAST of the four, so the port only opens once everything a lease answer depends on is
   // live: a worker that reached a half-composed master would be handed a 500 it retries forever.
-  const server = startLeaseServer({
-    scheduler,
-    workerRegistry,
-    refresher,
-    loadAccounts: roster,
-    accountOnboard,
-    accountRemove,
-    // The dashboard's refresh button reuses the poller's OWN sweep rather than fetching usage itself,
-    // so a forced refresh inherits every protection the scheduled path already has: the re-entrancy
-    // guard, the 500ms spacing between accounts, and the per-account 429 cooldown.
-    refreshUsage: usagePoller.tickOnce,
+  // Through startWithBindRetry because the bind can fail at boot (the Tailscale address is not up
+  // yet) — see that module for the half-alive master a single attempt used to leave behind.
+  const server = startWithBindRetry({
+    start: () =>
+      startLeaseServer({
+        scheduler,
+        workerRegistry,
+        refresher,
+        loadAccounts: roster,
+        accountOnboard,
+        accountRemove,
+        // The dashboard's refresh button reuses the poller's OWN sweep rather than fetching usage itself,
+        // so a forced refresh inherits every protection the scheduled path already has: the re-entrancy
+        // guard, the 500ms spacing between accounts, and the per-account 429 cooldown.
+        refreshUsage: usagePoller.tickOnce,
+        hostname: cfg.hostname,
+        port: cfg.port,
+        // The plugin's own abort signal, so the port dies with the plugin rather than outliving it as
+        // an unsupervised credential dispenser.
+        signal: api.lifecycle.signal,
+      }),
     hostname: cfg.hostname,
     port: cfg.port,
-    // The plugin's own abort signal, so the port dies with the plugin rather than outliving it as
-    // an unsupervised credential dispenser.
     signal: api.lifecycle.signal,
+    sleep,
   })
 
   // THE ONE COMMAND A MASTER REGISTERS, and the exception is narrow on purpose: /update-log mints
@@ -245,6 +255,8 @@ export function installCloudMaster(
   // /stats, and there is no longer a credential for a palette entry to mint. Everything an operator
   // needs is on the web dashboard this server already serves — the one palette entry above is
   // /update-log, which only reads this machine's log file.
-  log.info("master:installed", { hostname: cfg.hostname, port: server.port })
+  // cfg.port, not the bound one: the server may still be waiting for its interface here, and
+  // parseMode never admits port 0, so the two cannot differ once it binds.
+  log.info("master:installed", { hostname: cfg.hostname, port: cfg.port })
   return { dispose }
 }
