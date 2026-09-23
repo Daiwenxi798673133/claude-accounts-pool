@@ -14,7 +14,7 @@
 import { log, redactBody } from "../logger.ts"
 import type { LeaseFailure } from "../worker/leaseClient.ts"
 import type { SharedLease, SharedLeaseResult } from "./sharedLease.ts"
-import { downstreamHeaders, isQuotaExhausted, relayErrorResponse, upstreamHeaders } from "./relayWire.ts"
+import { decodeBodyForLog, downstreamHeaders, isQuotaExhausted, relayErrorResponse, upstreamHeaders } from "./relayWire.ts"
 
 export const RELAY_SERVICE = "claude-pool-relay"
 // 启动器与 relay 之间控制面的版本。relay 比启动器活得久(它服务全机所有会话),git pull 之后跑着的
@@ -219,7 +219,16 @@ export function createRelay(deps: RelayDeps): Relay {
         }
       }
       if (res.status >= 400) {
-        log.warn("claudecode:relay-upstream-status", { status: res.status, path, accountId: lease.lease.accountId.slice(0, 8) })
+        // 错误应答的正文摘要:不带配额头的 429、400 这类,光看状态码分不清是容量、权限还是请求形状。
+        // clone 只发生在错误路径上(正文是一小段 JSON),成功的流式应答原样直通、不多占一份内存。
+        const raw = await res.clone().arrayBuffer().catch(() => new ArrayBuffer(0))
+        const detail = decodeBodyForLog(new Uint8Array(raw), res.headers.get("content-encoding"))
+        log.warn("claudecode:relay-upstream-status", {
+          status: res.status,
+          path,
+          accountId: lease.lease.accountId.slice(0, 8),
+          body: redactBody(detail, 300),
+        })
       }
       // 每个请求一行,只在 CLAUDE_AUTOSWITCH_DEBUG 下出现(logger 的 debug 门):"这一发到底走的哪个号"
       // 是会话中途换号唯一的直接证据,但常开就是每次 API 调用一行日志。

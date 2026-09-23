@@ -50,7 +50,8 @@
     "LICENSE",
     "senpi-extension.ts",
     "claude-pool.ts",
-    "claude-pool-relay.ts"
+    "claude-pool-relay.ts",
+    "claude-pool-env.ts"
   ],
   "engines": {
     "opencode": ">=1.3.13",

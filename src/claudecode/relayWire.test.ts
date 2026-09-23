@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { downstreamHeaders, isQuotaExhausted, limitHeadersOf, relayErrorResponse, resetsAtOf, upstreamHeaders } from "./relayWire.ts"
+import { decodeBodyForLog, downstreamHeaders, isQuotaExhausted, limitHeadersOf, relayErrorResponse, resetsAtOf, upstreamHeaders } from "./relayWire.ts"
 
 const reqId = () => "req-1"
 
@@ -104,4 +104,14 @@ test("relay 自己的错误是 Anthropic 形状的报文:5xx 让客户端重试,
   expect(((await empty.json()) as { error: { type: string } }).error.type).toBe("rate_limit_error")
   // 不带配额头:客户端会显示 message 原文,而不是把它当成某个账号的额度用满。
   expect(isQuotaExhausted(empty.status, empty.headers)).toBe(false)
+})
+
+test("错误正文按 content-encoding 解开再进日志;解不开就如实说明,不抛", () => {
+  const json = '{"type":"error","error":{"type":"rate_limit_error","message":"x"}}'
+  const bytes = new TextEncoder().encode(json)
+  expect(decodeBodyForLog(Bun.gzipSync(bytes), "gzip")).toBe(json)
+  expect(decodeBodyForLog(require("node:zlib").brotliCompressSync(bytes), "br")).toBe(json)
+  expect(decodeBodyForLog(bytes, null)).toBe(json)
+  expect(decodeBodyForLog(bytes, "gzip")).toContain("解不开")
+  expect(decodeBodyForLog(bytes, "zstd")).toContain("zstd")
 })

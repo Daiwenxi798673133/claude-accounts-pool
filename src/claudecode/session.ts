@@ -121,7 +121,9 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
   // THE GUARD RUNS BEFORE THE RELAY, and the order is the point: a machine that cannot use a lease
   // should not start a relay that books one out of the pool.
   const settings = await deps.readSettings()
-  const dryRun = buildChildEnv({ env: deps.env, access: "", settings })
+  // relayUrl 也交进去:从一个已经走池子的会话里(比如它的 Bash 工具)再起 claude-pool,环境里继承来的
+  // 正是 relay 自己的地址,那不是操作者设的网关。
+  const dryRun = buildChildEnv({ env: deps.env, access: "", settings, relayUrl: deps.relayUrl })
   if (!dryRun.ok) {
     deps.notify(blockerText(dryRun.blockers))
     return EXIT_BLOCKED

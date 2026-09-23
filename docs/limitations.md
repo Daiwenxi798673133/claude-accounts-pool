@@ -32,7 +32,10 @@
   - **遥测会上报 base URL 的 host**(`127.0.0.1:<端口>`):订阅 OAuth 账号 + 自定义网关这个组合会出现在 Anthropic 自己的遥测里。
 - **一部分请求不经过 relay**:profile、usage、bootstrap 等端点直连 `api.anthropic.com`,用的是会话启动时那枚租约。续期或换号之后,它们仍带着旧的那枚;过了它的视界可能开始 401。推理请求不受影响。
 - **`metadata.user_id` 里的 `account_uuid` 取自本机登录**(`~/.claude.json`),与池子租约不是同一个号。这在 relay 之前就存在,relay 让它在会话中途换号时更明显。
-- **只覆盖从 `claude-pool` 启动的会话**。Claude Code 从自己二进制拉起的进程(`--bg` 后台会话、agent view、团队队友、自我重启)不经过启动器,拿到的是机器上的环境凭证。要接住它们,得把 relay 常驻(launchd)并写进 settings 的 `env` 块,尚未做。
+- **只用 `claude-pool` 时,只覆盖从它启动的会话**:`--bg` 后台会话、agent view、团队队友、自我重启拿到的是机器上的环境凭证。`make setup` 的全面接管补上了这些(官方启动器契约 + PATH 前的 `claude` 转发脚本 + launchd 常驻 relay),claude 2.1.280 上用真二进制验证过:`claude daemon status` 显示我们的启动器,`--bg` 会话的请求全部经 relay 走池子账号。
+- **全面接管仍不覆盖的**(官方文档列出的启动器盲区):`claude-cli://` 深链接拉起的第一个进程、`--worktree --tmux` 的那次重启、Claude in Chrome 的 native-messaging host。
+- **全面接管下,拿不到池子租约时 Claude Code 起不来**(启动器拒绝,而不是悄悄用你自己的号)。这是有意的,补救是 `make revert`。
+- **后台服务偶发一个 429**:`rate_limit_error` / message `"Error"`、不带任何限流头 —— 与 `src/senpi/rateLimitProbe.ts` 记的"请求缺少 Claude Code 身份句时服务端的回法"一致,是后台服务某个轻量请求本身的形状问题。relay 不改 body,按规则原样透传、不换号,后台会话照常完成(2.1.280 实测两次出现一次)。
 - **计费归属未经 relay 单独测量**。GATE 2 真网络跑通了会话中途换号(两轮都 200、`service_tier: standard`),但几百 token 在看板的整数百分比上看不出变化。结构上与直接注入 `CLAUDE_CODE_OAUTH_TOKEN` 等价(relay 只换 Authorization,请求其余部分由真 claude 生成),这条按「结构等价」采信,未单独验证。
 - **真实的额度用满换号只在假上游上验证过**(`scripts/e2e-claude-pool.ts`)。触发一次真实的 5h 用满代价太大,判定规则照抄的是客户端自己的分类代码。
 

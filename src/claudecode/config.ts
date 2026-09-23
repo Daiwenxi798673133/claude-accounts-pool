@@ -7,9 +7,10 @@
 //
 // 【一台机器只有一个标签】—— 本机所有 claude 会话经由同一个 relay、共用同一个号(issue #83 定稿),
 // 所以不再有槽位、不再有带编号的子标签。
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { leaseCacheDir } from "../senpi/leaseCache.ts"
-import { readWorkerConfig } from "../senpi/workerConfig.ts"
+import { readWorkerConfig, workerConfigPath } from "../senpi/workerConfig.ts"
 
 // 默认端口。避开 master 的 8787 —— issue #83 的探针、e2e 的假 master 都爱用它,同机调试时撞上会让
 // relay 误以为端口被"别的程序"占着。
@@ -41,12 +42,23 @@ export function resolveBaseWorkerId(senpiWorkerId: string, stored: unknown, env:
   return `${senpiWorkerId}.cc`
 }
 
+// 这条链自己的两个字段要从【原始文件】读:readWorkerConfig 只交回 senpi 认的那三个字段。之前这里
+// 把它的返回值当成原始文件来读,于是 ccWorkerId / ccRelayPort 写进文件也从来没生效过(e2e 抓到的)。
+function rawWorkerFile(env: NodeJS.ProcessEnv): Record<string, unknown> {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(workerConfigPath(env), "utf8"))
+    return typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
 export function readPoolConfig(env: NodeJS.ProcessEnv = process.env): ClaudeCodePoolConfig | undefined {
   const base = readWorkerConfig(env)
   if (!base) return undefined
   // 同一个文件,只是多读两个字段 —— 配置手术仅追加,这里也一样:读不到就用默认,不报错。
   // 旧版写进去的 `ccSlots` 被安静地忽略:它描述的是一个已经不存在的形状,不值得为它拒绝启动。
-  const raw = base as unknown as { ccWorkerId?: unknown; ccRelayPort?: unknown }
+  const raw = rawWorkerFile(env) as { ccWorkerId?: unknown; ccRelayPort?: unknown }
   return {
     masterUrl: base.masterUrl,
     workerId: resolveBaseWorkerId(base.workerId, raw.ccWorkerId, env),
@@ -69,4 +81,12 @@ export function upstreamUrl(env: NodeJS.ProcessEnv = process.env): string {
 /** relay 的日志。它是脱离终端的后台进程,没有别的地方可写。 */
 export function relayLogPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(leaseCacheDir(env), "cc-relay.log")
+}
+
+/**
+ * make setup 的接管清单:它装了什么、改了什么,make revert 照单撤回。进程启动器也看它 ——
+ * 清单不在,就说明接管已撤回,启动器原样放行(见 launcherEnv.ts)。
+ */
+export function takeoverManifestPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(leaseCacheDir(env), "cc-takeover.json")
 }

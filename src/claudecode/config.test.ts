@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test"
-import { CC_RELAY_DEFAULT_PORT, CC_UPSTREAM_DEFAULT, parseRelayPort, relayLogPath, relayUrl, resolveBaseWorkerId, upstreamUrl } from "./config.ts"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { CC_RELAY_DEFAULT_PORT, CC_UPSTREAM_DEFAULT, parseRelayPort, readPoolConfig, relayLogPath, relayUrl, resolveBaseWorkerId, upstreamUrl } from "./config.ts"
 
 test("relay 端口:缺省、合法值、非法值一律落回默认", () => {
   expect(parseRelayPort(undefined)).toBe(CC_RELAY_DEFAULT_PORT)
@@ -47,4 +50,24 @@ test("relay 日志不与 senpi 的日志共用一个文件", () => {
   const path = relayLogPath({ CAP_LEASE_CACHE_DIR: "/box" })
   expect(path).toBe("/box/cc-relay.log")
   expect(path).not.toContain("senpi")
+})
+
+// 回归:这两个字段曾经从 readWorkerConfig 的返回值(只有 senpi 认的三个字段)里读,写进文件也不生效。
+test("ccWorkerId / ccRelayPort 从配置文件里读得到", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-config-"))
+  try {
+    writeFileSync(
+      join(dir, "senpi-worker.json"),
+      JSON.stringify({ version: 1, masterUrl: "http://m:8787", workerId: "box.senpi", ccWorkerId: "box-cc", ccRelayPort: 19123 }),
+    )
+    expect(readPoolConfig({ CAP_LEASE_CACHE_DIR: dir })).toEqual({ masterUrl: "http://m:8787", workerId: "box-cc", relayPort: 19123 })
+    // 环境变量仍然优先。
+    expect(readPoolConfig({ CAP_LEASE_CACHE_DIR: dir, CAP_CC_WORKER: "env-cc", CAP_CC_RELAY_PORT: "19999" })).toEqual({
+      masterUrl: "http://m:8787",
+      workerId: "env-cc",
+      relayPort: 19999,
+    })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
