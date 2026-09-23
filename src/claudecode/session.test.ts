@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test"
-import type { LeaseOutcome } from "../worker/leaseClient.ts"
+import type { ClaimedLease } from "./claims.ts"
 import { CLAUDE_CODE_TOKEN_VAR } from "./childEnv.ts"
 import { EXIT_BLOCKED, EXIT_NO_LEASE, horizonText, leaseFailureText, runPooledSession, type SessionDeps } from "./session.ts"
 
 const NOW = 1_700_000_000_000
-const okLease = (over: Partial<{ accountId: string; access: string; expiresAt: number }> = {}): LeaseOutcome => ({
+let released = 0
+const okLease = (over: Partial<{ accountId: string; access: string; expiresAt: number }> = {}): ClaimedLease => ({
   ok: true,
   lease: { accountId: "af008f89-1111-2222-3333-444455556666", access: "leased-token", expiresAt: NOW + 3 * 3600_000, ...over },
+  release: async () => void released++,
 })
 
 type Harness = { deps: SessionDeps; spawned: { argv: readonly string[]; env: NodeJS.ProcessEnv }[]; notices: string[]; leases: number }
@@ -76,7 +78,7 @@ test("settings 里有 apiKeyHelper 时同样拒绝,同样不发租约", async ()
 })
 
 test("租不到号:报出该变体自己的补救建议,不启动", async () => {
-  const h = harness({ lease: async () => ({ ok: false, failure: { kind: "unreachable", detail: "ECONNREFUSED" } }) })
+  const h = harness({ lease: async () => ({ ok: false, reason: "lease-failed", failure: { kind: "unreachable", detail: "ECONNREFUSED" } }) })
   const code = await runPooledSession(h.deps, [])
   expect(code).toBe(EXIT_NO_LEASE)
   expect(h.spawned).toEqual([])
@@ -159,4 +161,40 @@ test("会话的 workerId(带槽位号)随环境送给钩子", async () => {
   const h = harness({ workerId: "vince-cc.2", hookPath: "/opt/pool/hook.ts" })
   await runPooledSession(h.deps, [])
   expect(h.spawned[0].env.CLAUDE_ACCOUNTS_POOL_WORKER).toBe("vince-cc.2")
+})
+
+// 声明活到子进程结束为止,一秒都不多 —— 多出来的每一秒都是别的会话被无谓排除的一秒。
+test("子进程退出后归还账号声明", async () => {
+  released = 0
+  const h = harness()
+  await runPooledSession(h.deps, [])
+  expect(released).toBe(1)
+})
+
+test("子进程抛错(比如 claude 不存在)也要归还声明", async () => {
+  released = 0
+  const h = harness({ spawn: async () => { throw new Error("ENOENT") } })
+  await expect(runPooledSession(h.deps, [])).rejects.toThrow("ENOENT")
+  expect(released).toBe(1)
+})
+
+test("守卫拦下时没有租约,也就没有声明要还", async () => {
+  released = 0
+  const h = harness({ env: { PATH: "/usr/bin", ANTHROPIC_API_KEY: "k" } })
+  await runPooledSession(h.deps, [])
+  expect(released).toBe(0)
+})
+
+test("声明层的三种失败各有各的文案", async () => {
+  const texts = new Set<string>()
+  for (const lease of [
+    async () => ({ ok: false, reason: "lock-unavailable" }) as ClaimedLease,
+    async () => ({ ok: false, reason: "at-capacity", held: 2 }) as ClaimedLease,
+    async () => ({ ok: false, reason: "lease-failed", failure: { kind: "no-account" } }) as ClaimedLease,
+  ]) {
+    const h = harness({ lease })
+    await runPooledSession(h.deps, [])
+    texts.add(h.notices.join("\n"))
+  }
+  expect(texts.size).toBe(3)
 })

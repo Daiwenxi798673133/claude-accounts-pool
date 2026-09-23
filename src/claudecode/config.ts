@@ -12,9 +12,8 @@ import { join } from "node:path"
 import { leaseCacheDir } from "../senpi/leaseCache.ts"
 import { readWorkerConfig } from "../senpi/workerConfig.ts"
 
-// senpi 那条链的上限是 16(它的宿主只读得到 16 个编号变量)。这条链没有那个约束 —— 每个会话一个
-// 进程 —— 但并发会话数仍然该有个上限:每个会话都占着一个池子账号,而 MAX_ACCOUNT_HOLDERS 是 3,
-// 一台机器把池子占空对谁都没好处。
+// 并发会话数的上限。每个会话都占着一个池子账号,一台机器把池子占空对谁都没好处 —— 而且账号是
+// 有限的:超出池子容量的那些会话会从 master 拿到 503,上限只是让它更早、更清楚地失败。
 export const CC_MAX_SLOTS = 8
 export const CC_DEFAULT_SLOTS = 2
 
@@ -54,7 +53,13 @@ export function readPoolConfig(env: NodeJS.ProcessEnv = process.env): ClaudeCode
   }
 }
 
-/** 锁文件与 senpi 的分开:`cc-slot-*.lock`,与 `senpi-slot-*.lock` 各不相干。 */
-export function slotLockTarget(slotName: string, env: NodeJS.ProcessEnv = process.env): string {
-  return join(leaseCacheDir(env), `${slotName}.lock`)
+// 本机声明簿与它的锁。与 senpi 的文件各不相干:那边的租约会被 keeper 续期,这边的是冻结的,
+// 共用一份会让 senpi 去续期一条我们管不了的租约。
+export function claimsPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(leaseCacheDir(env), "cc-claims.json")
+}
+
+/** 一把锁,不是每个会话一把 —— 它保护的是【声明簿】这一个资源,不是某个槽位。 */
+export function claimLockTarget(env: NodeJS.ProcessEnv = process.env): string {
+  return join(leaseCacheDir(env), "cc-claims.lock")
 }

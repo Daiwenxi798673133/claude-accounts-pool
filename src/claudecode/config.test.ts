@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { CC_DEFAULT_SLOTS, CC_MAX_SLOTS, parseSlots, resolveBaseWorkerId, slotLockTarget } from "./config.ts"
+import { CC_DEFAULT_SLOTS, CC_MAX_SLOTS, claimLockTarget, claimsPath, parseSlots, resolveBaseWorkerId } from "./config.ts"
 
 test("槽位数:缺省、封顶、非法值一律落回默认", () => {
   expect(parseSlots(undefined)).toBe(CC_DEFAULT_SLOTS)
@@ -30,8 +30,17 @@ test("空字符串当作没配", () => {
   expect(resolveBaseWorkerId("base", "", { CAP_CC_WORKER: "" })).toBe("base.cc")
 })
 
-test("锁文件与 senpi 的不共用", () => {
-  const target = slotLockTarget("cc-1", { CAP_LEASE_CACHE_DIR: "/box" })
-  expect(target).toBe("/box/cc-1.lock")
-  expect(target).not.toContain("senpi")
+// 与 senpi 的文件各不相干:那边的租约会被它的 keeper adopt 并续期,这边的是冻结的。共用一份
+// 就等于让另一条链去续期一条我们管不了的租约。
+test("声明簿与锁文件都不与 senpi 共用", () => {
+  const env = { CAP_LEASE_CACHE_DIR: "/box" }
+  expect(claimsPath(env)).toBe("/box/cc-claims.json")
+  expect(claimLockTarget(env)).toBe("/box/cc-claims.lock")
+  expect(claimsPath(env)).not.toContain("senpi")
+  expect(claimLockTarget(env)).not.toContain("senpi")
+})
+
+// 一把锁保护【声明簿】这一个资源,不是每个会话一把 —— 每会话一把就等于没锁。
+test("锁只有一把,与会话无关", () => {
+  expect(claimLockTarget({ CAP_LEASE_CACHE_DIR: "/box" })).toBe(claimLockTarget({ CAP_LEASE_CACHE_DIR: "/box" }))
 })
