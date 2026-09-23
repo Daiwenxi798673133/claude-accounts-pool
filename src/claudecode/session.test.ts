@@ -152,3 +152,11 @@ test("找不到钩子脚本时照常启动", async () => {
   expect(await runPooledSession(h.deps, ["-p", "x"])).toBe(0)
   expect(h.spawned[0].argv).toEqual(["-p", "x"])
 })
+
+// 钩子必须用【发出这次租约的那个标签】上报,否则 master 收到的是一个并不持有该账号的身份 ——
+// 它的持有者账本按 workerId 键,对不上就等于在给别人记账。
+test("会话的 workerId(带槽位号)随环境送给钩子", async () => {
+  const h = harness({ workerId: "vince-cc.2", hookPath: "/opt/pool/hook.ts" })
+  await runPooledSession(h.deps, [])
+  expect(h.spawned[0].env.CLAUDE_ACCOUNTS_POOL_WORKER).toBe("vince-cc.2")
+})

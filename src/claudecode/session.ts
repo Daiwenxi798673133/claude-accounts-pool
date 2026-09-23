@@ -81,6 +81,8 @@ export type SessionDeps = {
   // composition root, so it cannot pollute a piped stdout.
   notify: (line: string) => void
   masterUrl: string
+  // 本次会话的 workerId(带槽位号)。随环境交给钩子,让限流上报用的是发出这次租约的那个标签。
+  workerId?: string
   // 限流上报钩子脚本的绝对路径,undefined 表示这次不挂(找不到脚本,或操作者自己传了 --settings)。
   hookPath?: string
   now?: () => number
@@ -127,7 +129,13 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
     return EXIT_NO_LEASE
   }
 
-  const child = buildChildEnv({ env: deps.env, access: lease.access, accountId: lease.accountId, settings })
+  const child = buildChildEnv({
+    env: deps.env,
+    access: lease.access,
+    accountId: lease.accountId,
+    workerId: deps.workerId,
+    settings,
+  })
   // Unreachable in practice — the same inputs passed the dry run above — but the type says it can
   // fail, and inventing an `as` to get past that would be the one place this lane could start an
   // unguarded session.

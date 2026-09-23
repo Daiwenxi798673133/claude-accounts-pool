@@ -180,7 +180,7 @@ try {
       last_assistant_message: "API Error",
     })
 
-  async function feedHook(payload: string) {
+  async function feedHook(payload: string, extraEnv: Record<string, string> = {}) {
     const proc = Bun.spawn(["bun", join(REPO, "claude-pool-hook.ts")], {
       cwd: box,
       env: {
@@ -188,6 +188,7 @@ try {
         HOME: box,
         CAP_LEASE_CACHE_DIR: box, // 钩子靠它找到 worker 配置,才知道 master 在哪
         CLAUDE_ACCOUNTS_POOL_ACCOUNT: ACCOUNT_ID,
+        ...extraEnv,
       },
       stdin: Buffer.from(payload),
       stdout: "pipe",
@@ -205,6 +206,15 @@ try {
     check("master 收到了限流上报", limitReports.length - before === 1, limitReports.length - before)
     check("上报的是本次会话那个账号", limitReports.at(-1)?.accountId === ACCOUNT_ID, limitReports.at(-1))
     check("上报带着这台机器的标签", limitReports.at(-1)?.workerId === "e2e-claude-pool.local", limitReports.at(-1))
+  }
+
+  console.log("S6b 钩子用【会话的】workerId 上报,而不是配置里的基名")
+  {
+    // master 的持有者账本按 workerId 键。用基名上报 = 给一个并不持有这个号的身份记账。
+    const before = limitReports.length
+    await feedHook(realPayload("rate_limit"), { CLAUDE_ACCOUNTS_POOL_WORKER: "vince-cc.3" })
+    check("上报带的是会话注进来的槽位标签", limitReports.at(-1)?.workerId === "vince-cc.3", limitReports.at(-1))
+    check("确实多了一条上报", limitReports.length - before === 1)
   }
 
   console.log("S7 钩子进程:鉴权失败【绝不】上报 —— 那会把一个额度健康的号打进冷却")
