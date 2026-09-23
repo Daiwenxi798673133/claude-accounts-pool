@@ -15,6 +15,8 @@ import properLockfile from "proper-lockfile"
 import { log } from "../logger.ts"
 import { claimLockTarget, claimsPath } from "./config.ts"
 import { leaseWithClaim, type Claim, type ClaimStore } from "./claims.ts"
+import { createPinStore, resolvePreference } from "./pin.ts"
+import type { PoolArgs } from "./args.ts"
 import { createLeaseClient } from "../worker/leaseClient.ts"
 import type { HookRunDeps } from "./hookRun.ts"
 import type { SessionDeps } from "./session.ts"
@@ -178,7 +180,9 @@ export function createSessionDeps(
   env: NodeJS.ProcessEnv,
   cwd: string,
   maxSessions: number,
+  poolArgs: Pick<PoolArgs, "accountPrefix" | "pin"> = {},
 ): SessionDeps {
+  const pinStore = createPinStore(env)
   const client = createLeaseClient({ fetchImpl: fetch, sleep, masterUrl: cfg.masterUrl, workerId: cfg.workerId })
   return {
     // ATTEMPTS: 1, not the default ladder. An operator is sitting at a prompt waiting for a session to
@@ -190,7 +194,17 @@ export function createSessionDeps(
       leaseWithClaim({
         withLock: createClaimLock(env),
         store: createClaimStore(env),
-        lease: (excludeAccountIds) => client.lease({ reason: "prelease", attempts: 1, excludeAccountIds }),
+        lease: (input) => client.lease({ reason: "prelease", attempts: 1, ...input }),
+        // 点名在临界区【里面】算:要点的那个是不是已被本机另一个会话占着,只有拿到活声明才知道。
+        preferenceFor: (heldAccountIds) =>
+          resolvePreference({
+            cliPrefix: poolArgs.accountPrefix,
+            cliPin: poolArgs.pin,
+            storedPin: pinStore.read(),
+            heldAccountIds,
+          }),
+        // master 明说不服务这个账号时交还钉住 —— 唯一允许放弃它的那条路径(与 src/worker/pin.ts 同规矩)。
+        onPreferenceRefused: () => pinStore.write(undefined),
         maxSessions,
         pid: process.pid,
         // process.kill(pid, 0) 不发信号,只做存在性检查;拿不到权限(EPERM)说明进程确实在,算活着。

@@ -18,6 +18,7 @@
 // 把这台机器上所有的启动都堵死。
 import type { LeaseFailure, LeaseOutcome } from "../worker/leaseClient.ts"
 import { log } from "../logger.ts"
+import type { Preference } from "./pin.ts"
 
 export type Claim = {
   accountId: string
@@ -44,18 +45,34 @@ export function liveClaims(
 }
 
 export type ClaimedLease =
-  | { ok: true; lease: { accountId: string; access: string; expiresAt: number }; release: () => Promise<void> }
+  | {
+      ok: true
+      lease: { accountId: string; access: string; expiresAt: number }
+      release: () => Promise<void>
+      // "想点名但这次点不成"的那句话,由调用方转达给操作者。
+      notice?: string
+    }
   | { ok: false; reason: "lock-unavailable" }
   | { ok: false; reason: "at-capacity"; held: number }
-  | { ok: false; reason: "lease-failed"; failure: LeaseFailure }
+  | { ok: false; reason: "lease-failed"; failure: LeaseFailure; notice?: string }
 
 export type ClaimedLeaseDeps = {
   // 有界等待的机器级锁。undefined = 等不到 —— 调用方必须当成失败,绝不能绕过它去租号:
   // 不在锁里租号正是本模块存在要防的那件事。
   withLock: <T>(fn: () => Promise<T>) => Promise<T | undefined>
   store: ClaimStore
-  // 已绑定 workerId 的租号动词。excludeAccountIds 由本模块在临界区内算出来。
-  lease: (excludeAccountIds: readonly string[]) => Promise<LeaseOutcome>
+  // 已绑定 workerId 的租号动词。排除集与点名都由本模块在临界区内算出来。
+  lease: (input: {
+    excludeAccountIds: readonly string[]
+    preferredAccountIdPrefix?: string
+    pinned?: boolean
+  }) => Promise<LeaseOutcome>
+  // 点名哪个账号 —— 必须在临界区【里面】算,因为"要点的那个是不是已被本机另一个会话占着"
+  // 只有拿到活声明才知道。放在外面算就会在并发下同时对 master 说"别给我这个"和"就要这个"。
+  preferenceFor?: (heldAccountIds: readonly string[]) => Preference
+  // master 明说不服务被点名的账号时调用。钉住必须在这里交还 —— 否则每次启动都点它、每次被拒、
+  // 每次白跑一趟往返,而操作者早就被告知过它不可用。
+  onPreferenceRefused?: () => void
   maxSessions: number
   pid: number
   isAlive: (pid: number) => boolean
@@ -76,10 +93,18 @@ export async function leaseWithClaim(deps: ClaimedLeaseDeps): Promise<ClaimedLea
 
     // 3. 带着排除集去租。master 的 fewestHolders 对我们这个标签只看得见一条,所以"别给我这些号"
     //    必须由我们自己说出口。
-    const outcome = await deps.lease(live.map((claim) => claim.accountId))
+    const held = live.map((claim) => claim.accountId)
+    const preference = deps.preferenceFor?.(held) ?? {}
+    const outcome = await deps.lease({
+      excludeAccountIds: held,
+      ...(preference.prefix === undefined ? {} : { preferredAccountIdPrefix: preference.prefix, pinned: preference.pinned }),
+    })
     if (!outcome.ok) {
+      // 被点名的账号不可用(冷却中/需重登/已满员/前缀不唯一),master 明说了。绝不替换成别的:
+      // 操作者的用量归属依赖"我要的就是我拿到的"(与 src/worker/manualSwitch.ts 同一条规矩)。
+      if (outcome.failure.kind === "refused" && preference.prefix !== undefined) deps.onPreferenceRefused?.()
       deps.store.write(live) // 顺手把回收结果落盘;失败不写任何新声明,别毒化账本
-      return { ok: false, reason: "lease-failed", failure: outcome.failure }
+      return { ok: false, reason: "lease-failed", failure: outcome.failure, notice: preference.notice }
     }
 
     // 4. 声明与租号在同一个临界区内完成 —— 这一整段就是防惊群的全部。
@@ -90,6 +115,7 @@ export async function leaseWithClaim(deps: ClaimedLeaseDeps): Promise<ClaimedLea
     return {
       ok: true,
       lease: outcome.lease,
+      notice: preference.notice,
       // 撤销也必须在锁里做,否则它会与另一个会话的"读-改-写"互相覆盖。
       release: async () => {
         await deps.withLock(async () => {

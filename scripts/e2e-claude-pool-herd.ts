@@ -39,9 +39,10 @@ exit 0
   { mode: 0o755 },
 )
 
-type LeaseSeen = { workerId: string; excludes: string[] }
+type LeaseSeen = { workerId: string; excludes: string[]; preferred?: string; pinned?: boolean }
 let poolSize = 12
 let leaseDelayMs = 0
+let refuseNamed = false
 const seen: LeaseSeen[] = []
 const server = Bun.serve({
   port: 0,
@@ -49,11 +50,28 @@ const server = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url)
     if (url.pathname !== CLOUD_ROUTES.lease || req.method !== "POST") return new Response("nope", { status: 404 })
-    const body = (await req.json()) as { workerId?: string; excludeAccountIds?: string[] }
+    const body = (await req.json()) as {
+      workerId?: string
+      excludeAccountIds?: string[]
+      preferredAccountIdPrefix?: string
+      pinned?: boolean
+    }
     const excludes = body.excludeAccountIds ?? []
-    seen.push({ workerId: String(body.workerId), excludes: [...excludes] })
+    seen.push({
+      workerId: String(body.workerId),
+      excludes: [...excludes],
+      preferred: body.preferredAccountIdPrefix,
+      pinned: body.pinned,
+    })
     if (leaseDelayMs > 0) await Bun.sleep(leaseDelayMs)
     const pool = Array.from({ length: poolSize }, (_, i) => `acc${String(i).padStart(2, "0")}-0000-0000-0000-00000000`)
+    // 点名:服务它,或者按 refuseNamed 明确拒绝。绝不替换成别的 —— 与真 master 同一条规矩。
+    if (body.preferredAccountIdPrefix !== undefined) {
+      if (refuseNamed) return Response.json({ error: "cooling", refused: "cooling" }, { status: 409 })
+      const named = pool.find((id) => id.startsWith(String(body.preferredAccountIdPrefix)))
+      if (!named) return Response.json({ error: "unknown account", refused: "unknown" }, { status: 409 })
+      return Response.json({ accountId: named, access: `FAKE-${named}`, expiresAt: Date.now() + 3 * 3600_000 })
+    }
     const pick = pool.find((id) => !excludes.includes(id))
     // 503 = 池子没有可用账号。排除集把池子吃光时,master 就是这么答的。
     if (!pick) return Response.json({ error: "no account available" }, { status: 503 })
@@ -66,9 +84,9 @@ writeFileSync(
 )
 
 type Launch = { proc: Bun.Subprocess; tag: string }
-function launch(slots: number, index: number): Launch {
+function launch(slots: number, index: number, poolFlags: string[] = []): Launch {
   const tag = join(box, `tag-${index}-${Math.random().toString(36).slice(2, 8)}`)
-  const proc = Bun.spawn(["bun", join(REPO, "claude-pool.ts")], {
+  const proc = Bun.spawn(["bun", join(REPO, "claude-pool.ts"), ...poolFlags, "-p", "ignored"], {
     cwd: box,
     env: {
       PATH: process.env.PATH ?? "",
@@ -221,6 +239,71 @@ try {
     }
     check("十轮全部正常,每轮结束声明簿都是空的", ok)
   }
+  console.log("S7 点名与钉住")
+  {
+    seen.length = 0
+    const pinFile = join(box, "cc-pin.json")
+
+    // 一次性点名:pinned 必须是 false —— 那正是「一次 enter 切号」与「p 钉住」的区别
+    const once = launch(2, 700, ["--pool-account", "acc03"])
+    await waitUntil(() => identity(once.tag) !== undefined, 60_000)
+    check("点名的号被服务了", accountOf(once.tag)?.startsWith("acc03") === true, accountOf(once.tag))
+    check("一次性点名 pinned=false", seen.at(-1)?.pinned === false, seen.at(-1))
+    check("一次性点名不写钉住文件", !existsSync(pinFile))
+    await stopAll([once])
+
+    // 钉住:pinned=true 且落盘
+    const pinned = launch(2, 701, ["--pool-account", "acc05", "--pool-pin"])
+    await waitUntil(() => identity(pinned.tag) !== undefined, 60_000)
+    check("钉住时 pinned=true", seen.at(-1)?.pinned === true, seen.at(-1))
+    check("钉住落了盘", existsSync(pinFile))
+    await stopAll([pinned])
+
+    // 下一次不带任何参数,应当自动点名钉住的那个
+    const inherited = launch(2, 702)
+    await waitUntil(() => identity(inherited.tag) !== undefined, 60_000)
+    check("下次启动自动点名钉住的号", seen.at(-1)?.preferred === "acc05", seen.at(-1))
+    check("拿到的确实是它", accountOf(inherited.tag)?.startsWith("acc05") === true, accountOf(inherited.tag))
+
+    // 钉住的号正被这个会话占着时,另一个会话退回排名派号 —— 点名与排除集矛盾,本机自己化解
+    const second = launch(2, 703)
+    await waitUntil(() => identity(second.tag) !== undefined, 60_000)
+    check("被占着时不点名", seen.at(-1)?.preferred === undefined, seen.at(-1))
+    check("退回排名派号,拿到别的号", accountOf(second.tag)?.startsWith("acc05") === false, accountOf(second.tag))
+    // 先停再读 stderr:读到 EOF 需要进程退出,而进程退出需要 STOP 文件 —— 顺序反了就是死锁,
+    // 这个脚本第一版就是这么挂住的。
+    await stopAll([inherited, second])
+    const secondErr = await new Response(second.proc.stderr).text()
+    check("说清楚了为什么没用钉住的号", secondErr.includes("另一个会话占着"), secondErr.trim())
+    check("钉住没有因此丢失", existsSync(pinFile))
+
+    // master 拒绝被点名的账号:钉住必须交还,否则每次启动都白跑一趟往返
+    refuseNamed = true
+    const refused = launch(2, 704)
+    const refusedCode = await refused.proc.exited
+    const refusedErr = await new Response(refused.proc.stderr).text()
+    refuseNamed = false
+    check("被拒时不启动", refusedCode === 75, refusedCode)
+    check("报的是该拒绝变体自己的文案", refusedErr.includes("冷却"), refusedErr.trim())
+    check("钉住被交还了", !existsSync(pinFile) || readFileSync(pinFile, "utf8").includes("null"), readFileSync(pinFile, "utf8"))
+
+    // 取消钉住之后不再点名
+    const unpin = launch(2, 705, ["--pool-unpin"])
+    await waitUntil(() => identity(unpin.tag) !== undefined, 60_000)
+    check("取消钉住后不再点名", seen.at(-1)?.preferred === undefined, seen.at(-1))
+    await stopAll([unpin])
+
+    // 用法错误当场挡住
+    const bad = Bun.spawn(["bun", join(REPO, "claude-pool.ts"), "--pool-pin"], {
+      cwd: box,
+      env: { PATH: process.env.PATH ?? "", HOME: box, CAP_LEASE_CACHE_DIR: box, CAP_CC_WORKER: "vince-cc", CLAUDE_BIN: fakeClaude },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const badErr = await new Response(bad.stderr).text()
+    check("--pool-pin 单独出现被挡住", (await bad.exited) === 78 && badErr.includes("必须配"), badErr.trim())
+  }
+
 } finally {
   writeFileSync(STOP, "1")
   server.stop(true)

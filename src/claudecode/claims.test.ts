@@ -29,15 +29,24 @@ function serialLock() {
 function harness(over: Partial<ClaimedLeaseDeps> & { initial?: Claim[]; accounts?: string[] } = {}) {
   let book: Claim[] = over.initial ?? []
   const excludesSeen: string[][] = []
+  const leaseInputs: { preferredAccountIdPrefix?: string; pinned?: boolean }[] = []
   const accounts = over.accounts ?? ["acc-a", "acc-b", "acc-c", "acc-d"]
   let served = 0
   const lock = serialLock()
   const deps: ClaimedLeaseDeps = {
     withLock: lock.withLock,
     store: { read: () => [...book], write: (next) => void (book = [...next]) },
-    lease: async (excludeAccountIds): Promise<LeaseOutcome> => {
+    lease: async ({ excludeAccountIds, preferredAccountIdPrefix, pinned }): Promise<LeaseOutcome> => {
       excludesSeen.push([...excludeAccountIds])
-      // 假 master:发第一个没被排除的号 —— 于是"排除集算错了"会立刻表现成"两个会话拿到同一个号"
+      leaseInputs.push({ preferredAccountIdPrefix, pinned })
+      // 假 master:点名的优先(点不到就 409),否则发第一个没被排除的号 —— 于是"排除集算错了"
+      // 会立刻表现成"两个会话拿到同一个号"
+      if (preferredAccountIdPrefix !== undefined) {
+        const named = accounts.find((id) => id.startsWith(preferredAccountIdPrefix))
+        if (!named) return { ok: false, failure: { kind: "refused", refused: "unknown" } }
+        served++
+        return { ok: true, lease: { accountId: named, access: `tok-${served}`, expiresAt: NOW + 3 * HOUR } }
+      }
       const pick = accounts.find((id) => !excludeAccountIds.includes(id))
       if (!pick) return { ok: false, failure: { kind: "no-account" } }
       served++
@@ -49,7 +58,7 @@ function harness(over: Partial<ClaimedLeaseDeps> & { initial?: Claim[]; accounts
     now: () => NOW,
     ...over,
   }
-  return { deps, book: () => book, excludesSeen, lock }
+  return { deps, book: () => book, excludesSeen, leaseInputs, lock }
 }
 
 test("空机器:排除集为空,拿到号后写进声明簿", async () => {
@@ -171,4 +180,53 @@ test("liveClaims 两个条件都生效", () => {
     { accountId: "c", pid: 3, expiresAt: NOW + HOUR },
   ]
   expect(liveClaims(claims, NOW, (pid) => pid !== 3).map((c) => c.accountId)).toEqual(["a"])
+})
+
+test("点名:preferredAccountIdPrefix 与 pinned 一起发出去", async () => {
+  const h = harness({ preferenceFor: () => ({ prefix: "acc-c", pinned: true }) })
+  const result = await leaseWithClaim(h.deps)
+  expect(result.ok && result.lease.accountId).toBe("acc-c")
+  expect(h.leaseInputs[0]).toEqual({ preferredAccountIdPrefix: "acc-c", pinned: true })
+})
+
+// 点名必须在临界区【里面】算:要点的那个是不是已被本机另一个会话占着,只有拿到活声明才知道。
+test("点名的计算能看见本机活声明", async () => {
+  let seenHeld: readonly string[] = []
+  const h = harness({
+    initial: [{ accountId: "acc-a", pid: 7, expiresAt: NOW + HOUR }],
+    preferenceFor: (held) => {
+      seenHeld = held
+      return {}
+    },
+  })
+  await leaseWithClaim(h.deps)
+  expect(seenHeld).toEqual(["acc-a"])
+})
+
+// 钉住必须在这里交还,否则每次启动都点它、每次被拒、每次白跑一趟往返。
+test("master 拒绝被点名的账号:回调触发,让调用方把钉住交还", async () => {
+  let refused = 0
+  const h = harness({
+    preferenceFor: () => ({ prefix: "acc-zzz", pinned: true }),
+    onPreferenceRefused: () => void refused++,
+  })
+  const result = await leaseWithClaim(h.deps)
+  expect(result.ok).toBe(false)
+  expect(refused).toBe(1)
+})
+
+test("没点名时的普通失败不会误触发交还钉住", async () => {
+  let refused = 0
+  const h = harness({
+    lease: async () => ({ ok: false, failure: { kind: "refused", refused: "cooling" } }),
+    onPreferenceRefused: () => void refused++,
+  })
+  await leaseWithClaim(h.deps)
+  expect(refused).toBe(0)
+})
+
+test("「这次点不成」的那句话随结果带出去", async () => {
+  const h = harness({ preferenceFor: () => ({ notice: "被本机另一个会话占着" }) })
+  const result = await leaseWithClaim(h.deps)
+  expect(result.ok && result.notice).toBe("被本机另一个会话占着")
 })
