@@ -10,7 +10,8 @@
 // The cost is stated to the operator up front rather than discovered at hour four: a lease's horizon
 // is bounded by MASTER_REFRESH_THRESHOLD_MS, so a session outliving it dies on a 401 that nothing in
 // this lane can heal. Printing the remaining time is the only honest thing available.
-import type { LeaseFailure, LeaseOutcome } from "../worker/leaseClient.ts"
+import type { LeaseFailure } from "../worker/leaseClient.ts"
+import type { ClaimedLease } from "./claims.ts"
 import type { LeaseRefusal } from "../cloud/protocol.ts"
 import { buildChildEnv, POOL_SESSION_SENTINEL, type Blocker } from "./childEnv.ts"
 import { printModeNotice, withHookSettings } from "./hookSettings.ts"
@@ -54,6 +55,19 @@ export function leaseFailureText(failure: LeaseFailure, masterUrl: string): stri
   }
 }
 
+// 声明层的失败与租约层的失败分开成文案,理由与全仓其它按变体建的表一致:三种失败的补救动作
+// 完全不同 —— 等一会、关掉一个会话、去看 master —— 合并成一句"租不到号"就把它们全丢了。
+export function claimedLeaseText(result: Extract<ClaimedLease, { ok: false }>, masterUrl: string): string {
+  switch (result.reason) {
+    case "lock-unavailable":
+      return "拿不到本机的账号声明锁(另一个会话正在启动,或上一个崩在了临界区里)。稍等几秒重试。"
+    case "at-capacity":
+      return `这台机器已经有 ${result.held} 个池子会话在跑,到上限了。关掉一个,或调大 ccSlots。`
+    case "lease-failed":
+      return leaseFailureText(result.failure, masterUrl)
+  }
+}
+
 export function blockerText(blockers: readonly Blocker[]): string {
   const lines = blockers.map((b) => `  · ${b.remedy}`)
   return ["没有启动 claude:这台机器上有优先级更高的凭证,池子租约会被无声忽略。", ...lines].join("\n")
@@ -68,8 +82,9 @@ export function horizonText(expiresAt: number, now: number): string {
 }
 
 export type SessionDeps = {
-  // The lease verb, already bound to a master and a workerId by the composition root.
-  lease: () => Promise<LeaseOutcome>
+  // 领租约,并把"本机已占哪些号"的排除集与声明写在同一个临界区里(见 claims.ts)。返回的 release
+  // 由本模块在子进程退出后调用 —— 租约的生命周期与会话的生命周期是同一件事,所以它归这里管。
+  lease: () => Promise<ClaimedLease>
   // Runs the child and resolves with ITS exit code. Injected rather than imported so a test never
   // spawns a real `claude`, and so the composition root owns the stdio decision (inherit).
   spawn: (input: { argv: readonly string[]; env: NodeJS.ProcessEnv }) => Promise<number>
@@ -113,12 +128,12 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
     return EXIT_BLOCKED
   }
 
-  const outcome = await deps.lease()
-  if (!outcome.ok) {
-    deps.notify(leaseFailureText(outcome.failure, deps.masterUrl))
+  const claimed = await deps.lease()
+  if (!claimed.ok) {
+    deps.notify(claimedLeaseText(claimed, deps.masterUrl))
     return EXIT_NO_LEASE
   }
-  const lease = outcome.lease
+  const lease = claimed.lease
 
   // FAIL-SAFE, matching the repo's "过期就什么都不写" shape. The master will not serve a spent
   // horizon, so reaching here means something is wrong between the two clocks — and starting a
@@ -126,6 +141,7 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
   const remaining = lease.expiresAt - now()
   if (remaining <= 0) {
     deps.notify(`master 发回的租约已经过期(账号 ${lease.accountId.slice(0, 8)})。不启动。两端时钟可能不同步。`)
+    await claimed.release()
     return EXIT_NO_LEASE
   }
 
@@ -141,6 +157,7 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
   // unguarded session.
   if (!child.ok) {
     deps.notify(blockerText(child.blockers))
+    await claimed.release()
     return EXIT_BLOCKED
   }
 
@@ -157,5 +174,12 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
     const printNotice = printModeNotice(argv)
     if (printNotice !== undefined) deps.notify(`账号池:${printNotice}`)
   }
-  return deps.spawn({ argv: hooked.argv, env: child.env })
+
+  // 声明活到子进程结束为止,一秒都不多 —— 多出来的每一秒都是别的会话被无谓排除的一秒。
+  // finally 而不是顺序执行:子进程抛错(可执行文件不存在之类)同样要还回声明。
+  try {
+    return await deps.spawn({ argv: hooked.argv, env: child.env })
+  } finally {
+    await claimed.release().catch(() => {})
+  }
 }
