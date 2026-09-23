@@ -11,7 +11,7 @@
 //   3) 绝不打真 master / Anthropic —— 两者都是本进程里的假服务。
 //
 //   bun scripts/e2e-cc-takeover.ts    # 全部通过打印 E2E PASS 并 exit 0
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -111,6 +111,8 @@ const baseEnv = (extra: Record<string, string> = {}): Record<string, string> => 
   CAP_CC_RELAY_PORT: String(port),
   CAP_CC_UPSTREAM: `http://127.0.0.1:${upstream.port}`,
   CAP_CC_TAKEOVER_NO_LAUNCHD: "1",
+  // 本脚本就跑在 worktree 里;生产上 setup 拒绝在 worktree 里跑(worktree 合并后会被删掉)。
+  CAP_CC_TAKEOVER_ALLOW_WORKTREE: "1",
   ...extra,
 })
 
@@ -250,6 +252,75 @@ try {
     const back = await takeover("revert")
     check("revert 成功", back.code === 0, back.stderr)
     check("池子配置还原成 setup 之前", JSON.stringify(readJson(WORKER)) === JSON.stringify(senpi), readJson(WORKER))
+    rmSync(WORKER)
+  }
+
+  console.log("T10 settings 的 env 块里有盖过租约的变量:setup 拒绝,什么都不写")
+  {
+    writeFileSync(SETTINGS, JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://gw.internal" } }, null, 2))
+    const r = await takeover("setup", "--master", MASTER, "--worker", "e2e-box")
+    check("退出码 1", r.code === 1, r)
+    check("文案指向 settings 的 env 块", r.stderr.includes("env 块") && r.stderr.includes("ANTHROPIC_BASE_URL"), r.stderr)
+    check("没有清单", !existsSync(MANIFEST))
+    writeFileSync(SETTINGS, `${JSON.stringify(ORIGINAL_SETTINGS, null, 2)}\n`)
+  }
+
+  console.log("T11 .zshrc 是 symlink(dotfiles 仓库):写穿到目标,symlink 保留")
+  {
+    const dotfiles = join(box, "dotfiles")
+    mkdirSync(dotfiles)
+    const target = join(dotfiles, "zshrc")
+    writeFileSync(target, ORIGINAL_ZSHRC)
+    rmSync(ZSHRC)
+    symlinkSync(target, ZSHRC)
+    const r = await takeover("setup", "--master", MASTER, "--worker", "e2e-box")
+    check("setup 成功", r.code === 0, r.stderr)
+    check(".zshrc 仍是 symlink", lstatSync(ZSHRC).isSymbolicLink())
+    check("PATH 段写进了 dotfiles 里的目标文件", readFileSync(target, "utf8").includes(">>> claude-accounts-pool"))
+    const back = await takeover("revert")
+    check("revert 成功", back.code === 0, back.stderr)
+    check("撤回后仍是 symlink,目标文件回到原文", lstatSync(ZSHRC).isSymbolicLink() && readFileSync(target, "utf8") === ORIGINAL_ZSHRC)
+    rmSync(ZSHRC)
+    writeFileSync(ZSHRC, ORIGINAL_ZSHRC)
+  }
+
+  console.log("T12 macOS 上只有 .profile 的 bash 用户:写进 .profile,绝不新建 .bash_profile 把它遮住")
+  if (process.platform === "darwin") {
+    const profile = join(home, ".profile")
+    const original = 'export MYVAR=keep\n'
+    writeFileSync(profile, original)
+    const r = await run(["bun", join(REPO, "scripts", "cc-takeover.ts"), "setup", "--master", MASTER, "--worker", "e2e-box"], { SHELL: "/bin/bash" })
+    check("setup 成功", r.code === 0, r.stderr)
+    check("没有新建 .bash_profile", !existsSync(join(home, ".bash_profile")))
+    check("PATH 段进了 .profile,原内容保留", readFileSync(profile, "utf8").startsWith(original) && readFileSync(profile, "utf8").includes(">>> claude-accounts-pool"))
+    const back = await run(["bun", join(REPO, "scripts", "cc-takeover.ts"), "revert"], { SHELL: "/bin/bash" })
+    check("revert 成功", back.code === 0, back.stderr)
+    check(".profile 回到原文", readFileSync(profile, "utf8") === original)
+    rmSync(profile)
+  }
+
+  console.log("T13 bash 用户什么启动文件都没有:新建 .bash_profile,撤回后删掉而不是留个空壳")
+  if (process.platform === "darwin") {
+    const r = await run(["bun", join(REPO, "scripts", "cc-takeover.ts"), "setup", "--master", MASTER, "--worker", "e2e-box"], { SHELL: "/bin/bash" })
+    check("setup 成功", r.code === 0, r.stderr)
+    check("新建了 .bash_profile", existsSync(join(home, ".bash_profile")))
+    const back = await run(["bun", join(REPO, "scripts", "cc-takeover.ts"), "revert"], { SHELL: "/bin/bash" })
+    check("revert 成功", back.code === 0, back.stderr)
+    check(".bash_profile 被删掉", !existsSync(join(home, ".bash_profile")))
+  }
+
+  console.log("T14 PATH 里转发脚本目录换一种拼法(带尾斜杠):重跑 setup 不会把转发脚本当成真 claude")
+  {
+    const first = await takeover("setup", "--master", MASTER, "--worker", "e2e-box")
+    check("第一次 setup 成功", first.code === 0, first.stderr)
+    const again = await run(["bun", join(REPO, "scripts", "cc-takeover.ts"), "setup", "--master", MASTER, "--worker", "e2e-box"], {
+      PATH: [`${BIN}/`, realBin, dirname(process.execPath), "/usr/bin", "/bin"].join(":"),
+    })
+    check("重跑成功", again.code === 0, again.stderr)
+    const shim = readFileSync(join(BIN, "claude"), "utf8")
+    check("转发脚本仍指向真 claude,而不是它自己", shim.includes(`'${fakeClaude}'`) && !shim.includes(`'${BIN}/claude'`), shim)
+    const back = await takeover("revert")
+    check("revert 成功", back.code === 0, back.stderr)
   }
 } finally {
   const h = await relayHealth()

@@ -9,11 +9,15 @@
 .PHONY: setup revert status
 
 BUN := $(shell command -v bun 2>/dev/null)
+# 只认命令行上给的 MASTER / WORKER:make 默认也会从环境变量里取同名值,而 MASTER 这种名字很可能
+# 被别的东西用着 —— 那样 setup 会一声不响地拿它去配池子。
+MASTER_ARG := $(if $(filter command line,$(origin MASTER)),$(MASTER))
+WORKER_ARG := $(if $(filter command line,$(origin WORKER)),$(WORKER))
 
 setup:
 	@if [ -z "$(BUN)" ]; then echo "需要 bun:curl -fsSL https://bun.sh/install | bash" >&2; exit 1; fi
 	@if [ ! -d node_modules ]; then "$(BUN)" install >/dev/null || exit 1; fi
-	@"$(BUN)" scripts/cc-takeover.ts setup --master "$(MASTER)" --worker "$(WORKER)"
+	@"$(BUN)" scripts/cc-takeover.ts setup --master "$(MASTER_ARG)" --worker "$(WORKER_ARG)"
 
 revert:
 	@if [ -z "$(BUN)" ]; then \

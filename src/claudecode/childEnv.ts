@@ -96,18 +96,33 @@ export function envBlockers(env: NodeJS.ProcessEnv, ownRelayUrl?: string): Block
 //
 // Takes the PARSED settings object, not a path: reading and locating settings files is IO the caller
 // owns, and this module stays a pure function of what it was handed.
-export function settingsBlockers(settings: unknown): Blocker[] {
+//
+// THE SETTINGS `env` BLOCK COUNTS TOO. Claude Code applies it to its own process after whatever started
+// it — so an ANTHROPIC_BASE_URL there overrides the relay we inject (the leased token goes to that
+// gateway), and an ANTHROPIC_API_KEY or CLAUDE_CODE_USE_* there bills somewhere the pool never leased.
+// Same table as the process environment, different remedy: the fix is an edit to a file, not `unset`.
+export function settingsBlockers(settings: unknown, ownRelayUrl?: string): Blocker[] {
   if (typeof settings !== "object" || settings === null) return []
+  const found: Blocker[] = []
   const helper = (settings as Record<string, unknown>).apiKeyHelper
-  if (typeof helper !== "string" || helper.length === 0) return []
-  return [
-    {
+  if (typeof helper === "string" && helper.length > 0) {
+    found.push({
       varName: "apiKeyHelper",
       remedy:
         "settings.json 里配了 apiKeyHelper,它的优先级高于池子租约,而且那条车道不带 oauth-2025-04-20、服务端会 401。" +
         "把它从 settings.json 里去掉再试。",
-    },
-  ]
+    })
+  }
+  const env = (settings as Record<string, unknown>).env
+  if (typeof env === "object" && env !== null) {
+    for (const varName of Object.keys(ENV_BLOCKERS)) {
+      const value = (env as Record<string, unknown>)[varName]
+      if (typeof value !== "string" || value.length === 0) continue
+      if (varName === RELAY_URL_VAR && value === ownRelayUrl) continue
+      found.push({ varName: `env.${varName}`, remedy: `settings.json 的 env 块里设了 ${varName},它会盖过池子租约。把它从 env 里去掉再试。` })
+    }
+  }
+  return found
 }
 
 export type ChildEnvInput = {
@@ -136,7 +151,7 @@ export type ChildEnvOutcome =
 // hand-written hook and MCP server that reads them. The pool's business is the credential; everything
 // else on that command line is theirs.
 export function buildChildEnv(input: ChildEnvInput): ChildEnvOutcome {
-  const blockers = [...envBlockers(input.env, input.relayUrl), ...settingsBlockers(input.settings)]
+  const blockers = [...envBlockers(input.env, input.relayUrl), ...settingsBlockers(input.settings, input.relayUrl)]
   if (blockers.length > 0) return { ok: false, blockers }
   return {
     ok: true,

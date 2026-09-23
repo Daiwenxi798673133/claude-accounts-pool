@@ -57,9 +57,12 @@ export async function readSettings(env: NodeJS.ProcessEnv, cwd: string): Promise
     try {
       const parsed = JSON.parse(text) as Record<string, unknown>
       // Only the keys this lane judges. Merging whole files would invent a settings-precedence model
-      // this module has no business owning.
+      // this module has no business owning — a blocker found in ANY of them is reported.
       if (typeof parsed.apiKeyHelper === "string" && parsed.apiKeyHelper.length > 0) {
         merged.apiKeyHelper = parsed.apiKeyHelper
+      }
+      if (typeof parsed.env === "object" && parsed.env !== null && !Array.isArray(parsed.env)) {
+        merged.env = { ...((merged.env as Record<string, unknown> | undefined) ?? {}), ...(parsed.env as Record<string, unknown>) }
       }
     } catch (error) {
       log.warn("claudecode:settings-unparseable", { path, error: error instanceof Error ? error.message : String(error) })

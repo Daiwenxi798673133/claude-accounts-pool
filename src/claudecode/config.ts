@@ -9,6 +9,7 @@
 // 所以不再有槽位、不再有带编号的子标签。
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
+import { isWorkerLabel } from "../cloud/protocol.ts"
 import { leaseCacheDir } from "../senpi/leaseCache.ts"
 import { readWorkerConfig, workerConfigPath } from "../senpi/workerConfig.ts"
 
@@ -38,7 +39,9 @@ export function parseRelayPort(raw: string | number | undefined): number {
 export function resolveBaseWorkerId(senpiWorkerId: string, stored: unknown, env: NodeJS.ProcessEnv): string {
   const fromEnv = env.CAP_CC_WORKER
   if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv
-  if (typeof stored === "string" && stored.length > 0) return stored
+  // 手改出错的标签(空格、超长)不采用:master 会对它的每一次租约回 400,每个会话都起不来。
+  // 回到推导出的默认值,至少能跑。
+  if (typeof stored === "string" && isWorkerLabel(stored)) return stored
   return `${senpiWorkerId}.cc`
 }
 

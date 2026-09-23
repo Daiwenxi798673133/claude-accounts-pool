@@ -14,7 +14,7 @@
 //
 // 设计依据:issue #93;启动器契约见 code.claude.com/docs/en/corporate-launcher。
 import { spawnSync } from "node:child_process"
-import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs"
+import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { delimiter, dirname, join } from "node:path"
 import { createInterface } from "node:readline/promises"
@@ -55,7 +55,9 @@ const EXIT_USAGE = 2
 
 const env = process.env
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)))
-const BUN = process.execPath
+// PATH 上的那个 bun,而不是 process.execPath:后者是解析过 symlink 的真实路径,Homebrew / mise 装的
+// bun 会带着版本号(Cellar/bun/1.x/bin/bun),brew upgrade 之后启动器与常驻 relay 就一起找不到它了。
+const BUN = Bun.which("bun") ?? process.execPath
 const HOME = env.HOME && env.HOME.length > 0 ? env.HOME : homedir()
 const POOL_DIR = leaseCacheDir(env)
 const BIN_DIR = join(POOL_DIR, "bin")
@@ -70,13 +72,31 @@ const AGENT_PLIST = join(HOME, "Library", "LaunchAgents", `${RELAY_AGENT_LABEL}.
 // 只在 macOS 上用 launchd;CAP_CC_TAKEOVER_NO_LAUNCHD=1 只给测试用(沙箱 HOME 里不能往真 launchd 装任务)。
 const USE_LAUNCHD = process.platform === "darwin" && env.CAP_CC_TAKEOVER_NO_LAUNCHD !== "1"
 
+// 生成的转发脚本里的一句注释,用来在 PATH 上认出它(见 isOurShim)。与 renderClaudeShim 的第二行对应。
+const SHIM_MARKER = "终端里手敲的 claude 经由账号池的启动器"
+
+// setup 时生效的 CAP_* 覆盖,抄进 launchd 任务。CAP_CC_TAKEOVER_* 只管 setup 自己,不抄。
+function capOverrides(source: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [name, value] of Object.entries(source)) {
+    if (name.startsWith("CAP_") && !name.startsWith("CAP_CC_TAKEOVER_") && typeof value === "string" && value.length > 0) out[name] = value
+  }
+  return out
+}
+
 const say = (line = ""): void => void process.stdout.write(`${line}\n`)
 const warn = (line: string): void => void process.stderr.write(`${line}\n`)
 
+// 登录 shell 实际会读的那个文件。bash 登录 shell 只读 .bash_profile / .bash_login / .profile 里【第一个
+// 存在的】—— 在只有 .profile 的机器上新建 .bash_profile,会让 .profile 里的全部配置从此不再生效。
 function shellRcPath(): string {
   const shell = env.SHELL ?? ""
   if (shell.endsWith("zsh")) return join(env.ZDOTDIR && env.ZDOTDIR.length > 0 ? env.ZDOTDIR : HOME, ".zshrc")
-  if (shell.endsWith("bash")) return join(HOME, process.platform === "darwin" ? ".bash_profile" : ".bashrc")
+  if (shell.endsWith("bash")) {
+    if (process.platform !== "darwin") return join(HOME, ".bashrc")
+    const candidates = [".bash_profile", ".bash_login", ".profile"].map((name) => join(HOME, name))
+    return candidates.find((path) => existsSync(path)) ?? candidates[0]
+  }
   return join(HOME, ".profile")
 }
 
@@ -103,7 +123,13 @@ function readJsonObject(path: string): JsonRead {
 const jsonText = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`
 
 // 覆盖别人的文件:先备份,写完把权限改回原样(atomicWrite 一律 0600,shell rc / settings 原本多半是 0644)。
-async function rewrite(path: string, text: string, now: Date): Promise<string | undefined> {
+// symlink 写穿到它指向的文件:temp → rename 会把 symlink 本身换成普通文件,dotfiles 仓库(stow、
+// home-manager)里那份就再也不会被更新,home-manager 下次切换还会因为这个挡路的文件失败。
+async function rewrite(linkOrPath: string, text: string, now: Date): Promise<string | undefined> {
+  let path = linkOrPath
+  try {
+    if (lstatSync(linkOrPath).isSymbolicLink()) path = realpathSync(linkOrPath)
+  } catch {}
   let backup: string | undefined
   let mode: number | undefined
   if (existsSync(path)) {
@@ -131,13 +157,26 @@ function loadManifest(path: string): TakeoverManifest | undefined {
 
 // 真正的 claude:PATH 上第一个不是我们自己转发脚本的 `claude`。保留 symlink 路径本身(不 realpath),
 // 这样 Claude Code 自动更新换掉版本目录之后仍然指得对。
+//
+// 认出【我们自己的】转发脚本要靠内容与 realpath,不能靠目录字符串相等:PATH 里写成带尾斜杠、或经由
+// symlink 的另一种拼法,字符串比较就会把转发脚本当成真 claude —— 新生成的转发脚本于是 exec 它自己,
+// 无限循环,每一圈还跑一次 bun 与一次 relay attach。
+function isOurShim(candidate: string): boolean {
+  try {
+    if (existsSync(SHIM) && realpathSync(candidate) === realpathSync(SHIM)) return true
+    return readFileSync(candidate, "utf8").slice(0, 400).includes(SHIM_MARKER)
+  } catch {
+    return false
+  }
+}
+
 function findRealClaude(): string | undefined {
   for (const dir of (env.PATH ?? "").split(delimiter)) {
-    if (dir.length === 0 || dir === BIN_DIR) continue
+    if (dir.length === 0) continue
     const candidate = join(dir, "claude")
     try {
       accessSync(candidate, fsConstants.X_OK)
-      if (statSync(candidate).isFile()) return candidate
+      if (statSync(candidate).isFile() && !isOurShim(candidate)) return candidate
     } catch {}
   }
   return undefined
@@ -182,7 +221,9 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   const interactive = process.stdin.isTTY === true
   const existingWorker = readJsonObject(WORKER_FILE)
   const current = existingWorker.kind === "ok" ? existingWorker.value : undefined
-  const previous = loadManifest(MANIFEST)
+  // 一次中途失败的 revert 会留下 .reverting:那里记着最初的原样(池子配置、env 块是不是我们建的),
+  // 丢了它,下一次 revert 就会把 setup 写的那份当成"原样"写回去。
+  const previous = loadManifest(MANIFEST) ?? loadManifest(REVERTING)
 
   // ── 1. 输入 ──
   const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : undefined
@@ -225,6 +266,11 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
 
   // ── 3. 预检:任何一条不过都不写任何东西 ──
   const refusals: string[] = []
+  // 从 git worktree 里跑:启动器与 launchd 任务会写死这个目录,而 worktree 按本仓的流程合并后就删掉。
+  // 那之后启动器会(按设计)把"仓库不在了"当成撤回、静默放行,常驻 relay 则每 10 秒崩一次。
+  if (statSync(join(REPO, ".git"), { throwIfNoEntry: false })?.isFile() && env.CAP_CC_TAKEOVER_ALLOW_WORKTREE !== "1") {
+    refusals.push(`${REPO} 是一个 git worktree。请在主 clone 里跑 make setup —— worktree 合并后会被删掉,接管会随之失效。`)
+  }
   const realClaude = findRealClaude()
   if (realClaude === undefined) refusals.push("PATH 上找不到 claude。先装好 Claude Code。")
   else {
@@ -246,12 +292,14 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   const settingsRead = readJsonObject(SETTINGS)
   if (settingsRead.kind === "bad") refusals.push(`${settingsRead.reason};没法安全地往里加一个键。`)
   const settings = settingsRead.kind === "ok" ? settingsRead.value : {}
-  for (const blocker of settingsBlockers(settings)) refusals.push(blocker.remedy)
+  for (const blocker of settingsBlockers(settings, relayUrl(priorPort))) refusals.push(blocker.remedy)
   const settingsPlan = addWrapper(settings, wrapperValue(LAUNCHER))
   if (!settingsPlan.ok) refusals.push(`${SETTINGS}:${settingsPlan.reason}`)
 
   const rcPath = shellRcPath()
-  const rcBefore = readText(rcPath) ?? ""
+  const rcExisting = readText(rcPath)
+  const rcCreated = rcExisting === undefined
+  const rcBefore = rcExisting ?? ""
   const rcPlan = addShellBlock(rcBefore, shellBlock(BIN_DIR))
 
   if (existingWorker.kind === "bad") refusals.push(`${existingWorker.reason};手工修好或删掉它再跑。`)
@@ -269,6 +317,7 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   manifest.repo = REPO
   mkdirSync(BIN_DIR, { recursive: true, mode: 0o700 })
   await saveManifest(manifest)
+  if (existsSync(REVERTING)) rmSync(REVERTING) // 它的内容已经并进 manifest(previous)
 
   const worker = mergeWorker(current, masterUrl, workerId)
   if (worker.changed) {
@@ -306,7 +355,7 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
     const backup = await rewrite(rcPath, rcPlan.text, now)
     say(`写入   ${rcPath} 末尾的 PATH 段${backup ? `(备份 ${backup})` : ""}`)
   }
-  manifest.shellRc = { path: rcPath }
+  manifest.shellRc = { path: rcPath, created: manifest.shellRc?.created ?? rcCreated }
   await saveManifest(manifest)
 
   // ── 5. 常驻 relay ──
@@ -321,11 +370,14 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
       home: HOME,
       logPath: relayLogPath(env),
       path: [dirname(BUN), "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":"),
-      extraEnv: proxyEnv(env),
+      // 代理:launchd 不继承 shell 的代理变量。CAP_*:setup 时生效的覆盖(端口、标签、缓存目录)
+      // 常驻 relay 也得看到同样的值,否则它与启动器各用各的端口。
+      extraEnv: { ...proxyEnv(env), ...capOverrides(env) },
     })
     mkdirSync(dirname(AGENT_PLIST), { recursive: true })
     await atomicWrite(AGENT_PLIST, plist)
-    chmodSync(AGENT_PLIST, 0o644)
+    // 0600:代理地址里可能带着凭证。launchd 只要求它不被别人可写。
+    chmodSync(AGENT_PLIST, 0o600)
     manifest.launchAgent = { path: AGENT_PLIST, label: RELAY_AGENT_LABEL }
     await saveManifest(manifest)
     launchctl(["bootout", `gui/${uid()}/${RELAY_AGENT_LABEL}`]) // 重跑:先卸下旧的,新代码才会被加载
@@ -392,10 +444,15 @@ async function revert(): Promise<number> {
     const text = readText(rcPath)
     if (text === undefined) continue
     const removed = removeShellBlock(text)
-    if (removed.changed) {
-      const backup = await rewrite(rcPath, removed.text, now)
-      say(`还原   ${rcPath}:删掉 PATH 段(备份 ${backup})`)
+    if (!removed.changed) continue
+    // setup 新建的文件、删掉我们那段之后什么都不剩:整个删掉,不留一个会遮住 .profile 的空 .bash_profile。
+    if (manifest?.shellRc?.path === rcPath && manifest.shellRc.created === true && removed.text.trim().length === 0) {
+      rmSync(rcPath)
+      say(`删除   ${rcPath}(setup 新建的,撤回后已空)`)
+      continue
     }
+    const backup = await rewrite(rcPath, removed.text, now)
+    say(`还原   ${rcPath}:删掉 PATH 段(备份 ${backup})`)
   }
 
   // 常驻 relay。

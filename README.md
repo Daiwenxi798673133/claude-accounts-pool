@@ -150,7 +150,7 @@ make status     # 装没装、relay 在不在、当前共享哪个号
 make revert     # 一键撤回:Claude Code 回到你自己的号
 ```
 
-也可以不提问:`make setup MASTER=100.64.0.36:8787 WORKER=vince-mbp`。WorkerID 就是看板上这台机器的名字。
+也可以不提问:`make setup MASTER=100.64.0.36:8787 WORKER=vince-mbp`。WorkerID 就是看板上这台机器的名字。要在**主 clone** 里跑(不是 git worktree):启动器和 launchd 任务会写死仓库路径,worktree 合并后被删掉,接管就跟着失效了。
 
 `make setup` 做五件事。每一件都记进 `~/.claude-accounts-pool/cc-takeover.json`,改别人的文件之前先备份(`*.bak-<时间>`):
 

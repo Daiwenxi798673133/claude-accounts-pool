@@ -36,6 +36,11 @@ test("推导出的默认标签合法", () => {
   expect(resolveBaseWorkerId("vince-local.senpi", undefined, {})).toMatch(/^[A-Za-z0-9._-]{1,64}$/)
 })
 
+test("手改出错的标签不采用,回到推导出的默认值", () => {
+  expect(resolveBaseWorkerId("vince-local.senpi", "has space", {})).toBe("vince-local.senpi.cc")
+  expect(resolveBaseWorkerId("vince-local.senpi", "x".repeat(65), {})).toBe("vince-local.senpi.cc")
+})
+
 test("空字符串当作没配", () => {
   expect(resolveBaseWorkerId("base", "", { CAP_CC_WORKER: "" })).toBe("base.cc")
 })

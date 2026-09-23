@@ -169,9 +169,18 @@ export function removeShellBlock(text: string): { text: string; changed: boolean
 // The file is shared with the senpi lane: `workerId` is senpi's label, `ccWorkerId` is this lane's.
 // Setup sets ccWorkerId to exactly what the operator typed — that is the name they will look for on
 // the dashboard — and leaves an existing senpi label alone.
+//
+// On a FRESH machine the senpi label still has to be something (readWorkerConfig requires it), and it
+// must NOT be the same string: two lanes under one label make the master double-book an account
+// (src/claudecode/config.ts header), and an omo install would start leasing under it on its own.
+export function senpiLabelFor(workerId: string): string {
+  const suffixed = `${workerId}.senpi`
+  return isWorkerLabel(suffixed) ? suffixed : `${workerId.slice(0, 64 - ".senpi".length)}.senpi`
+}
+
 export function mergeWorker(existing: JsonObject | undefined, masterUrl: string, workerId: string): { next: JsonObject; changed: boolean } {
   const base: JsonObject = existing ?? { version: 1 }
-  const senpiId = typeof base.workerId === "string" && isWorkerLabel(base.workerId) ? base.workerId : workerId
+  const senpiId = typeof base.workerId === "string" && isWorkerLabel(base.workerId) ? base.workerId : senpiLabelFor(workerId)
   const next: JsonObject = { ...base, version: 1, masterUrl, workerId: senpiId, ccWorkerId: workerId }
   return { next, changed: existing === undefined || JSON.stringify(existing) !== JSON.stringify(next) }
 }
@@ -209,6 +218,10 @@ export function renderLauncher(p: LauncherPaths): string {
 # 账号池的 Claude Code 启动器 —— make setup 生成。官方启动器契约(CLAUDE_CODE_PROCESS_WRAPPER):
 # 注入池子租约后 exec "$@"。make revert 之后它退化成原样 exec(见下面的条件),可以安全地留着。
 if [ -f ${sq(p.manifest)} ] && [ -f ${sq(`${p.repo}/claude-pool-env.ts`)} ]; then
+  if [ ! -x ${sq(p.bun)} ]; then
+    echo "账号池启动器找不到 bun(${p.bun.replace(/["\\$`]/g, "")})。重跑 make setup,或先恢复原生 Claude Code:cd ${p.repo.replace(/["\\$`]/g, "")} && make revert" >&2
+    exit 127
+  fi
   pool_env=$(${sq(p.bun)} ${sq(`${p.repo}/claude-pool-env.ts`)} "$$") || exit $?
   eval "$pool_env"
 fi
@@ -290,7 +303,9 @@ export type TakeoverManifest = {
   updatedAt: string
   repo: string
   settings?: { path: string; value: string; createdEnv: boolean }
-  shellRc?: { path: string }
+  // created: setup 新建了这个文件(之前不存在)—— 撤回后只剩空内容就删掉,不留一个会遮住别的
+  // 启动文件的空壳(bash 登录 shell 只读 .bash_profile / .bash_login / .profile 里第一个存在的)。
+  shellRc?: { path: string; created?: boolean }
   // Files setup created. The launcher is listed separately: revert leaves it (it is a passthrough
   // once the manifest is gone, and processes started before the revert still point at it).
   generated: string[]

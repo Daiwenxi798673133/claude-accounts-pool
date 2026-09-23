@@ -39,9 +39,10 @@ const outcome = await launcherEnv({
     spawnRelay: spawnRelay(env),
     sleep,
     now: Date.now,
-    // 启动器契约:约 3 秒内到达 exec。relay 常驻时这两步都是本机往返,远用不到这么久。
-    startTimeoutMs: 2_500,
-    controlTimeoutMs: 8_000,
+    // 启动器契约:约 3 秒内到达 exec。relay 常驻时这两步都是本机往返,远用不到这么久;只有 relay 正在
+    // 排队换号(或 master 很慢)时才会等满 —— 那时宁可早点拒绝并说清原因,也不要让 Claude Code 干等。
+    startTimeoutMs: 2_000,
+    controlTimeoutMs: 4_000,
   }),
   relayUrl: url,
   relayLogPath: relayLogPath(env),

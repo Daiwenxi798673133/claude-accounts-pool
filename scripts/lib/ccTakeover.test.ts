@@ -13,6 +13,7 @@ import {
   renderLauncher,
   renderPlist,
   revertWorker,
+  senpiLabelFor,
   shellBlock,
   SHELL_BLOCK_BEGIN,
   validateWorkerId,
@@ -117,9 +118,17 @@ test("shell rc:PATH 段里的路径被正确转义", () => {
   expect(shellBlock('/Users/a"b/$x/bin')).toContain('export PATH="/Users/a\\"b/\\$x/bin:$PATH"')
 })
 
-test("池子配置:新建时 senpi 标签与看板名字都是输入值", () => {
+// 两条链共用一个标签,master 会给同一个号记重账;omo 装上之后还会自动用它租号。
+test("池子配置:新机器上 senpi 标签与看板名字不同", () => {
   const out = mergeWorker(undefined, "http://m:8787", "vince-mbp")
-  expect(out.next).toEqual({ version: 1, masterUrl: "http://m:8787", workerId: "vince-mbp", ccWorkerId: "vince-mbp" })
+  expect(out.next).toEqual({ version: 1, masterUrl: "http://m:8787", workerId: "vince-mbp.senpi", ccWorkerId: "vince-mbp" })
+})
+
+test("senpi 标签:加后缀会超长时截短,结果仍是合法标签", () => {
+  expect(senpiLabelFor("a")).toBe("a.senpi")
+  const long = senpiLabelFor("x".repeat(64))
+  expect(long.length).toBe(64)
+  expect(long.endsWith(".senpi")).toBe(true)
 })
 
 // 这个文件与 senpi 共用:它的 workerId 是 senpi 那条链的身份,不能被 Claude Code 的接管改掉。
