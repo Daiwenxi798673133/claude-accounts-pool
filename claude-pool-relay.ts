@@ -7,7 +7,8 @@
 //
 // 【单例靠端口】多个启动器同时拉起多个 relay 时,只有一个绑得上端口,其余的在这里安静退出。
 // 【闲置退出】所有会话结束 RELAY_IDLE_EXIT_MS 之后自行退出,空着的 relay 不该在 master 的持有者账本上
-// 一直占一个位子。
+// 一直占一个位子。【常驻模式】(CAP_CC_RELAY_RESIDENT=1,make setup 装的 launchd 任务)不退出:
+// 手敲的 claude 与后台会话不经过会登记 pid 的启动器之外的任何东西,闲置退出会让 launchd 反复重启它。
 import { initLogger, log } from "./src/logger.ts"
 import { createFileLogClient } from "./src/senpi/logSink.ts"
 import { readPoolConfig, relayLogPath } from "./src/claudecode/config.ts"
@@ -22,6 +23,7 @@ if (!config) {
 }
 
 initLogger(createFileLogClient(process.env, relayLogPath(process.env)))
+const resident = process.env.CAP_CC_RELAY_RESIDENT === "1"
 const relay = createRelay(createRelayDeps(config, process.env))
 
 let server: ReturnType<typeof Bun.serve>
@@ -47,10 +49,10 @@ try {
   process.exit(1)
 }
 
-log.info("claudecode:relay-started", { pid: process.pid, port: config.relayPort, workerId: config.workerId })
+log.info("claudecode:relay-started", { pid: process.pid, port: config.relayPort, workerId: config.workerId, resident })
 
 const timer = setInterval(() => {
-  if (relay.tick() !== "exit") return
+  if (relay.tick() !== "exit" || resident) return
   // 闲置判据只看"最近一次请求开始的时刻",一条比闲置窗口还长的流(没有登记的孤儿会话发起的)
   // 此刻可能还在回传。有在飞的请求就再等一拍,而且优雅关闭 —— 强制关会把它拦腰截断。
   if (server.pendingRequests > 0) return

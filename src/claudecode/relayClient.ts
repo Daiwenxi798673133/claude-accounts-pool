@@ -32,6 +32,9 @@ export type RelayClientDeps = {
   sleep: (ms: number) => Promise<void>
   now: () => number
   startTimeoutMs?: number
+  // attach 的超时。默认盖住 relay 串行队列的最坏情况;make setup 装的进程启动器要在约 3 秒内 exec
+  // (官方启动器契约),传一个短的。
+  controlTimeoutMs?: number
 }
 
 const PROBE_TIMEOUT_MS = 1_000
@@ -87,7 +90,7 @@ export function createRelayClient(deps: RelayClientDeps): RelayClient {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(input),
-          signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+          signal: AbortSignal.timeout(deps.controlTimeoutMs ?? CONTROL_TIMEOUT_MS),
         })
       } catch (error) {
         // 说清楚是 relay 没应答,不是 master:两者的排查方向完全不同(一个看 cc-relay.log,一个看 master)。

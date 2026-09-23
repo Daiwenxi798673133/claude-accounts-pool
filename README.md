@@ -139,6 +139,39 @@ claude-pool --pool-unpin                         # 取消钉住
 
 设计依据与实测记录见 [issue #83](https://github.com/Daiwenxi798673133/claude-accounts-pool/issues/83)。已知代价见 [docs/limitations.md](docs/limitations.md#原生-claude-codeclaude-pool)。
 
+### 一键接管本机 Claude Code:make setup / make revert
+
+不想每次敲 `claude-pool`,想让手敲的 `claude`、后台会话、agent view 全都走池子:
+
+```bash
+cd claude-accounts-pool
+make setup      # 提示输入 master 的 ip:port,再提示输入 WorkerID,然后一键配好
+make status     # 装没装、relay 在不在、当前共享哪个号
+make revert     # 一键撤回:Claude Code 回到你自己的号
+```
+
+也可以不提问:`make setup MASTER=100.64.0.36:8787 WORKER=vince-mbp`。WorkerID 就是看板上这台机器的名字。要在**主 clone** 里跑(不是 git worktree):启动器和 launchd 任务会写死仓库路径,worktree 合并后被删掉,接管就跟着失效了。
+
+`make setup` 做五件事。每一件都记进 `~/.claude-accounts-pool/cc-takeover.json`,改别人的文件之前先备份(`*.bak-<时间>`):
+
+| 改了什么 | 为什么 |
+|---|---|
+| `~/.claude-accounts-pool/senpi-worker.json` | 池子配置:master 地址、`ccWorkerId`(已有的 senpi 标签不动) |
+| `~/.claude-accounts-pool/bin/claude-pool-launch` | 启动器:向 relay 领当前共享租约,注入环境后 `exec` |
+| `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PROCESS_WRAPPER` | 官方[启动器契约](https://code.claude.com/docs/en/corporate-launcher):Claude Code 从自己二进制拉起的一切进程(后台服务、agent view、自我重启、Remote Control、队友 pane)都经过启动器 |
+| `~/.claude-accounts-pool/bin/claude` + shell rc 末尾一段 PATH | 终端里手敲的 `claude` 不在契约覆盖内,文档的建议做法就是在 PATH 前面放一个名为 `claude` 的脚本(官方 symlink 不动) |
+| `~/Library/LaunchAgents/com.claude-accounts-pool.relay.plist` | relay 常驻:不闲置退出,崩溃自动拉起 |
+
+装完**开一个新终端**再敲 `claude`。已经开着的会话读的是旧设置,重启后生效;后台服务要重启一次(没有在跑的后台会话时执行 `claude daemon stop --any`)。
+
+**出问题时启动器会拒绝启动,而不是退回你自己的号**,并在报错里告诉你 `make revert`。退回你自己的号意味着会话照跑、用量却记在你没打算用的号上,而且你察觉不到。
+
+`make revert` 按清单逐项撤回:删掉 settings 里那个键、删掉 shell rc 里那段 PATH、卸下 launchd 任务、停掉 relay、删掉转发脚本;池子配置由 setup 新建的就删掉,被 setup 改过的就还原。撤回的第一步是挪开清单,而启动器看不到清单就原样放行,所以哪怕撤回中途出错,新起的 Claude Code 也已经回到你自己的号上。几件事要知道:
+
+- 撤回之前开着的 `claude` 会话还指向刚停掉的 relay,需要重启。已打开的终端若提示找不到 `claude`,执行 `rehash`。
+- 启动器文件会留下(它此时只做 `exec`):撤回前启动的会话和后台服务还指着它,删掉会让它们起不来。所有会话都重启过之后可以手工删。
+- 拉了新代码之后重跑一次 `make setup`(幂等),常驻 relay 才会换成新代码。
+
 ### 更多细节
 
 - [docs/local-mode.md](docs/local-mode.md) —— 单机模式详解:账号管理流程、`/usage` 面板键位、`/stats` 仪表盘、限流自动切号的完整机制、ChatGPT 多账号(含两个默认关闭的开关)

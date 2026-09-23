@@ -89,6 +89,17 @@ test("settings 里的 apiKeyHelper 同样拒绝:它优先级更高,而且那条�
   expect(outcome.blockers[0].varName).toBe("apiKeyHelper")
 })
 
+// Claude Code 在启动之后才应用 settings 的 env 块,它会盖过我们注入的值。
+test("settings 的 env 块里有盖过租约的变量:同样拒绝,文案指向 settings", () => {
+  const blockers = settingsBlockers({ env: { ANTHROPIC_BASE_URL: "http://gw", ANTHROPIC_API_KEY: "k", FOO: "bar" } })
+  expect(blockers.map((b) => b.varName).sort()).toEqual(["env.ANTHROPIC_API_KEY", "env.ANTHROPIC_BASE_URL"])
+  expect(blockers[0].remedy).toContain("settings.json 的 env 块")
+})
+
+test("settings 的 env 块:relay 自己的地址、我们自己的启动器变量都不算", () => {
+  expect(settingsBlockers({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:18787", CLAUDE_CODE_PROCESS_WRAPPER: "/x" } }, "http://127.0.0.1:18787")).toEqual([])
+})
+
 test("settings 读不到时不假装干净,但也不凭空拦人", () => {
   // undefined = 不知道。本模块只报它被出示过的东西,判断「不知道要不要拦」是调用方的事。
   expect(settingsBlockers(undefined)).toEqual([])

@@ -30,6 +30,8 @@ const NOT_FORWARDED = new Set([
 // x-api-key 出现说明客户端被配进了别的车道 —— 两者都不该到达上游,由当前租约取代。
 const CREDENTIAL_HEADERS = new Set(["authorization", "x-api-key"])
 
+import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib"
+
 export const CLIENT_REQUEST_ID_HEADER = "x-client-request-id"
 
 /** 发往 api.anthropic.com 的请求头:原样照抄,只换凭证。 */
@@ -98,4 +100,28 @@ export function limitHeadersOf(headers: Headers): Record<string, string> {
 export function relayErrorResponse(status: number, message: string): Response {
   const type = status === 429 ? "rate_limit_error" : "api_error"
   return Response.json({ type: "error", error: { type, message } }, { status })
+}
+
+/**
+ * 错误应答正文的可读文本,只给日志用。上游字节是原样过来的(decompress: false),多半压过 ——
+ * 不解压,日志里只有一串乱码,而"这个 429 到底是容量、权限还是额度"就写在这段正文里。
+ * 解不开就如实说明,绝不抛出:这是诊断,不是转发路径。
+ */
+export function decodeBodyForLog(bytes: Uint8Array, contentEncoding: string | null): string {
+  const encoding = (contentEncoding ?? "").trim().toLowerCase()
+  try {
+    const plain =
+      encoding === "gzip" || encoding === "x-gzip"
+        ? gunzipSync(bytes)
+        : encoding === "br"
+          ? brotliDecompressSync(bytes)
+          : encoding === "deflate"
+            ? inflateSync(bytes)
+            : encoding === "" || encoding === "identity"
+              ? bytes
+              : undefined
+    return plain === undefined ? `<${encoding} 编码的 ${bytes.length} 字节>` : new TextDecoder().decode(plain)
+  } catch {
+    return `<${encoding || "未知"} 编码的 ${bytes.length} 字节,解不开>`
+  }
 }

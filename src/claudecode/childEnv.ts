@@ -75,10 +75,15 @@ const ENV_BLOCKERS: Record<string, string> = {
 // EMPTY STRING IS ABSENT. `export ANTHROPIC_API_KEY=` leaves the name defined with an empty value,
 // which Claude Code does not treat as a credential — refusing on it would block a launch for a
 // variable that changes nothing, and operators do leave these lying around in shell profiles.
-export function envBlockers(env: NodeJS.ProcessEnv): Blocker[] {
+//
+// OUR OWN RELAY IS NOT A BLOCKER. Under the full takeover (make setup) the launcher runs for every
+// process Claude Code spawns, nested ones included, and those inherit the base URL the outer launcher
+// set — the relay's. Refusing it would make every nested self-spawn fail.
+export function envBlockers(env: NodeJS.ProcessEnv, ownRelayUrl?: string): Blocker[] {
   const found: Blocker[] = []
   for (const [varName, remedy] of Object.entries(ENV_BLOCKERS)) {
     const value = env[varName]
+    if (varName === RELAY_URL_VAR && ownRelayUrl !== undefined && value === ownRelayUrl) continue
     if (typeof value === "string" && value.length > 0) found.push({ varName, remedy })
   }
   return found
@@ -91,18 +96,33 @@ export function envBlockers(env: NodeJS.ProcessEnv): Blocker[] {
 //
 // Takes the PARSED settings object, not a path: reading and locating settings files is IO the caller
 // owns, and this module stays a pure function of what it was handed.
-export function settingsBlockers(settings: unknown): Blocker[] {
+//
+// THE SETTINGS `env` BLOCK COUNTS TOO. Claude Code applies it to its own process after whatever started
+// it — so an ANTHROPIC_BASE_URL there overrides the relay we inject (the leased token goes to that
+// gateway), and an ANTHROPIC_API_KEY or CLAUDE_CODE_USE_* there bills somewhere the pool never leased.
+// Same table as the process environment, different remedy: the fix is an edit to a file, not `unset`.
+export function settingsBlockers(settings: unknown, ownRelayUrl?: string): Blocker[] {
   if (typeof settings !== "object" || settings === null) return []
+  const found: Blocker[] = []
   const helper = (settings as Record<string, unknown>).apiKeyHelper
-  if (typeof helper !== "string" || helper.length === 0) return []
-  return [
-    {
+  if (typeof helper === "string" && helper.length > 0) {
+    found.push({
       varName: "apiKeyHelper",
       remedy:
         "settings.json 里配了 apiKeyHelper,它的优先级高于池子租约,而且那条车道不带 oauth-2025-04-20、服务端会 401。" +
         "把它从 settings.json 里去掉再试。",
-    },
-  ]
+    })
+  }
+  const env = (settings as Record<string, unknown>).env
+  if (typeof env === "object" && env !== null) {
+    for (const varName of Object.keys(ENV_BLOCKERS)) {
+      const value = (env as Record<string, unknown>)[varName]
+      if (typeof value !== "string" || value.length === 0) continue
+      if (varName === RELAY_URL_VAR && value === ownRelayUrl) continue
+      found.push({ varName: `env.${varName}`, remedy: `settings.json 的 env 块里设了 ${varName},它会盖过池子租约。把它从 env 里去掉再试。` })
+    }
+  }
+  return found
 }
 
 export type ChildEnvInput = {
@@ -111,8 +131,11 @@ export type ChildEnvInput = {
   // 当前那枚。它仍然必须是真凭证 —— claude 有一批请求不走 base URL、直连 api.anthropic.com
   // (profile、usage、bootstrap 之类),给假值会让它们从第一秒起全部 401。空串用于启动前那次空跑。
   access: string
-  // 本机 relay 的地址。空跑时不给。
+  // 本机 relay 的地址。环境里已有的同一个地址不算"操作者自己设的"(见 envBlockers)。
   relayUrl?: string
+  // 是否置自我调用哨兵。claude-pool 启动器置(防别名递归);make setup 装的进程启动器不置 ——
+  // 它按契约会被 Claude Code 嵌套调用,嵌套正是它的常态。
+  sentinel?: boolean
   // Parsed contents of the settings file that applies to the child, or undefined when the caller
   // could not read one. UNDEFINED IS NOT "CLEAN": it means unknown, and the caller says so — this
   // module only reports what it was shown.
@@ -128,14 +151,14 @@ export type ChildEnvOutcome =
 // hand-written hook and MCP server that reads them. The pool's business is the credential; everything
 // else on that command line is theirs.
 export function buildChildEnv(input: ChildEnvInput): ChildEnvOutcome {
-  const blockers = [...envBlockers(input.env), ...settingsBlockers(input.settings)]
+  const blockers = [...envBlockers(input.env, input.relayUrl), ...settingsBlockers(input.settings, input.relayUrl)]
   if (blockers.length > 0) return { ok: false, blockers }
   return {
     ok: true,
     env: {
       ...input.env,
       [CLAUDE_CODE_TOKEN_VAR]: input.access,
-      [POOL_SESSION_SENTINEL]: "1",
+      ...(input.sentinel === false ? {} : { [POOL_SESSION_SENTINEL]: "1" }),
       ...(input.relayUrl === undefined ? {} : { [RELAY_URL_VAR]: input.relayUrl }),
       ...(input.env[TOOL_SEARCH_VAR] ? {} : { [TOOL_SEARCH_VAR]: "true" }),
     },

@@ -45,7 +45,7 @@ function settingsCandidates(env: NodeJS.ProcessEnv, cwd: string): string[] {
 // A MISSING file is clean; an UNPARSEABLE one is reported and skipped. Claude Code itself ignores a
 // settings file it cannot read, so refusing to launch over one would be stricter than the client we
 // are protecting — and would strand an operator behind a stray comma in a file nobody reads.
-async function readSettings(env: NodeJS.ProcessEnv, cwd: string): Promise<unknown> {
+export async function readSettings(env: NodeJS.ProcessEnv, cwd: string): Promise<unknown> {
   const merged: Record<string, unknown> = {}
   for (const path of settingsCandidates(env, cwd)) {
     let text: string
@@ -57,9 +57,12 @@ async function readSettings(env: NodeJS.ProcessEnv, cwd: string): Promise<unknow
     try {
       const parsed = JSON.parse(text) as Record<string, unknown>
       // Only the keys this lane judges. Merging whole files would invent a settings-precedence model
-      // this module has no business owning.
+      // this module has no business owning — a blocker found in ANY of them is reported.
       if (typeof parsed.apiKeyHelper === "string" && parsed.apiKeyHelper.length > 0) {
         merged.apiKeyHelper = parsed.apiKeyHelper
+      }
+      if (typeof parsed.env === "object" && parsed.env !== null && !Array.isArray(parsed.env)) {
+        merged.env = { ...((merged.env as Record<string, unknown> | undefined) ?? {}), ...(parsed.env as Record<string, unknown>) }
       }
     } catch (error) {
       log.warn("claudecode:settings-unparseable", { path, error: error instanceof Error ? error.message : String(error) })
@@ -99,7 +102,7 @@ export function relayEntryPath(): string {
 //
 // The environment is passed whole: the relay resolves the same worker config the launcher did
 // (CAP_LEASE_CACHE_DIR, CAP_CC_* overrides included), which is what keeps the two in agreement.
-function spawnRelay(env: NodeJS.ProcessEnv): () => void {
+export function spawnRelay(env: NodeJS.ProcessEnv): () => void {
   return () => {
     const logPath = relayLogPath(env)
     mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 })
