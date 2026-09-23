@@ -40,6 +40,10 @@ export const POOL_SESSION_SENTINEL = "CLAUDE_ACCOUNTS_POOL_SESSION"
 // (官方 schema 只有 session_id / error_type / error_message),而钩子是另一个进程,拿不到启动器的内存。
 export const POOL_ACCOUNT_VAR = "CLAUDE_ACCOUNTS_POOL_ACCOUNT"
 
+// 本次会话的 workerId(带槽位号)。钩子必须用【发出这次租约的那个标签】上报限流,否则 master 收到
+// 的是一个并不持有该账号的身份 —— 它的持有者账本按 workerId 键,对不上就等于在给别人记账。
+export const POOL_WORKER_VAR = "CLAUDE_ACCOUNTS_POOL_WORKER"
+
 export type Blocker = {
   varName: string
   // Shown to the operator verbatim, so it names the FIX rather than the rule: they are standing at a
@@ -99,6 +103,8 @@ export type ChildEnvInput = {
   access: string
   // 本次租约的账号 id。空串用于启动前那次不带凭证的空跑(守卫检查),此时不写这个变量。
   accountId?: string
+  // 本次会话的 workerId(带槽位号),交给钩子用。
+  workerId?: string
   // Parsed contents of the settings file that applies to the child, or undefined when the caller
   // could not read one. UNDEFINED IS NOT "CLEAN": it means unknown, and the caller says so — this
   // module only reports what it was shown.
@@ -123,6 +129,7 @@ export function buildChildEnv(input: ChildEnvInput): ChildEnvOutcome {
       [CLAUDE_CODE_TOKEN_VAR]: input.access,
       [POOL_SESSION_SENTINEL]: "1",
       ...(input.accountId === undefined || input.accountId.length === 0 ? {} : { [POOL_ACCOUNT_VAR]: input.accountId }),
+      ...(input.workerId === undefined || input.workerId.length === 0 ? {} : { [POOL_WORKER_VAR]: input.workerId }),
     },
   }
 }
