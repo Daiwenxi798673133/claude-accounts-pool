@@ -228,6 +228,16 @@ export const MAX_ACCOUNT_HOLDERS = 3
 // symptom and less to go on.
 export const MASTER_SERVE_IDLE_TIMEOUT_SECONDS = 255
 
+// Backoff for binding the master's HTTP port while the interface it names does not exist yet. The
+// deployment binds a Tailscale address, and a box that boots with no network runs opencode minutes
+// before tailscaled has one to hand out (measured 2026-09-23: nine minutes). One attempt at load time
+// meant a master that refreshed every token and served none of them until a human restarted it.
+//
+// The cap is how late the pool comes back after the address appears, so it stays short: a retry is a
+// single local syscall, not a request anybody else pays for.
+export const MASTER_BIND_RETRY_BASE_MS = 1_000
+export const MASTER_BIND_RETRY_CAP_MS = 30_000
+
 // ── Web onboarding (the dashboard's 添加账号 flow) ───────────────────────────────────────────────
 // Every bound below exists because these two routes are KEYLESS, like the rest of the dashboard.
 // That decision is the pool owner's (it is what keeps "open the browser and click" true), and it
