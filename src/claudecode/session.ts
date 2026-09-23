@@ -130,10 +130,13 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
 
   const claimed = await deps.lease()
   if (!claimed.ok) {
+    if (claimed.reason === "lease-failed" && claimed.notice !== undefined) deps.notify(`账号池:${claimed.notice}`)
     deps.notify(claimedLeaseText(claimed, deps.masterUrl))
     return EXIT_NO_LEASE
   }
   const lease = claimed.lease
+  // 「想点名但这次点不成」先说 —— 操作者需要知道这个会话没在他指定的号上。
+  if (claimed.notice !== undefined) deps.notify(`账号池:${claimed.notice}`)
 
   // FAIL-SAFE, matching the repo's "过期就什么都不写" shape. The master will not serve a spent
   // horizon, so reaching here means something is wrong between the two clocks — and starting a
