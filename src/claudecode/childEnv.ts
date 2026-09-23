@@ -1,4 +1,4 @@
-// The credential seam for the Claude Code lane: what environment a leased `claude` child gets.
+// The credential seam for the Claude Code lane: what environment a pooled `claude` child gets.
 //
 // WHY A GUARD AND NOT JUST AN ASSIGNMENT — this module exists for the refusal, not the injection.
 // Claude Code resolves credentials by a fixed precedence (measured against a local capture endpoint,
@@ -16,15 +16,18 @@
 // never leased" — arriving through a different door. It is unobservable from inside, so it has to be
 // refused BEFORE the child starts rather than detected after.
 //
-// ANTHROPIC_BASE_URL is refused for a different reason: it does not outrank us, it REDIRECTS us. A
-// leased subscription token sent to a third-party gateway is a credential handed to whoever runs that
-// gateway — worse than billing to the wrong account, and equally silent.
+// ANTHROPIC_BASE_URL IS OURS NOW, which is exactly why an operator's own value is still refused: the
+// child's base URL points at this machine's relay (src/claudecode/relay.ts), and the relay is what
+// swaps the frozen startup token for the machine's CURRENT lease on every request. An inherited value
+// would be silently overwritten — and an operator who set one meant their traffic to go somewhere,
+// which is a decision to surface, not to discard. It was refused for the opposite reason before the
+// relay existed (a leased token sent to someone else's gateway), and that reason still holds.
 //
 // WE DO NOT TOUCH THE OPERATOR'S LOGIN. Injection is per-child-process, so ~/.claude/.credentials.json
-// (and the macOS Keychain entry) is never read, written, or shadowed on disk: drop the variable and
+// (and the macOS Keychain entry) is never read, written, or shadowed on disk: drop the variables and
 // the next hand-typed `claude` is back on their own account. Writing that file instead would make this
 // machine a second refresher of a chain the master owns (INV-CLOUD-1) — the one shape this lane must
-// never take, however convenient a mid-session renewal would be.
+// never take. The relay is what makes mid-session renewal possible WITHOUT that file.
 import type { ProviderId } from "../accounts.ts"
 
 /** The variable Claude Code reads for a subscription OAuth credential (precedence rank 5). */
@@ -36,13 +39,17 @@ export const CLAUDE_CODE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 // fork, until the machine runs out of processes. The sentinel is what turns that into one sentence.
 export const POOL_SESSION_SENTINEL = "CLAUDE_ACCOUNTS_POOL_SESSION"
 
-// 本次会话租到的账号 id,交给 StopFailure 钩子用。必须走环境,因为钩子报文里【没有】账号信息
-// (官方 schema 只有 session_id / error_type / error_message),而钩子是另一个进程,拿不到启动器的内存。
-export const POOL_ACCOUNT_VAR = "CLAUDE_ACCOUNTS_POOL_ACCOUNT"
+/** Where the child sends every API request: this machine's relay, never Anthropic directly. */
+export const RELAY_URL_VAR = "ANTHROPIC_BASE_URL"
 
-// 本次会话的 workerId(带槽位号)。钩子必须用【发出这次租约的那个标签】上报限流,否则 master 收到
-// 的是一个并不持有该账号的身份 —— 它的持有者账本按 workerId 键,对不上就等于在给别人记账。
-export const POOL_WORKER_VAR = "CLAUDE_ACCOUNTS_POOL_WORKER"
+// RESTORES A DEFAULT THE RELAY WOULD OTHERWISE COST. Claude Code switches optimistic tool search OFF
+// whenever ANTHROPIC_BASE_URL is not api.anthropic.com (claude-code src/utils/toolSearch.ts: a gateway
+// "typically" rejects tool_reference blocks) — which would load every MCP tool into context on every
+// turn. The relay forwards to api.anthropic.com byte for byte, so the gate's premise does not hold here.
+// `true` is the same mode an unset value resolves to on first-party (getToolSearchMode → 'tst'), so this
+// puts the child back where it would have been. Only when the operator left it unset: a value they
+// chose is theirs.
+export const TOOL_SEARCH_VAR = "ENABLE_TOOL_SEARCH"
 
 export type Blocker = {
   varName: string
@@ -100,11 +107,12 @@ export function settingsBlockers(settings: unknown): Blocker[] {
 
 export type ChildEnvInput = {
   env: NodeJS.ProcessEnv
+  // 启动时的共享租约。它在子进程里会冻结(issue #83),但无所谓:发往 relay 的每个请求都会被换成
+  // 当前那枚。它仍然必须是真凭证 —— claude 有一批请求不走 base URL、直连 api.anthropic.com
+  // (profile、usage、bootstrap 之类),给假值会让它们从第一秒起全部 401。空串用于启动前那次空跑。
   access: string
-  // 本次租约的账号 id。空串用于启动前那次不带凭证的空跑(守卫检查),此时不写这个变量。
-  accountId?: string
-  // 本次会话的 workerId(带槽位号),交给钩子用。
-  workerId?: string
+  // 本机 relay 的地址。空跑时不给。
+  relayUrl?: string
   // Parsed contents of the settings file that applies to the child, or undefined when the caller
   // could not read one. UNDEFINED IS NOT "CLEAN": it means unknown, and the caller says so — this
   // module only reports what it was shown.
@@ -115,7 +123,7 @@ export type ChildEnvOutcome =
   | { ok: true; env: NodeJS.ProcessEnv }
   | { ok: false; blockers: Blocker[] }
 
-// The child's environment is the parent's PLUS the lease — not a curated allowlist. A `claude` started
+// The child's environment is the parent's PLUS the lease and the relay — not a curated allowlist. A `claude` started
 // with a scrubbed environment loses the operator's PATH, editor, proxy and terminal settings, and every
 // hand-written hook and MCP server that reads them. The pool's business is the credential; everything
 // else on that command line is theirs.
@@ -128,8 +136,8 @@ export function buildChildEnv(input: ChildEnvInput): ChildEnvOutcome {
       ...input.env,
       [CLAUDE_CODE_TOKEN_VAR]: input.access,
       [POOL_SESSION_SENTINEL]: "1",
-      ...(input.accountId === undefined || input.accountId.length === 0 ? {} : { [POOL_ACCOUNT_VAR]: input.accountId }),
-      ...(input.workerId === undefined || input.workerId.length === 0 ? {} : { [POOL_WORKER_VAR]: input.workerId }),
+      ...(input.relayUrl === undefined ? {} : { [RELAY_URL_VAR]: input.relayUrl }),
+      ...(input.env[TOOL_SEARCH_VAR] ? {} : { [TOOL_SEARCH_VAR]: "true" }),
     },
   }
 }

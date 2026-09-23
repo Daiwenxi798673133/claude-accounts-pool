@@ -16,11 +16,25 @@
 ## cloud 模式
 
 - **计费归属只在同一台机器上验证过。** 实测确认:用租借来的 access token 经真实 ex-machina 发推理,用量扣在该账号的**订阅窗口**上(5h +7%、7d +1%),超额(overage)计数器**分文未动**。但这次测量是在**持有该账号的那台机器**上做的;真实部署里 worker 在**另一台机器、另一个出口 IP**。「跨 IP 是否影响计费归属」**尚未验证**,需要在第二台机器上重跑同一套协议(`scripts/gate0-billing-attribution.ts`)。
-- **worker 无法在请求层被拦住。** OpenCode 的 TUI 插件拿不到请求级钩子(`Hooks` 只属于 server 插件,而 TUI 模块与 server 模块互斥),所以"租约失效时阻止请求发出"做不到。当前的兜底是:keeper 提前续租、失败时明确报错并拒绝写入陈旧租约,再加上 `401` 的重领租恢复。真正的请求拦截需要额外注册一个 server 插件入口,尚未做。
+- **worker 无法在请求层被拦住**(OpenCode 那条链;claude-pool 那条链有 relay,不受这条与下一条限制)。OpenCode 的 TUI 插件拿不到请求级钩子(`Hooks` 只属于 server 插件,而 TUI 模块与 server 模块互斥),所以"租约失效时阻止请求发出"做不到。当前的兜底是:keeper 提前续租、失败时明确报错并拒绝写入陈旧租约,再加上 `401` 的重领租恢复。真正的请求拦截需要额外注册一个 server 插件入口,尚未做。
 - **成功响应的限流头拿不到。** `session.status` 只带一个 message 字符串,限流头只在错误路径(`session.error` 的 `APIError.data`)里出现。所以 master 的稳态选号数据来自它自己轮询 `/api/oauth/usage`,而不是 worker 回传——而该端点有已知的持续 429 问题,因此轮询刻意做得很粗。
 - **同一账号会在不同 worker 之间轮转**,即同一账号从多个出口 IP 出现。这是"按用量轮转、默认不做粘性"这个取舍的直接代价,也是一个已知的账号共享特征。**按 `p` 钉住**(见 [cloud-mode.md](cloud-mode.md#p钉住一个号))能把这件事按人缓解:钉住的那台机器在额度用满前不再被轮换走,代价正是吞吐——它不再跟着全池最空的号走。但这**只收窄不消除**:pin 不是独占,别人照样能租到同一个号,所以"一个账号同时被多个 IP 使用"依旧可能发生。<br>*(这条原先把粘性写成一个"可以考虑但没做"的假设方案。`p` 落地后那句话不再成立,于是改写而不是在后面补一句——同一条取舍只该有一个当前版本。)*
 - **单出口 IP 的限流切号无效。** 部分 429 是按出口 IP 计的,这种情况下换账号解决不了问题。
 - 服务端若启用原生客户端 attestation,这套纯软件方案(伪装由客户端 ex-machina 完成)会整体失效。详见 [research/options-analysis.md](research/options-analysis.md)。
+
+## 原生 Claude Code(claude-pool)
+
+- **base URL 不是 `api.anthropic.com`,客户端会改几处行为**(源码快照 `isFirstPartyAnthropicBaseUrl()`;2.1.280 抓包复核了前两条):
+  - tools 不再带 `eager_input_streaming`(细粒度工具流)。relay 不改 body,所以不补——改 body 就是 [方案 A](research/options-analysis.md) 那条伪装滑坡的第一步。
+  - 乐观 tool search 默认关闭。启动器在你没设 `ENABLE_TOOL_SEARCH` 时补成 `true`,还原 first-party 下的默认值。
+  - 不再发 `x-client-request-id`。relay 补上,因为上游本来就是 `api.anthropic.com`。
+  - policy limits、settings sync、team memory 等旁路功能停用。
+  - **遥测会上报 base URL 的 host**(`127.0.0.1:<端口>`):订阅 OAuth 账号 + 自定义网关这个组合会出现在 Anthropic 自己的遥测里。
+- **一部分请求不经过 relay**:profile、usage、bootstrap 等端点直连 `api.anthropic.com`,用的是会话启动时那枚租约。续期或换号之后,它们仍带着旧的那枚;过了它的视界可能开始 401。推理请求不受影响。
+- **`metadata.user_id` 里的 `account_uuid` 取自本机登录**(`~/.claude.json`),与池子租约不是同一个号。这在 relay 之前就存在,relay 让它在会话中途换号时更明显。
+- **只覆盖从 `claude-pool` 启动的会话**。Claude Code 从自己二进制拉起的进程(`--bg` 后台会话、agent view、团队队友、自我重启)不经过启动器,拿到的是机器上的环境凭证。要接住它们,得把 relay 常驻(launchd)并写进 settings 的 `env` 块,尚未做。
+- **计费归属未经 relay 单独测量**。GATE 2 真网络跑通了会话中途换号(两轮都 200、`service_tier: standard`),但几百 token 在看板的整数百分比上看不出变化。结构上与直接注入 `CLAUDE_CODE_OAUTH_TOKEN` 等价(relay 只换 Authorization,请求其余部分由真 claude 生成),这条按「结构等价」采信,未单独验证。
+- **真实的额度用满换号只在假上游上验证过**(`scripts/e2e-claude-pool.ts`)。触发一次真实的 5h 用满代价太大,判定规则照抄的是客户端自己的分类代码。
 
 ## 工程
 

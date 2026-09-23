@@ -33,10 +33,13 @@ type LogPayload = {
  * throws (directory gone, disk full) costs a record rather than a turn. Duplicating that guard would
  * only hide which of the two swallowed it.
  */
-export function createFileLogClient(env: NodeJS.ProcessEnv = process.env): {
+export function createFileLogClient(
+  env: NodeJS.ProcessEnv = process.env,
+  // The claude-pool relay reuses this sink with its own file; senpi keeps the default.
+  path: string = senpiLogPath(env),
+): {
   app: { log: (payload: LogPayload) => void }
 } {
-  const path = senpiLogPath(env)
   return {
     app: {
       // 0600 applies on creation only, and matters because this file lands beside senpi-lease-cache.json.
