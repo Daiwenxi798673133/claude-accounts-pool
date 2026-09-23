@@ -86,6 +86,26 @@ git clone --depth 1 https://github.com/Daiwenxi798673133/claude-accounts-pool.gi
 
 **4. 想把一个号移出池子**:同一个看板,点右上角「删除账号」,选中那一行,再把它的邮箱**完整输入一遍**确认。这是**不可撤销**的——账号记录里那份 refresh token 是唯一一份,Anthropic 不补发,删掉只能重新授权。master 会在删除前把这条记录单独备份到 `claude-accounts.json` 的同目录下(`claude-accounts.deleted-<时间戳>-<id前缀>.json`),后悔了从那里拷回来。
 
+### cloud 模式:用池子的号跑原生 Claude Code
+
+worker 配好之后,这台机器还多一条入口:直接用账号池的号起一个**原生 `claude` 会话**。
+
+```bash
+bun ~/.claude-accounts-pool/claude-pool.ts            # 等价于 `claude`,但用池子的号
+bun ~/.claude-accounts-pool/claude-pool.ts -p "..."   # 参数原样透传,一个都不解析
+```
+
+它在会话开始前领一次租约,把凭证放进 `claude` 子进程的环境,然后把终端整个让出去。**不碰你自己的登录**:`~/.claude/.credentials.json` 与 Keychain 条目一个字节都不动,不用这条命令时,手敲的 `claude` 照常用你自己的号。
+
+两件必须先知道的事:
+
+- **会话中途不换号,也不续期。** 实测 claude 2.1.278:凭证在进程内冻结——改 settings、送 401,都不会让一个已经在跑的会话换掉 token。所以账号在会话开始时定下,之后只能靠重开来换。租约有效期(启动时会打印)上限约 4 小时,超时的长会话会以 401 结束。
+- **环境里有更高优先级的凭证时,它会拒绝启动而不是将就。** `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY`,以及 settings 里的 `apiKeyHelper`,都排在池子租约之前。将就的后果是会话照跑、钱记在池子没租过的号上,而且无法从内部察觉——所以宁可不启动,并告诉你 unset 哪一个。
+
+退出码:`78` = 这台机器配置得让租约用不上(先按提示修);`75` = 池子这会儿给不出号(稍后再试);其余都是 `claude` 自己的退出码。
+
+设计依据与实测记录见 [issue #83](https://github.com/Daiwenxi798673133/claude-accounts-pool/issues/83)。
+
 ### 更多细节
 
 - [docs/local-mode.md](docs/local-mode.md) —— 单机模式详解:账号管理流程、`/usage` 面板键位、`/stats` 仪表盘、限流自动切号的完整机制、ChatGPT 多账号(含两个默认关闭的开关)

@@ -38,6 +38,9 @@
       "import": "./dist/tui.js"
     }
   },
+  "bin": {
+    "claude-pool": "./claude-pool.ts"
+  },
   "files": [
     "dist",
     "tui.tsx",
@@ -45,7 +48,8 @@
     "!src/**/*.test.ts",
     "README.md",
     "LICENSE",
-    "senpi-extension.ts"
+    "senpi-extension.ts",
+    "claude-pool.ts"
   ],
   "engines": {
     "opencode": ">=1.3.13",
