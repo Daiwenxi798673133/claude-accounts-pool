@@ -36,6 +36,10 @@ export const CLAUDE_CODE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 // fork, until the machine runs out of processes. The sentinel is what turns that into one sentence.
 export const POOL_SESSION_SENTINEL = "CLAUDE_ACCOUNTS_POOL_SESSION"
 
+// 本次会话租到的账号 id,交给 StopFailure 钩子用。必须走环境,因为钩子报文里【没有】账号信息
+// (官方 schema 只有 session_id / error_type / error_message),而钩子是另一个进程,拿不到启动器的内存。
+export const POOL_ACCOUNT_VAR = "CLAUDE_ACCOUNTS_POOL_ACCOUNT"
+
 export type Blocker = {
   varName: string
   // Shown to the operator verbatim, so it names the FIX rather than the rule: they are standing at a
@@ -93,6 +97,8 @@ export function settingsBlockers(settings: unknown): Blocker[] {
 export type ChildEnvInput = {
   env: NodeJS.ProcessEnv
   access: string
+  // 本次租约的账号 id。空串用于启动前那次不带凭证的空跑(守卫检查),此时不写这个变量。
+  accountId?: string
   // Parsed contents of the settings file that applies to the child, or undefined when the caller
   // could not read one. UNDEFINED IS NOT "CLEAN": it means unknown, and the caller says so — this
   // module only reports what it was shown.
@@ -110,7 +116,15 @@ export type ChildEnvOutcome =
 export function buildChildEnv(input: ChildEnvInput): ChildEnvOutcome {
   const blockers = [...envBlockers(input.env), ...settingsBlockers(input.settings)]
   if (blockers.length > 0) return { ok: false, blockers }
-  return { ok: true, env: { ...input.env, [CLAUDE_CODE_TOKEN_VAR]: input.access, [POOL_SESSION_SENTINEL]: "1" } }
+  return {
+    ok: true,
+    env: {
+      ...input.env,
+      [CLAUDE_CODE_TOKEN_VAR]: input.access,
+      [POOL_SESSION_SENTINEL]: "1",
+      ...(input.accountId === undefined || input.accountId.length === 0 ? {} : { [POOL_ACCOUNT_VAR]: input.accountId }),
+    },
+  }
 }
 
 // Which provider's credentials this lane can carry. Stated as a typed constant rather than left

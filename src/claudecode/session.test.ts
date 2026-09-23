@@ -126,3 +126,29 @@ test("子进程环境带上哨兵,下一代才认得出自己在环里", async (
   await runPooledSession(h.deps, [])
   expect(h.spawned[0].env.CLAUDE_ACCOUNTS_POOL_SESSION).toBe("1")
 })
+
+test("限流上报钩子经 --settings 挂到子进程上,账号 id 随环境送进去", async () => {
+  const h = harness({ hookPath: "/opt/pool/claude-pool-hook.ts" })
+  await runPooledSession(h.deps, ["-p", "x"])
+  const settingsIndex = h.spawned[0].argv.indexOf("--settings")
+  expect(settingsIndex).toBe(0)
+  expect(h.spawned[0].argv[settingsIndex + 1]).toContain("claude-pool-hook.ts")
+  expect(h.spawned[0].argv.slice(2)).toEqual(["-p", "x"])
+  // 钩子是另一个进程,报文里又没有账号信息,所以这是它认得出「这轮是哪个号撞的墙」的唯一途径。
+  expect(h.spawned[0].env.CLAUDE_ACCOUNTS_POOL_ACCOUNT).toBe("af008f89-1111-2222-3333-444455556666")
+})
+
+// 挂不上不该拦住启动:少的是给别的机器看的遥测,这次会话照常能跑。
+test("操作者自己传了 --settings:照常启动,但说清楚代价", async () => {
+  const h = harness({ hookPath: "/opt/pool/claude-pool-hook.ts" })
+  const code = await runPooledSession(h.deps, ["--settings", "/my/own.json"])
+  expect(code).toBe(0)
+  expect(h.spawned[0].argv).toEqual(["--settings", "/my/own.json"])
+  expect(h.notices.join("\n")).toContain("限流")
+})
+
+test("找不到钩子脚本时照常启动", async () => {
+  const h = harness({ hookPath: undefined })
+  expect(await runPooledSession(h.deps, ["-p", "x"])).toBe(0)
+  expect(h.spawned[0].argv).toEqual(["-p", "x"])
+})

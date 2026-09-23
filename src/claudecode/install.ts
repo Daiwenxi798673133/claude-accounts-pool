@@ -6,12 +6,16 @@
 // nothing to refresh (the master owns every chain — INV-CLOUD-1). If a future edit adds a timer here,
 // that is the signal something has been misunderstood.
 import { spawn } from "node:child_process"
+import { existsSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { constants as osConstants, homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { log } from "../logger.ts"
 import { createLeaseClient } from "../worker/leaseClient.ts"
+import type { HookRunDeps } from "./hookRun.ts"
 import type { SessionDeps } from "./session.ts"
+import { POOL_ACCOUNT_VAR } from "./childEnv.ts"
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -71,7 +75,28 @@ function spawnChild(bin: string): SessionDeps["spawn"] {
     })
 }
 
+// 钩子脚本在仓库根,与本文件相距两层。解析成绝对路径而不是相对路径,因为它要被写进交给子进程的
+// settings JSON,而子进程的 cwd 是操作者的工作目录,不是这个仓库。
+// 找不到就返回 undefined:一个装了一半的 clone(或某天改了布局)不该让整条链路起不来,代价只是
+// 少一条遥测 —— session.ts 会照实说一句。
+export function resolveHookPath(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const path = join(dirname(dirname(here)), "claude-pool-hook.ts")
+  return existsSync(path) ? path : undefined
+}
+
 export type ClaudeCodeConfig = { masterUrl: string; workerId: string }
+
+// 钩子进程的依赖。与 createSessionDeps 分开,因为它们跑在【不同的进程】里:启动器起会话,钩子由
+// Claude Code 在一轮对话失败时另行拉起,两者唯一的共同点是同一份 worker 配置和同一个 master。
+export function createHookDeps(cfg: ClaudeCodeConfig, env: NodeJS.ProcessEnv): HookRunDeps {
+  const client = createLeaseClient({ fetchImpl: fetch, sleep, masterUrl: cfg.masterUrl, workerId: cfg.workerId })
+  return {
+    readStdin: async () => await new Response(process.stdin as unknown as ReadableStream).text(),
+    reportRateLimit: (input) => client.reportRateLimit(input),
+    accountId: env[POOL_ACCOUNT_VAR],
+  }
+}
 
 export function createSessionDeps(cfg: ClaudeCodeConfig, env: NodeJS.ProcessEnv, cwd: string): SessionDeps {
   const client = createLeaseClient({ fetchImpl: fetch, sleep, masterUrl: cfg.masterUrl, workerId: cfg.workerId })
@@ -87,5 +112,6 @@ export function createSessionDeps(cfg: ClaudeCodeConfig, env: NodeJS.ProcessEnv,
     // sentence in that stream would corrupt a machine-readable result.
     notify: (line) => process.stderr.write(`${line}\n`),
     masterUrl: cfg.masterUrl,
+    hookPath: resolveHookPath(),
   }
 }
