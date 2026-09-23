@@ -108,11 +108,20 @@ function spawnRelay(env: NodeJS.ProcessEnv): () => void {
       log.error("claudecode:relay-entry-missing", { entry })
       return
     }
-    const fd = openSync(logPath, "a", 0o600)
-    const child = spawn(process.execPath, [entry], { env, detached: true, stdio: ["ignore", fd, fd] })
-    child.unref()
-    // The child holds its own copy of the descriptor; ours would otherwise stay open for the session.
-    closeSync(fd)
+    // Never throw out of here: a relay that could not be started is reported by the health poll that
+    // follows (relayFailureText points at the log), not by a raw stack trace in the operator's terminal.
+    let fd: number | undefined
+    try {
+      fd = openSync(logPath, "a", 0o600)
+      const child = spawn(process.execPath, [entry], { env, detached: true, stdio: ["ignore", fd, fd] })
+      child.on("error", (error) => log.error("claudecode:relay-spawn-fail", { error: error.message }))
+      child.unref()
+    } catch (error) {
+      log.error("claudecode:relay-spawn-fail", { error: error instanceof Error ? error.message : String(error) })
+    } finally {
+      // The child holds its own copy of the descriptor; ours would otherwise stay open for the session.
+      if (fd !== undefined) closeSync(fd)
+    }
   }
 }
 
@@ -141,6 +150,7 @@ export function createSessionDeps(
       ...(poolArgs.accountPrefix === undefined ? {} : { prefix: poolArgs.accountPrefix }),
       ...(poolArgs.pin === undefined ? {} : { pinned: poolArgs.pin }),
     },
+    pin: createPinStore(env),
     heartbeat: (beat) => {
       // unref: the heartbeat must never be the thing keeping the launcher alive after its child exits.
       const timer = setInterval(() => void beat().catch(() => {}), HEARTBEAT_MS)
@@ -165,7 +175,7 @@ export function createRelayDeps(cfg: ClaudeCodePoolConfig, env: NodeJS.ProcessEn
     }),
     fetchImpl: fetch,
     upstream: upstreamUrl(env),
-    identity: { pid: process.pid, workerId: cfg.workerId, masterUrl: cfg.masterUrl },
+    identity: { pid: process.pid, port: cfg.relayPort, workerId: cfg.workerId, masterUrl: cfg.masterUrl },
     // process.kill(pid, 0) sends nothing, it only checks existence; EPERM means the process is there.
     isAlive: (pid) => {
       try {

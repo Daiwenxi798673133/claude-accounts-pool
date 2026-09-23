@@ -13,6 +13,7 @@
 import type { LeaseFailure } from "../worker/leaseClient.ts"
 import type { LeaseRefusal } from "../cloud/protocol.ts"
 import { buildChildEnv, POOL_SESSION_SENTINEL, type Blocker } from "./childEnv.ts"
+import { applyPinIntent, type PinStore } from "./pin.ts"
 import { relayNotices, type RelayClient, type RelayUp } from "./relayClient.ts"
 
 // sysexits codes, not 1-for-everything: the operator's shell (and any wrapper script) can tell
@@ -92,8 +93,10 @@ export type SessionDeps = {
   workerId: string
   // This launcher's pid — what the relay registers. The launcher lives exactly as long as its child.
   pid: number
-  // --pool-account on this command line: switch the MACHINE's shared account to it.
+  // --pool-account / --pool-pin / --pool-unpin on this command line. The prefix switches the MACHINE's
+  // shared account; `pinned` true/false sets/clears the pin the relay names on every automatic lease.
   preference: { prefix?: string; pinned?: boolean }
+  pin: PinStore
   // Runs `beat` periodically while the child is alive; returns the function that stops it. A relay
   // that crashed mid-session is brought back and this session re-registered by the next beat —
   // otherwise every open session would lose its route to Anthropic until someone started a new one.
@@ -131,6 +134,14 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
   }
   for (const line of relayNotices(up.health, { workerId: deps.workerId, masterUrl: deps.masterUrl })) {
     deps.notify(`账号池:${line}`)
+  }
+
+  // 钉住意图【在守卫与 relay 都通过之后】落盘,且在 attach 之前:被拒绝的启动不该留下一个钉住 ——
+  // relay 下一次续期就会把整台机器搬过去;而 attach 被 master 拒绝时,relay 交还的正是这里写下的那个。
+  applyPinIntent(deps.pin, { accountPrefix: deps.preference.prefix, pin: deps.preference.pinned })
+  const storedPin = deps.pin.read()
+  if (deps.preference.prefix !== undefined && deps.preference.pinned !== true && storedPin !== undefined && storedPin !== deps.preference.prefix) {
+    deps.notify(`账号池:钉住的 ${storedPin} 仍然有效,下一次续期会切回它。想改钉这个号,加 --pool-pin;想取消钉住,用 --pool-unpin。`)
   }
 
   const attached = await deps.relay.attach({

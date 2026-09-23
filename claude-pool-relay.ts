@@ -51,10 +51,12 @@ log.info("claudecode:relay-started", { pid: process.pid, port: config.relayPort,
 
 const timer = setInterval(() => {
   if (relay.tick() !== "exit") return
+  // 闲置判据只看"最近一次请求开始的时刻",一条比闲置窗口还长的流(没有登记的孤儿会话发起的)
+  // 此刻可能还在回传。有在飞的请求就再等一拍,而且优雅关闭 —— 强制关会把它拦腰截断。
+  if (server.pendingRequests > 0) return
   log.info("claudecode:relay-idle-exit", { pid: process.pid })
   clearInterval(timer)
-  server.stop(true)
-  process.exit(0)
+  void server.stop().then(() => process.exit(0))
 }, RELAY_TICK_MS)
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {

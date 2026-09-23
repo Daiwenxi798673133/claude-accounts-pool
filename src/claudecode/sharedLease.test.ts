@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import type { LeaseOutcome } from "../worker/leaseClient.ts"
 import { LEASE_RENEW_BUFFER_MS } from "../constants.ts"
-import { createSharedLease, SWITCH_RETRY_MS, type SharedLeaseDeps } from "./sharedLease.ts"
+import { createSharedLease, RENEW_RETRY_MS, REPEAT_SWITCH_MS, SWITCH_RETRY_MS, type SharedLeaseDeps } from "./sharedLease.ts"
 
 const A = "aaaaaaaa-0000-0000-0000-000000000000"
 const B = "bbbbbbbb-0000-0000-0000-000000000000"
@@ -246,4 +246,77 @@ test("点名拿回一枚本进程见过 401 的 access:如实失败,不静默换
   const named = await h.shared.name("aaaaaaaa", false)
   expect(named.ok).toBe(false)
   expect(!named.ok && named.failure.kind).toBe("dead-access")
+})
+
+// master 慢速故障时,续期窗口里的每个请求都在串行队列里各等一次超时 —— 第 5 个要等一分多钟。
+test("续期失败后退避:并发的 ensure 不各自再等一次 master,手里那枚能用就接着用", async () => {
+  const h = harness({
+    delay: 20,
+    answers: [
+      () => h.grant(A, "x"),
+      () => ({ ok: false, failure: { kind: "unreachable", detail: "timeout" } }),
+      () => h.grant(A, "y"),
+    ],
+  })
+  await h.shared.ensure()
+  h.advance(3 * 3600_000 - 60_000)
+  const results = await Promise.all(Array.from({ length: 5 }, () => h.shared.ensure()))
+  expect(h.leases).toHaveLength(2)
+  for (const r of results) expect(r.ok && r.lease.access).toBe("x")
+  h.advance(RENEW_RETRY_MS)
+  const retried = await h.shared.ensure()
+  expect(h.leases).toHaveLength(3)
+  expect(retried.ok && retried.lease.access).toBe("y")
+})
+
+test("没有可用租约且刚失败过:直接交回上次的失败,不再等 master", async () => {
+  const h = harness({ answers: [() => ({ ok: false, failure: { kind: "unreachable", detail: "timeout" } })] })
+  expect((await h.shared.ensure()).ok).toBe(false)
+  const again = await h.shared.ensure()
+  expect(!again.ok && again.failure.kind).toBe("unreachable")
+  expect(h.leases).toHaveLength(1)
+})
+
+// master 的错报宽限期(15s):刚换过去就报限流,master 丢弃报告、原号奉还。
+test("master 原号奉还:宽限期内同一个号上的 429 不再上报、不再换号", async () => {
+  const h = harness({ answers: [() => h.grant(A, "a"), () => h.grant(B, "b"), () => h.grant(B, "b2"), () => h.grant(C, "c")] })
+  await h.shared.ensure()
+  await h.shared.quotaExhausted(A, QUOTA) // A → B
+  const same = await h.shared.quotaExhausted(B, QUOTA) // master 原样发回 B
+  expect(same.ok && same.lease.accountId).toBe(B)
+  await h.shared.quotaExhausted(B, QUOTA)
+  await h.shared.quotaExhausted(B, QUOTA)
+  expect(h.reports.map((r) => r.accountId)).toEqual([A, B])
+  expect(h.leases).toHaveLength(3)
+  h.advance(REPEAT_SWITCH_MS)
+  const moved = await h.shared.quotaExhausted(B, QUOTA)
+  expect(moved.ok && moved.lease.accountId).toBe(C)
+  expect(h.reports.map((r) => r.accountId)).toEqual([A, B, B])
+})
+
+// 代次比对管"只换一次",不该连带吞掉"旧号用满了"这件事。
+test("号因为点名已经换走时,在旧号上撞墙仍然上报旧号,但不换号", async () => {
+  const h = harness({ answers: [() => h.grant(A, "a"), () => h.grant(C, "c")] })
+  await h.shared.ensure()
+  await h.shared.name("cccccccc", false)
+  const r = await h.shared.quotaExhausted(A, QUOTA)
+  expect(r.ok && r.lease.accountId).toBe(C)
+  expect(h.reports.map((x) => x.accountId)).toEqual([A])
+  expect(h.leases).toHaveLength(2)
+})
+
+test("交还钉住前先核对:读钉住与被拒之间换了新钉住,新钉住不被抹掉", async () => {
+  let h!: ReturnType<typeof harness>
+  h = harness({
+    pin: "aaaaaaaa",
+    answers: [
+      () => {
+        h.setPin("bbbbbbbb") // 启动器在这次请求飞行期间写进了新钉住
+        return { ok: false, failure: { kind: "refused", refused: "cooling" } }
+      },
+      () => h.grant(C, "c"),
+    ],
+  })
+  await h.shared.ensure()
+  expect(h.pin()).toBe("bbbbbbbb")
 })

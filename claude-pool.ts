@@ -21,7 +21,6 @@
 // 这台机器必须先被 configure-worker 配过(~/.claude-accounts-pool/senpi-worker.json)。
 import { parsePoolArgs } from "./src/claudecode/args.ts"
 import { readPoolConfig } from "./src/claudecode/config.ts"
-import { applyPinIntent, createPinStore } from "./src/claudecode/pin.ts"
 import { createSessionDeps } from "./src/claudecode/install.ts"
 import { EXIT_BLOCKED, runPooledSession } from "./src/claudecode/session.ts"
 
@@ -42,11 +41,8 @@ if (!parsed.ok) {
   process.exit(EXIT_BLOCKED)
 }
 
-// 钉住意图【先落盘】:relay 在每一次自动租约时读它,必须在 attach 之前就能看到新意图。
-// 被 master 拒绝时由 relay 交还 —— 那是唯一允许放弃钉住的路径。
-applyPinIntent(createPinStore(process.env), parsed.args)
-
-// 登记与注销都在 runPooledSession 里,因为会话的生命周期就是登记的生命周期。这里不再有
+// 钉住意图的落盘、登记与注销都在 runPooledSession 里:钉住要等守卫通过再写(被拒绝的启动不该留下
+// 一个会把整台机器搬走的钉住),登记的生命周期就是会话的生命周期。这里不再有
 // process.exit 之前要做的清理 —— process.exit 会直接终止进程、finally 根本不跑。
 const deps = createSessionDeps(config, process.env, process.cwd(), parsed.args)
 process.exit(await runPooledSession(deps, parsed.args.rest))

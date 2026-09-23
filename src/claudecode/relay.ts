@@ -55,7 +55,8 @@ export type RelayDeps = {
   fetchImpl: typeof fetch
   // 上游地址,生产是 https://api.anthropic.com;只有测试会改(CAP_CC_UPSTREAM)。
   upstream: string
-  identity: { pid: number; workerId: string; masterUrl: string }
+  // port: 本 relay 监听的端口,用来核对请求的 Host(见 fromThisMachine)。
+  identity: { pid: number; port: number; workerId: string; masterUrl: string }
   // 会话登记的是启动器进程的 pid,它与 claude 子进程同生共死。kill -9 掉的启动器不会来 detach,
   // 所以每次 tick 都按存活回收。
   isAlive: (pid: number) => boolean
@@ -71,6 +72,23 @@ export type Relay = {
 }
 
 const BODYLESS = new Set(["GET", "HEAD"])
+
+// 只有这条路径上的 401 才说明凭证死了。别的端点(经 base URL 过来的 /api/* 之类)的 401 可能是
+// scope 或别的原因,拿它去判死凭证,会在 master 原样发回同一枚时把整台机器换到别的号上 ——
+// 违反"只在额度用满时换号"。
+const CREDENTIAL_PROBE_PATH = "/v1/messages"
+
+// 【浏览器挡在门外】relay 绑的是回环,但回环挡不住本机浏览器里的网页:
+//   · 任何网页都能对 127.0.0.1 发 text/plain 的"简单 POST",不经 CORS 预检 —— 登记一个假会话,
+//     relay 就永不退出、一直续着租约;
+//   · DNS rebinding 能让网页以同源身份读到 /attach 的应答,里面有一枚活的 access。
+// claude(以及 claude-pool 启动器)从不发 Origin,Host 永远是 127.0.0.1:<端口>。浏览器发起的跨源请求
+// 一定带 Origin,rebinding 过来的请求 Host 是攻击者的域名。所以两条都核对。这不是应用层鉴权 ——
+// 不认人,只认"是不是从本机的非浏览器进程来的"。
+function fromThisMachine(req: Request, url: URL, port: number): boolean {
+  if (req.headers.has("origin")) return false
+  return url.host === `127.0.0.1:${port}` || url.host === `localhost:${port}`
+}
 
 // 失败变体 → 状态码 + 会话里显示的那句话。按变体建表,理由与全仓一致:补救动作各不相同。
 // 5xx 让客户端按退避重试(master 在重启时正是想要的),429 让它直接显示、不重试(池子空了重试是空转)。
@@ -92,7 +110,8 @@ function failureResponse(failure: LeaseFailure, masterUrl: string): Response {
 function parseAttach(raw: unknown): AttachRequest | undefined {
   if (typeof raw !== "object" || raw === null) return undefined
   const { pid, preferredAccountIdPrefix, pinned } = raw as Record<string, unknown>
-  if (!Number.isInteger(pid) || (pid as number) <= 0) return undefined
+  // pid 1 被拒:它永远"活着"(对它 kill(1, 0) 得到 EPERM,isAlive 算活),登记它就等于让 relay 永不退出。
+  if (!Number.isInteger(pid) || (pid as number) <= 1) return undefined
   if (preferredAccountIdPrefix !== undefined && (typeof preferredAccountIdPrefix !== "string" || preferredAccountIdPrefix.length === 0)) {
     return undefined
   }
@@ -124,6 +143,11 @@ export function createRelay(deps: RelayDeps): Relay {
 
   async function control(req: Request, path: string): Promise<Response> {
     if (path === RELAY_ROUTES.health && req.method === "GET") return Response.json(health())
+    // 控制面的 POST 必须是 JSON:浏览器的"简单请求"发不出 application/json,于是这一条连同上面的
+    // Origin 核对,把"网页不经预检就能登记会话"这条路堵死。
+    if (req.method === "POST" && !(req.headers.get("content-type") ?? "").startsWith("application/json")) {
+      return Response.json({ error: "control routes take application/json" }, { status: 415 })
+    }
     if (path === RELAY_ROUTES.attach && req.method === "POST") {
       const input = parseAttach(await req.json().catch(() => undefined))
       if (!input) return Response.json({ error: "malformed attach" }, { status: 400 })
@@ -186,7 +210,7 @@ export function createRelay(deps: RelayDeps): Relay {
           lease = next
           res = await send(req, url, body, next.lease.access)
         }
-      } else if (res.status === 401) {
+      } else if (res.status === 401 && path.startsWith(CREDENTIAL_PROBE_PATH)) {
         const next = await deps.shared.unauthorized(lease.lease.access)
         if (next.ok && next.lease.access !== lease.lease.access) {
           await res.body?.cancel().catch(() => {})
@@ -212,6 +236,10 @@ export function createRelay(deps: RelayDeps): Relay {
   return {
     handle: async (req) => {
       const url = new URL(req.url)
+      if (!fromThisMachine(req, url, deps.identity.port)) {
+        log.warn("claudecode:relay-foreign-request", { host: url.host, hasOrigin: req.headers.has("origin") })
+        return Response.json({ error: "claude-pool relay only serves local non-browser clients" }, { status: 403 })
+      }
       if (url.pathname.startsWith("/__claude-pool/")) return control(req, url.pathname)
       return forward(req, url.pathname, url.search)
     },

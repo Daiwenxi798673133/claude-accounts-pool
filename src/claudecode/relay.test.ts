@@ -52,7 +52,7 @@ function harness(
     shared,
     fetchImpl,
     upstream: "https://api.anthropic.com/",
-    identity: { pid: 4242, workerId: "vince-cc", masterUrl: "http://master:8787" },
+    identity: { pid: 4242, port: 18787, workerId: "vince-cc", masterUrl: "http://master:8787" },
     isAlive: (pid) => alive.has(pid),
     newRequestId: () => "rid",
     now: () => now,
@@ -284,4 +284,59 @@ test("未知控制路由:404,不转发给上游", async () => {
   const h = harness()
   expect((await h.relay.handle(new Request(`${BASE}/__claude-pool/nope`))).status).toBe(404)
   expect(h.seen).toHaveLength(0)
+})
+
+// 回环挡不住本机浏览器里的网页。claude 与启动器从不发 Origin,Host 永远是 127.0.0.1:<端口>。
+test("带 Origin 的请求一律 403:浏览器里的网页不能用 relay", async () => {
+  const h = harness()
+  const res = await h.relay.handle(post("/v1/messages", {}, { origin: "https://evil.example" }))
+  expect(res.status).toBe(403)
+  const attach = await h.relay.handle(post(RELAY_ROUTES.attach, { pid: 11 }, { origin: "https://evil.example" }))
+  expect(attach.status).toBe(403)
+  expect(h.seen).toHaveLength(0)
+  expect(h.relay.sessionCount()).toBe(0)
+})
+
+test("Host 不是 127.0.0.1:<端口>(DNS rebinding)一律 403,access 不会被读走", async () => {
+  const h = harness()
+  const res = await h.relay.handle(
+    new Request("http://evil.example:18787" + RELAY_ROUTES.attach, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pid: 11 }),
+    }),
+  )
+  expect(res.status).toBe(403)
+  expect(await res.text()).not.toContain("access-A")
+  expect(h.leaseCalls).toHaveLength(0)
+})
+
+test("localhost:<端口> 同样放行", async () => {
+  const h = harness()
+  const res = await h.relay.handle(new Request("http://localhost:18787" + RELAY_ROUTES.health))
+  expect(res.status).toBe(200)
+})
+
+// 浏览器的"简单 POST"(text/plain)不经 CORS 预检;要求 JSON 就把它挡在外面。
+test("控制面的 POST 不是 application/json:415", async () => {
+  const h = harness()
+  const res = await h.relay.handle(
+    new Request(`${BASE}${RELAY_ROUTES.attach}`, { method: "POST", headers: { "content-type": "text/plain" }, body: JSON.stringify({ pid: 11 }) }),
+  )
+  expect(res.status).toBe(415)
+  expect(h.relay.sessionCount()).toBe(0)
+})
+
+test("pid 1 不收:它永远算活着,登记它 relay 就永不退出", async () => {
+  const h = harness()
+  expect((await h.relay.handle(post(RELAY_ROUTES.attach, { pid: 1 }))).status).toBe(400)
+})
+
+// 只有 /v1/messages 上的 401 说明凭证死了;别处的 401 拿去判死凭证,会把整台机器换到别的号上。
+test("别的路径上的 401 原样交给客户端,不判死凭证、不续期", async () => {
+  const h = harness({ upstream: () => new Response("{}", { status: 401 }) })
+  const res = await h.relay.handle(new Request(`${BASE}/api/oauth/profile`))
+  expect(res.status).toBe(401)
+  expect(h.leaseCalls).toHaveLength(1) // 只有首次 ensure
+  expect(h.seen).toHaveLength(1)
 })

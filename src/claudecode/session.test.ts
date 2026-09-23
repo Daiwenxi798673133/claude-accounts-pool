@@ -18,6 +18,7 @@ const attachedOk = (over: Partial<{ accountId: string; access: string; expiresAt
 })
 
 type Harness = {
+  pinValue: () => string | undefined
   deps: SessionDeps
   spawned: { argv: readonly string[]; env: NodeJS.ProcessEnv }[]
   notices: string[]
@@ -28,14 +29,27 @@ type Harness = {
   stopped: number
 }
 
-function harness(over: Partial<SessionDeps> & { up?: RelayUp; attach?: (input: AttachRequest) => AttachOutcome } = {}): Harness {
-  const h: Harness = { spawned: [], notices: [], attaches: [], detaches: [], ensures: 0, beats: [], stopped: 0, deps: undefined as never }
+function harness(
+  over: Partial<SessionDeps> & { up?: RelayUp; attach?: (input: AttachRequest) => AttachOutcome; storedPin?: string } = {},
+): Harness {
+  let pinned = over.storedPin
+  const h: Harness = {
+    spawned: [],
+    notices: [],
+    attaches: [],
+    detaches: [],
+    ensures: 0,
+    beats: [],
+    stopped: 0,
+    pinValue: () => pinned,
+    deps: undefined as never,
+  }
   const relay: RelayClient = {
     ensureRunning: async () => (h.ensures++, over.up ?? UP),
     attach: async (input) => (h.attaches.push(input), (over.attach ?? (() => attachedOk()))(input)),
     detach: async (pid) => void h.detaches.push(pid),
   }
-  const { up: _up, attach: _attach, ...rest } = over
+  const { up: _up, attach: _attach, storedPin: _storedPin, ...rest } = over
   h.deps = {
     relay,
     relayUrl: "http://127.0.0.1:18787",
@@ -49,6 +63,7 @@ function harness(over: Partial<SessionDeps> & { up?: RelayUp; attach?: (input: A
     workerId: "vince-cc",
     pid: 777,
     preference: {},
+    pin: { read: () => pinned, write: (next) => void (pinned = next) },
     heartbeat: (beat) => {
       h.beats.push(beat)
       return () => void h.stopped++
@@ -215,4 +230,38 @@ test("子进程抛错(比如 claude 不存在)也要停心跳、注销登记", a
   await expect(runPooledSession(h.deps, [])).rejects.toThrow("ENOENT")
   expect(h.stopped).toBe(1)
   expect(h.detaches).toEqual([777])
+})
+
+// 被拒绝的启动不该留下钉住:relay 下一次续期就会按它把整台机器搬过去。
+test("守卫拦下的启动不落盘钉住", async () => {
+  const h = harness({ env: { PATH: "/usr/bin", ANTHROPIC_API_KEY: "k" }, preference: { prefix: "af008f89", pinned: true } })
+  await runPooledSession(h.deps, [])
+  expect(h.pinValue()).toBeUndefined()
+})
+
+test("relay 起不来的启动也不落盘钉住", async () => {
+  const h = harness({ up: { ok: false, reason: "timeout" }, preference: { prefix: "af008f89", pinned: true } })
+  await runPooledSession(h.deps, [])
+  expect(h.pinValue()).toBeUndefined()
+})
+
+test("--pool-pin 在 attach 之前落盘(relay 被拒时交还的正是它)", async () => {
+  let seenAtAttach: string | undefined
+  const h = harness({ preference: { prefix: "af008f89", pinned: true }, attach: () => ((seenAtAttach = h.pinValue()), attachedOk()) })
+  await runPooledSession(h.deps, [])
+  expect(seenAtAttach).toBe("af008f89")
+})
+
+test("--pool-unpin 清掉钉住", async () => {
+  const h = harness({ storedPin: "af008f89", preference: { pinned: false } })
+  await runPooledSession(h.deps, [])
+  expect(h.pinValue()).toBeUndefined()
+})
+
+// 钉住是机器级的:一次性点名只撑到下一次续期,不说出来操作者会以为号被莫名切回去了。
+test("一次性点名而另一个号仍钉着:提醒下一次续期会切回去", async () => {
+  const h = harness({ storedPin: "eaaa1a79", preference: { prefix: "af008f89" } })
+  await runPooledSession(h.deps, [])
+  expect(h.pinValue()).toBe("eaaa1a79")
+  expect(h.notices.join("\n")).toContain("钉住的 eaaa1a79 仍然有效")
 })

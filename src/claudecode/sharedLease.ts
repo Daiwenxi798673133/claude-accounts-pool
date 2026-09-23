@@ -49,6 +49,15 @@ export type SharedLeaseDeps = {
 // 否则池子空了的那几分钟里,每个请求都是一次上报加一次租约 —— 对着 master 连发,而答案不会变。
 export const SWITCH_RETRY_MS = 60_000
 
+// master 把刚换过去的号原样发回来时(它的 RATELIMIT_ADOPTION_GRACE_MS = 15s:刚换过去就报限流,
+// master 认定是错报、丢弃报告并原号奉还),这段时间内同一个号上的 429 不再上报、不再换号 —— 答案在
+// 宽限期内不会变。略长于 15s,过了宽限期再报,master 才会真的轮换。同一个号的上报也按这个窗口去重。
+export const REPEAT_SWITCH_MS = 20_000
+
+// 续期失败之后多久再试。master 慢速故障(tailnet 掉线,每次都等满 15s 超时)时,没有这个退避,
+// 续期窗口里的每个请求都会在串行队列里各等一次超时 —— 第 5 个并发请求要等一分多钟。
+export const RENEW_RETRY_MS = 30_000
+
 export type SharedLease = {
   /** 当前持有的租约,不发起任何请求。 */
   current: () => HeldLease | undefined
@@ -67,7 +76,12 @@ export function createSharedLease(deps: SharedLeaseDeps): SharedLease {
   // 本进程亲眼见过 401 的 access。master 在视界够宽时返回缓存的那枚,吊销了也原样返回
   // (src/senpi/deadLease.ts 的头注释),所以"续一次"可能拿回同一具尸体 —— 这个集合是唯一的证据。
   const deadAccess = new Set<string>()
-  let switchFailed: { accountId: string; at: number; failure: LeaseFailure } | undefined
+  // 某个号上的换号暂时不必再试:换号失败(SWITCH_RETRY_MS)或 master 原号奉还(REPEAT_SWITCH_MS)。
+  let switchHold: { accountId: string; until: number; result: SharedLeaseResult } | undefined
+  // 每个号最近一次上报的时刻。代次比对管"只换一次号",这里管"只报一次"—— 两者不是一回事:号因为
+  // 别的原因(点名、续期挪了号)已经换走时,在旧号上撞墙的请求仍然该让 master 知道旧号用满了。
+  const reportedAt = new Map<string, number>()
+  let renewFailed: { at: number; failure: LeaseFailure } | undefined
 
   let queue: Promise<unknown> = Promise.resolve()
   function serialize<T>(fn: () => Promise<T>): Promise<T> {
@@ -97,19 +111,38 @@ export function createSharedLease(deps: SharedLeaseDeps): SharedLease {
     const outcome = await leaseLiveAccess(leaseDeps, { ...base, preferredAccountIdPrefix: pinned, pinned: true })
     if (outcome.ok || outcome.failure.kind !== "refused") return outcome
     log.warn("claudecode:relay-pin-dropped", { idPrefix: pinned, refused: outcome.failure.refused })
-    deps.pin.write(undefined)
+    // 只交还【被拒的那个】钉住:读钉住与 master 拒绝之间,启动器可能已经写进了一个新的。
+    if (deps.pin.read() === pinned) deps.pin.write(undefined)
     return leaseLiveAccess(leaseDeps, base)
   }
 
   async function renew(why: string): Promise<SharedLeaseResult> {
+    // 刚失败过:不再去等 master,手里那枚能用就用,不能用就把上次的失败原样交回。
+    if (renewFailed !== undefined && deps.now() - renewFailed.at < RENEW_RETRY_MS) {
+      if (held !== undefined && usable(held)) return { ok: true, lease: held }
+      return { ok: false, failure: renewFailed.failure }
+    }
     const outcome = await autoLease("prelease")
-    if (outcome.ok) return adopt(outcome.lease, why)
+    if (outcome.ok) {
+      renewFailed = undefined
+      return adopt(outcome.lease, why)
+    }
+    renewFailed = { at: deps.now(), failure: outcome.failure }
     // 续不上但手里那枚还能用:接着用,下一次再续。把一次 master 抖动变成所有会话的报错才是错的。
     if (held !== undefined && usable(held)) {
       log.warn("claudecode:relay-renew-failed", { kind: outcome.failure.kind, accountId: held.accountId.slice(0, 8) })
       return { ok: true, lease: held }
     }
     return outcome
+  }
+
+  async function reportOnce(accountId: string, headers: Headers): Promise<void> {
+    const last = reportedAt.get(accountId)
+    if (last !== undefined && deps.now() - last < REPEAT_SWITCH_MS) return
+    reportedAt.set(accountId, deps.now())
+    const resetsAt = resetsAtOf(headers)
+    await deps.reportRateLimit({ accountId, headers: limitHeadersOf(headers), ...(resetsAt === undefined ? {} : { resetsAt }) })
+    log.warn("claudecode:relay-quota-exhausted", { accountId: accountId.slice(0, 8), resetsAt })
   }
 
   return {
@@ -147,41 +180,41 @@ export function createSharedLease(deps: SharedLeaseDeps): SharedLease {
 
     quotaExhausted: (failedAccountId, headers) =>
       serialize(async (): Promise<SharedLeaseResult> => {
-        // 代次比对:排在前面的已经换过号了。
-        if (held !== undefined && held.accountId !== failedAccountId) return { ok: true, lease: held }
-        if (
-          switchFailed !== undefined &&
-          switchFailed.accountId === failedAccountId &&
-          deps.now() - switchFailed.at < SWITCH_RETRY_MS
-        ) {
-          return { ok: false, failure: switchFailed.failure }
+        // 代次比对:号已经不是撞墙的那个了,不再换号 —— 但旧号用满这件事仍要让 master 知道(去重后)。
+        if (held !== undefined && held.accountId !== failedAccountId) {
+          await reportOnce(failedAccountId, headers)
+          return { ok: true, lease: held }
+        }
+        if (switchHold !== undefined && switchHold.accountId === failedAccountId && deps.now() < switchHold.until) {
+          return switchHold.result
         }
         // 先报后租:报告先落地,master 才会把这个号标成冷却 —— 钉住的正是它时,下面的点名会被
         // 明确拒绝(cooling)并交还钉住,而不是把用满的号原样发回来。
-        const resetsAt = resetsAtOf(headers)
-        await deps.reportRateLimit({
-          accountId: failedAccountId,
-          headers: limitHeadersOf(headers),
-          ...(resetsAt === undefined ? {} : { resetsAt }),
-        })
-        log.warn("claudecode:relay-quota-exhausted", { accountId: failedAccountId.slice(0, 8), resetsAt })
+        await reportOnce(failedAccountId, headers)
         const outcome = await autoLease("ratelimit")
         if (!outcome.ok) {
-          switchFailed = { accountId: failedAccountId, at: deps.now(), failure: outcome.failure }
+          switchHold = { accountId: failedAccountId, until: deps.now() + SWITCH_RETRY_MS, result: outcome }
           log.warn("claudecode:relay-switch-failed", { kind: outcome.failure.kind, accountId: failedAccountId.slice(0, 8) })
           return outcome
         }
-        switchFailed = undefined
-        return adopt(outcome.lease, "ratelimit")
+        const result = adopt(outcome.lease, "ratelimit")
+        // 原号奉还 = master 的错报宽限期在起作用。宽限期内再问也是同一个答案。
+        switchHold =
+          outcome.lease.accountId === failedAccountId
+            ? { accountId: failedAccountId, until: deps.now() + REPEAT_SWITCH_MS, result }
+            : undefined
+        return result
       }),
 
     unauthorized: (failedAccess) =>
       serialize(async (): Promise<SharedLeaseResult> => {
         if (held !== undefined && held.access !== failedAccess) return { ok: true, lease: held }
-        deadAccess.add(failedAccess)
-        log.warn("claudecode:relay-unauthorized", { accountId: held?.accountId.slice(0, 8) })
-        const outcome = await autoLease("prelease")
-        return outcome.ok ? adopt(outcome.lease, "unauthorized") : outcome
+        if (!deadAccess.has(failedAccess)) {
+          deadAccess.add(failedAccess)
+          log.warn("claudecode:relay-unauthorized", { accountId: held?.accountId.slice(0, 8) })
+        }
+        // 走 renew 而不是直接租:同一枚死凭证上并发的 401 共享续期失败后的退避,不各自再敲一次 master。
+        return renew("unauthorized")
       }),
   }
 }

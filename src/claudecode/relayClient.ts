@@ -35,9 +35,9 @@ export type RelayClientDeps = {
 }
 
 const PROBE_TIMEOUT_MS = 1_000
-// 控制面请求会触发 master 租约往返:单次 15s 超时,遇到死凭证还要排除后再租一次(deadLease),
-// 所以要盖住两次 —— 否则 relay 还在正常等 master,启动器先以为它挂了。
-const CONTROL_TIMEOUT_MS = 35_000
+// 控制面请求会排进 relay 的串行队列,前面可能正有一次换号(上报 + 钉住被拒 + 再租,每步最长 15s)。
+// 要盖住最坏情况 —— 否则 relay 还在正常等 master,启动器先以为它挂了。
+const CONTROL_TIMEOUT_MS = 90_000
 const POLL_MS = 100
 const DEFAULT_START_TIMEOUT_MS = 10_000
 
@@ -90,7 +90,8 @@ export function createRelayClient(deps: RelayClientDeps): RelayClient {
           signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
         })
       } catch (error) {
-        return { ok: false, failure: { kind: "unreachable", detail: `relay: ${error instanceof Error ? error.message : String(error)}` } }
+        // 说清楚是 relay 没应答,不是 master:两者的排查方向完全不同(一个看 cc-relay.log,一个看 master)。
+        return { ok: false, failure: { kind: "unreachable", detail: `本机 relay 没有应答(${error instanceof Error ? error.message : String(error)})` } }
       }
       const raw = (await res.json().catch(() => undefined)) as AttachResponse | undefined
       if (!res.ok || raw === undefined || typeof raw.ok !== "boolean") {
