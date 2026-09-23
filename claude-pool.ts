@@ -1,26 +1,26 @@
 #!/usr/bin/env bun
 // 入口链 C:用账号池的号起一个原生 Claude Code 会话。
 //
-// 并列于 tui.tsx(opencode 插件)与 senpi-extension.ts(omo 扩展)。前两条都是把凭证塞进一个
-// 长期活着的宿主;这一条只在会话开始前做一次事,然后把终端整个让给 `claude`。
+// 并列于 tui.tsx(opencode 插件)与 senpi-extension.ts(omo 扩展)。前两条把凭证塞进一个长期活着的
+// 宿主;这一条把 `claude` 的 ANTHROPIC_BASE_URL 指向本机 relay(claude-pool-relay.ts),由 relay 在每个
+// 请求上把凭证换成全机共享的当前租约。
 //
-// 原因在 issue #83:claude 2.1.278 实测,凭证在进程内冻结。改 settings、送 401,都不会让一个
-// 已经在跑的会话换掉 token。所以「每会话一租约」不是简化,是这个客户端唯一允许的形状。
+// 原因在 issue #83:claude 2.1.278 实测,凭证在进程内冻结。所以换 token 这件事挪到了进程外面 ——
+// 会话中途续期、撞额度换号都由 relay 做,会话不用重开。
 //
 //   claude-pool                              # 等价于 `claude`,但用池子的号
 //   claude-pool -p "..."                     # 参数原样透传
-//   claude-pool --pool-account af008f89      # 这次会话点名这个号
-//   claude-pool --pool-account af008f89 --pool-pin   # 以后每次启动都点名它
+//   claude-pool --pool-account af008f89      # 把本机共享号切到这个号
+//   claude-pool --pool-account af008f89 --pool-pin   # 并且以后一直用它
 //   claude-pool --pool-unpin                 # 取消钉住
 //   CLAUDE_BIN=/path/to/claude claude-pool
 //
-// 并发多开是支持的:所有会话共用一个 workerId,靠本机的声明簿(src/claudecode/claims.ts)保证
-// 它们不会拿到同一个账号。
+// 并发多开是支持的,而且【所有会话共用一个号】—— 这是有意的:到期、撞墙都只处理一次,不会一瞬间
+// 切走 N 个号。
 //
 // 这台机器必须先被 configure-worker 配过(~/.claude-accounts-pool/senpi-worker.json)。
 import { parsePoolArgs } from "./src/claudecode/args.ts"
 import { readPoolConfig } from "./src/claudecode/config.ts"
-import { applyPinIntent, createPinStore } from "./src/claudecode/pin.ts"
 import { createSessionDeps } from "./src/claudecode/install.ts"
 import { EXIT_BLOCKED, runPooledSession } from "./src/claudecode/session.ts"
 
@@ -41,18 +41,8 @@ if (!parsed.ok) {
   process.exit(EXIT_BLOCKED)
 }
 
-// 钉住意图【先落盘】,与 src/worker/pin.ts 的顺序一致:并发启动的另一个会话必须立刻看到新意图,
-// 否则它会按旧的钉住去点名。被 master 拒绝时再交还 —— 那是唯一允许放弃钉住的路径。
-applyPinIntent(createPinStore(process.env), parsed.args)
-//
-// 租约的申领与归还都在 runPooledSession 里,因为租约的生命周期就是会话的生命周期。这里不再有
-// process.exit 之前要做的清理 —— 之前那版把清理写在 finally 里,而 process.exit 会直接终止进程、
-// finally 根本不跑。
-const deps = createSessionDeps(
-  { masterUrl: config.masterUrl, workerId: config.baseWorkerId },
-  process.env,
-  process.cwd(),
-  config.slots,
-  parsed.args,
-)
+// 钉住意图的落盘、登记与注销都在 runPooledSession 里:钉住要等守卫通过再写(被拒绝的启动不该留下
+// 一个会把整台机器搬走的钉住),登记的生命周期就是会话的生命周期。这里不再有
+// process.exit 之前要做的清理 —— process.exit 会直接终止进程、finally 根本不跑。
+const deps = createSessionDeps(config, process.env, process.cwd(), parsed.args)
 process.exit(await runPooledSession(deps, parsed.args.rest))

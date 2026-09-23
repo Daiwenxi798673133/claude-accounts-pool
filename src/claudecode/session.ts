@@ -1,20 +1,20 @@
-// One pooled `claude` session, start to finish: lease → guard → spawn → the child's exit code.
+// One pooled `claude` session, start to finish: guard → relay → attach → spawn → the child's exit code.
 //
-// WHY THERE IS NO RENEWAL LOOP HERE, and why that is not an omission. Measured on claude 2.1.278
-// (issue #83): the credential a Claude Code process resolves at startup is FROZEN for that process.
-// Rewriting settings.json mid-session — rename or in-place, headless or interactive — leaves the next
-// request carrying the token the process started with, and even a 401 does not make it re-read. So a
-// session's account is decided exactly once, here, before the child exists. Rotation happens at
-// session boundaries or not at all.
+// THE CREDENTIAL IS NOT DECIDED HERE ANY MORE. Measured on claude 2.1.278 (issue #83): the token a
+// Claude Code process resolves at startup is frozen for that process. So the child is pointed at this
+// machine's relay (ANTHROPIC_BASE_URL), and the relay swaps that frozen token for the machine's CURRENT
+// lease on every request — renewing it before expiry, switching accounts when quota runs out. The
+// session never has to be reopened for either.
 //
-// The cost is stated to the operator up front rather than discovered at hour four: a lease's horizon
-// is bounded by MASTER_REFRESH_THRESHOLD_MS, so a session outliving it dies on a 401 that nothing in
-// this lane can heal. Printing the remaining time is the only honest thing available.
+// ONE ACCOUNT PER MACHINE, shared by every session (issue #83 decision). This launcher does not lease
+// anything itself: it asks the relay for the shared lease, and gets the same answer every concurrent
+// launcher gets. That is the natural limit — a quota wall or an expiry is handled once, by the relay,
+// not once per open session.
 import type { LeaseFailure } from "../worker/leaseClient.ts"
-import type { ClaimedLease } from "./claims.ts"
 import type { LeaseRefusal } from "../cloud/protocol.ts"
 import { buildChildEnv, POOL_SESSION_SENTINEL, type Blocker } from "./childEnv.ts"
-import { printModeNotice, withHookSettings } from "./hookSettings.ts"
+import { applyPinIntent, type PinStore } from "./pin.ts"
+import { relayNotices, type RelayClient, type RelayUp } from "./relayClient.ts"
 
 // sysexits codes, not 1-for-everything: the operator's shell (and any wrapper script) can tell
 // "this machine is configured wrong, fixing it is on you" apart from "the pool had nothing right
@@ -47,24 +47,24 @@ export function leaseFailureText(failure: LeaseFailure, masterUrl: string): stri
       return `连不上 master(${masterUrl}):${failure.detail}。确认它在跑、且这台机器能到它的地址。`
     case "bad-response":
       return `master 的应答看不懂:${failure.detail}。多半是两端版本不一致。`
-    // NEVER PRODUCED BY THIS LANE — the dead-access guard belongs to senpi's renewal loop, which has
-    // a previous 401 to compare against. Handled anyway because the union is exhaustive by design:
-    // a variant added to LeaseFailure must become a compile error here, not a silent fallthrough.
+    // Only a NAMED account can end here: the automatic path steps around a dead token by excluding
+    // its account, but a named one may not be swapped for another (usage attribution depends on
+    // "what I asked for is what I got").
     case "dead-access":
-      return `master 发回的凭证在本机已经被判定失效(账号 ${failure.accountId.slice(0, 8)})。这不该出现在这条链上,请附日志开 issue。`
+      return `master 发回的凭证在本机已经被判定失效(账号 ${failure.accountId.slice(0, 8)})。等它在 master 上刷新后再点名,或换一个号。`
   }
 }
 
-// 声明层的失败与租约层的失败分开成文案,理由与全仓其它按变体建的表一致:三种失败的补救动作
-// 完全不同 —— 等一会、关掉一个会话、去看 master —— 合并成一句"租不到号"就把它们全丢了。
-export function claimedLeaseText(result: Extract<ClaimedLease, { ok: false }>, masterUrl: string): string {
-  switch (result.reason) {
-    case "lock-unavailable":
-      return "拿不到本机的账号声明锁(另一个会话正在启动,或上一个崩在了临界区里)。稍等几秒重试。"
-    case "at-capacity":
-      return `这台机器已经有 ${result.held} 个池子会话在跑,到上限了。关掉一个,或调大 ccSlots。`
-    case "lease-failed":
-      return leaseFailureText(result.failure, masterUrl)
+// 每种 relay 故障一句补救。foreign 是配置问题(换端口),timeout 是本机进程问题(看日志)。
+export function relayFailureText(up: Extract<RelayUp, { ok: false }>, port: number, logPath: string): string {
+  switch (up.reason) {
+    case "foreign":
+      return (
+        `端口 ${port} 上有别的程序在听(${up.detail}),不是账号池的 relay。` +
+        `在 ~/.claude-accounts-pool/senpi-worker.json 里加 "ccRelayPort": <另一个端口>,或设 CAP_CC_RELAY_PORT。`
+      )
+    case "timeout":
+      return `本机 relay 没能按时起来。看它的日志:${logPath}`
   }
 }
 
@@ -73,18 +73,12 @@ export function blockerText(blockers: readonly Blocker[]): string {
   return ["没有启动 claude:这台机器上有优先级更高的凭证,池子租约会被无声忽略。", ...lines].join("\n")
 }
 
-/** 剩余有效期,给操作者一个「这个会话能活多久」的数字。 */
-export function horizonText(expiresAt: number, now: number): string {
-  const ms = expiresAt - now
-  if (ms <= 0) return "已过期"
-  const minutes = Math.floor(ms / 60_000)
-  return minutes >= 60 ? `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m` : `${minutes}m`
-}
-
 export type SessionDeps = {
-  // 领租约,并把"本机已占哪些号"的排除集与声明写在同一个临界区里(见 claims.ts)。返回的 release
-  // 由本模块在子进程退出后调用 —— 租约的生命周期与会话的生命周期是同一件事,所以它归这里管。
-  lease: () => Promise<ClaimedLease>
+  relay: RelayClient
+  // The relay's own address, handed to the child as ANTHROPIC_BASE_URL.
+  relayUrl: string
+  relayPort: number
+  relayLogPath: string
   // Runs the child and resolves with ITS exit code. Injected rather than imported so a test never
   // spawns a real `claude`, and so the composition root owns the stdio decision (inherit).
   spawn: (input: { argv: readonly string[]; env: NodeJS.ProcessEnv }) => Promise<number>
@@ -96,10 +90,17 @@ export type SessionDeps = {
   // composition root, so it cannot pollute a piped stdout.
   notify: (line: string) => void
   masterUrl: string
-  // 本次会话的 workerId(带槽位号)。随环境交给钩子,让限流上报用的是发出这次租约的那个标签。
-  workerId?: string
-  // 限流上报钩子脚本的绝对路径,undefined 表示这次不挂(找不到脚本,或操作者自己传了 --settings)。
-  hookPath?: string
+  workerId: string
+  // This launcher's pid — what the relay registers. The launcher lives exactly as long as its child.
+  pid: number
+  // --pool-account / --pool-pin / --pool-unpin on this command line. The prefix switches the MACHINE's
+  // shared account; `pinned` true/false sets/clears the pin the relay names on every automatic lease.
+  preference: { prefix?: string; pinned?: boolean }
+  pin: PinStore
+  // Runs `beat` periodically while the child is alive; returns the function that stops it. A relay
+  // that crashed mid-session is brought back and this session re-registered by the next beat —
+  // otherwise every open session would lose its route to Anthropic until someone started a new one.
+  heartbeat: (beat: () => Promise<void>) => () => void
   now?: () => number
 }
 
@@ -107,9 +108,8 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
   const now = deps.now ?? Date.now
 
   // FIRST, before anything with a side effect. A launcher that reached here from inside a session it
-  // started is an alias loop (see POOL_SESSION_SENTINEL): every generation would lease an account and
-  // hand it to a child that does the same. Refusing costs one confusing launch; not refusing costs the
-  // pool every account it has.
+  // started is an alias loop (see POOL_SESSION_SENTINEL): every generation would register with the
+  // relay and hand the child to a copy of itself. Refusing costs one confusing launch.
   if (deps.env[POOL_SESSION_SENTINEL] === "1") {
     deps.notify(
       "检测到自我调用:本启动器又启动了自己。多半是把 `claude` 别名指到了它。" +
@@ -118,9 +118,8 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
     return EXIT_BLOCKED
   }
 
-  // THE GUARD RUNS BEFORE THE LEASE, and the order is the point: a machine that cannot use a lease
-  // should not book one out of the pool. Leasing first would take an account away from a worker that
-  // could have used it, then refuse to start anyway.
+  // THE GUARD RUNS BEFORE THE RELAY, and the order is the point: a machine that cannot use a lease
+  // should not start a relay that books one out of the pool.
   const settings = await deps.readSettings()
   const dryRun = buildChildEnv({ env: deps.env, access: "", settings })
   if (!dryRun.ok) {
@@ -128,61 +127,75 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
     return EXIT_BLOCKED
   }
 
-  const claimed = await deps.lease()
-  if (!claimed.ok) {
-    if (claimed.reason === "lease-failed" && claimed.notice !== undefined) deps.notify(`账号池:${claimed.notice}`)
-    deps.notify(claimedLeaseText(claimed, deps.masterUrl))
-    return EXIT_NO_LEASE
+  const up = await deps.relay.ensureRunning()
+  if (!up.ok) {
+    deps.notify(relayFailureText(up, deps.relayPort, deps.relayLogPath))
+    return up.reason === "foreign" ? EXIT_BLOCKED : EXIT_NO_LEASE
   }
-  const lease = claimed.lease
-  // 「想点名但这次点不成」先说 —— 操作者需要知道这个会话没在他指定的号上。
-  if (claimed.notice !== undefined) deps.notify(`账号池:${claimed.notice}`)
-
-  // FAIL-SAFE, matching the repo's "过期就什么都不写" shape. The master will not serve a spent
-  // horizon, so reaching here means something is wrong between the two clocks — and starting a
-  // session on it would burn the operator's turn on a credential that 401s immediately.
-  const remaining = lease.expiresAt - now()
-  if (remaining <= 0) {
-    deps.notify(`master 发回的租约已经过期(账号 ${lease.accountId.slice(0, 8)})。不启动。两端时钟可能不同步。`)
-    await claimed.release()
-    return EXIT_NO_LEASE
+  for (const line of relayNotices(up.health, { workerId: deps.workerId, masterUrl: deps.masterUrl })) {
+    deps.notify(`账号池:${line}`)
   }
 
-  const child = buildChildEnv({
-    env: deps.env,
-    access: lease.access,
-    accountId: lease.accountId,
-    workerId: deps.workerId,
-    settings,
+  // 钉住意图【在守卫与 relay 都通过之后】落盘,且在 attach 之前:被拒绝的启动不该留下一个钉住 ——
+  // relay 下一次续期就会把整台机器搬过去;而 attach 被 master 拒绝时,relay 交还的正是这里写下的那个。
+  applyPinIntent(deps.pin, { accountPrefix: deps.preference.prefix, pin: deps.preference.pinned })
+  const storedPin = deps.pin.read()
+  if (deps.preference.prefix !== undefined && deps.preference.pinned !== true && storedPin !== undefined && storedPin !== deps.preference.prefix) {
+    deps.notify(`账号池:钉住的 ${storedPin} 仍然有效,下一次续期会切回它。想改钉这个号,加 --pool-pin;想取消钉住,用 --pool-unpin。`)
+  }
+
+  const attached = await deps.relay.attach({
+    pid: deps.pid,
+    ...(deps.preference.prefix === undefined
+      ? {}
+      : { preferredAccountIdPrefix: deps.preference.prefix, pinned: deps.preference.pinned === true }),
   })
+  if (!attached.ok) {
+    deps.notify(leaseFailureText(attached.failure, deps.masterUrl))
+    return EXIT_NO_LEASE
+  }
+  const lease = attached.lease
+
+  // FAIL-SAFE, matching the repo's "过期就什么都不写" shape. The relay renews before handing a lease
+  // out, so reaching here means its clock and ours disagree — and a child started on a spent token
+  // would have its direct-to-Anthropic requests 401 from the first second.
+  if (lease.expiresAt <= now()) {
+    deps.notify(`relay 交回的租约已经过期(账号 ${lease.accountId.slice(0, 8)})。不启动。`)
+    await deps.relay.detach(deps.pid)
+    return EXIT_NO_LEASE
+  }
+
+  const child = buildChildEnv({ env: deps.env, access: lease.access, relayUrl: deps.relayUrl, settings })
   // Unreachable in practice — the same inputs passed the dry run above — but the type says it can
   // fail, and inventing an `as` to get past that would be the one place this lane could start an
   // unguarded session.
   if (!child.ok) {
     deps.notify(blockerText(child.blockers))
-    await claimed.release()
+    await deps.relay.detach(deps.pid)
     return EXIT_BLOCKED
   }
 
+  const others = attached.sessions - 1
+  if (deps.preference.prefix !== undefined && others > 0) {
+    deps.notify(`账号池:已把本机共享账号切到 ${lease.accountId.slice(0, 8)},正在跑的另外 ${others} 个会话从下一个请求起也用它。`)
+  }
   deps.notify(
-    `账号池:已租到 ${lease.accountId.slice(0, 8)},本次会话凭证有效期 ${horizonText(lease.expiresAt, now())}。` +
-      "会话中途不会换号,到期后需要重开。",
+    `账号池:本机共享账号 ${lease.accountId.slice(0, 8)}(本机 ${attached.sessions} 个会话在用)。` +
+      "到期自动续期,撞额度自动换号,会话不用重开。",
   )
 
-  // 限流上报钩子。挂不上不是失败:少的是给【别的机器】看的遥测,这一次会话照常能跑。所以只说一句,
-  // 不拦启动 —— 反过来(为了一条遥测拒绝启动)才是本末倒置。
-  const hooked = withHookSettings(argv, deps.hookPath)
-  if (hooked.skipped !== undefined) deps.notify(`账号池:${hooked.skipped}`)
-  else {
-    const printNotice = printModeNotice(argv)
-    if (printNotice !== undefined) deps.notify(`账号池:${printNotice}`)
-  }
+  // 心跳里的 attach 【不带】点名:点名是这一次命令行的意图,不该每一拍重放一遍 —— 那会把别的会话
+  // 之后发起的点名反复切回来。
+  const stop = deps.heartbeat(async () => {
+    const again = await deps.relay.ensureRunning()
+    if (again.ok) await deps.relay.attach({ pid: deps.pid })
+  })
 
-  // 声明活到子进程结束为止,一秒都不多 —— 多出来的每一秒都是别的会话被无谓排除的一秒。
-  // finally 而不是顺序执行:子进程抛错(可执行文件不存在之类)同样要还回声明。
+  // finally, not sequential: a child that throws (missing executable) must still deregister.
   try {
-    return await deps.spawn({ argv: hooked.argv, env: child.env })
+    return await deps.spawn({ argv, env: child.env })
   } finally {
-    await claimed.release().catch(() => {})
+    stop()
+    await deps.relay.detach(deps.pid).catch(() => {})
   }
 }

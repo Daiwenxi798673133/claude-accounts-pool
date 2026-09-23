@@ -95,49 +95,49 @@ bun ~/.claude-accounts-pool/claude-pool.ts            # 等价于 `claude`,但�
 bun ~/.claude-accounts-pool/claude-pool.ts -p "..."   # 参数原样透传,一个都不解析
 ```
 
-它在会话开始前领一次租约,把凭证放进 `claude` 子进程的环境,然后把终端整个让出去。**不碰你自己的登录**:`~/.claude/.credentials.json` 与 Keychain 条目一个字节都不动,不用这条命令时,手敲的 `claude` 照常用你自己的号。
+它不直接把凭证交给 `claude`,而是在本机起一个**中间层(relay)**,把 `claude` 的 `ANTHROPIC_BASE_URL` 指向它(`127.0.0.1:18787`)。relay 把每个请求的凭证换成当前租约,其余原样转发给 `api.anthropic.com`。**不碰你自己的登录**:`~/.claude/.credentials.json` 与 Keychain 条目一个字节都不动,不用这条命令时,手敲的 `claude` 照常用你自己的号。
 
-两件必须先知道的事:
+为什么要多这一层:实测 claude 2.1.278,凭证在进程内冻结——改 settings、送 401,都不会让一个已经在跑的会话换掉 token。把换 token 挪到进程外面之后:
 
-- **会话中途不换号,也不续期。** 实测 claude 2.1.278:凭证在进程内冻结——改 settings、送 401,都不会让一个已经在跑的会话换掉 token。所以账号在会话开始时定下,之后只能靠重开来换。租约有效期(启动时会打印)上限约 4 小时,超时的长会话会以 401 结束。
-- **环境里有更高优先级的凭证时,它会拒绝启动而不是将就。** `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY`,以及 settings 里的 `apiKeyHelper`,都排在池子租约之前。将就的后果是会话照跑、钱记在池子没租过的号上,而且无法从内部察觉——所以宁可不启动,并告诉你 unset 哪一个。
+- **会话中途会自动续期**,不再有「租约 4 小时到期、长会话以 401 结束」。
+- **撞额度会自动换号,会话不用重开**。只有带配额头的 429(`anthropic-ratelimit-unified-representative-claim` / `-overage-status`,或 `unified-status: rejected`)才换;不带这些头的 429(容量问题,或「1M 上下文需要 Extra Usage」这类权限问题)换到哪个号都一样,原样交给 `claude` 显示。换号前先把限流上报给 master,别的机器不用各自再撞一次墙。
+- **`-p` 模式同样生效**——以前靠 `StopFailure` 钩子上报限流,而 `-p` 下那个钩子不触发。
+
+**本机所有会话共用一个号**,这是有意的:到期续期、撞额度换号都只发生一次。反过来每个会话各持一个号,5 个会话同时撞墙就会一瞬间切走 5 个号。relay 内部也按这个原则处理并发:5 个请求同时在同一个号上吃到 429,只有第一个去上报并换号,其余的直接在换好的号上重发。
+
+relay 由 `claude-pool` 按需拉起(端口绑定即单例),所有会话结束 10 分钟后自行退出,日志在 `~/.claude-accounts-pool/cc-relay.log`。会话运行期间启动器每 15 秒确认一次 relay 还在,它意外退出时会被拉起、会话重新登记。
+
+**环境里有更高优先级的凭证时,它会拒绝启动而不是将就。** `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY`,以及 settings 里的 `apiKeyHelper`,都排在池子租约之前。`ANTHROPIC_BASE_URL` 是另一种情况:子进程的 base URL 必须是本机 relay,你自己设的那个会被覆盖——而你设了它,说明想让流量去别处,这得由你决定,所以同样拒绝。将就的后果是会话照跑、钱记在池子没租过的号上,而且无法从内部察觉——所以宁可不启动,并告诉你 unset 哪一个。
 
 退出码:`78` = 这台机器配置得让租约用不上(先按提示修);`75` = 池子这会儿给不出号(稍后再试);其余都是 `claude` 自己的退出码。
 
-**可以同时开多个会话**。所有会话共用一个 workerId,靠本机的**账号声明簿**保证它们不会拿到同一个号:领租约时把「本机已占哪些号」作为排除集发给 master,而**读排除集、租号、写声明是同一个临界区**——不是这样的话,N 个同时启动的会话会各自读到空排除集、都被派到同一个账号,一个 5 小时窗口被 N 倍烧。
-
-在 `~/.claude-accounts-pool/senpi-worker.json` 里加两个字段(只增不改):
+在 `~/.claude-accounts-pool/senpi-worker.json` 里可以加两个字段(只增不改):
 
 ```jsonc
-{ "ccWorkerId": "vince-cc",  // 看板上会被人读到的名字;不配则由 worker 标签推导
-  "ccSlots": 2 }             // 本机允许的并发会话数,默认 2,上限 8
+{ "ccWorkerId": "vince-cc",   // 看板上会被人读到的名字;不配则由 worker 标签推导
+  "ccRelayPort": 18787 }      // relay 端口;被别的程序占着时改这个
 ```
 
-到上限时启动会以 **75** 退出并说明原因。会话崩溃(`kill -9`)留下的声明会被下一个会话按进程存活与租约到期两个条件回收,不会让池子在这台机器眼里越来越小。
+旧版的 `ccSlots` 已不再使用,留在文件里也无妨。
 
-**可以点名用哪个账号**，或把它钉住：
+**可以点名用哪个账号**,或把它钉住——点名作用于**整台机器**:
 
 ```bash
-claude-pool --pool-account af008f89              # 这次会话用这个号
-claude-pool --pool-account af008f89 --pool-pin   # 以后每次启动都点名它
+claude-pool --pool-account af008f89              # 把本机共享号切到这个号
+claude-pool --pool-account af008f89 --pool-pin   # 并且以后一直用它,直到额度用满
 claude-pool --pool-unpin                         # 取消钉住
 ```
 
-前缀就是看板上显示的账号 id 前 8 位。这几个参数**只在最前面**被解析，遇到第一个不是 `--pool-*` 的就停止，其余原样透传给 `claude`——所以 `claude-pool -p "参数叫 --pool-pin"` 里那个字符串不会被当成参数。
+前缀就是看板上显示的账号 id 前 8 位。这几个参数**只在最前面**被解析,遇到第一个不是 `--pool-*` 的就停止,其余原样透传给 `claude`——所以 `claude-pool -p "参数叫 --pool-pin"` 里那个字符串不会被当成参数。
 
-三条行为值得先知道：
+几条行为值得先知道:
 
-- **被点名的号不可用时（冷却中、需重登、已满员、前缀匹配到多个），启动直接失败**，绝不替换成别的号——你的用量归属依赖「我要的就是我拿到的」。
-- **钉住的号被本机另一个会话占着时**，这次退回排名派号并说明原因；钉住不会因此丢失，那个会话结束后会继续点名它。
-- **master 明说不服务被点名的号时，钉住会被交还**，否则以后每次启动都白跑一趟往返。
+- **点名会带着正在跑的会话一起换**:它们从下一个请求起用新号,启动时会说明有几个会话受影响。
+- **被点名的号不可用时(冷却中、需重登、已满员、前缀匹配到多个),启动直接失败**,绝不替换成别的号——你的用量归属依赖「我要的就是我拿到的」。其余会话继续用原来的号。
+- **钉住是机器级的,一次性点名只撑到下一次续期**:另一个号钉着时,`--pool-account X`(不带 `--pool-pin`)会切过去,但下一次续期 relay 会点名钉住的那个、切回去——启动时会提醒这一句。
+- **钉住的号额度用满时**,relay 先上报、再点名,master 以「冷却中」拒绝,钉住随之交还并按用量换号;master 明说不服务被钉住的号时同样交还,否则以后每次续期都白跑一趟往返。
 
-**撞限流会自动上报给 master**,于是别的机器不用各自再撞一次墙。实现是一个 `StopFailure` 钩子,经 `--settings` 挂在子进程上——同样不碰你的 settings 文件。两个实测得来的边界:
-
-- **`-p` 模式下不触发**(同一次对照里 `SessionStart` / `UserPromptSubmit` 触发了,`Stop` 与 `StopFailure` 没有;交互式会话四个全触发)。所以 `-p` 跑的那次撞限流不会上报,启动时会提醒一句。
-- **鉴权失败绝不当限流上报**。租约过期与额度打满是两回事,把前者报成后者会把一个额度健康的账号打进冷却。
-
-
-设计依据与实测记录见 [issue #83](https://github.com/Daiwenxi798673133/claude-accounts-pool/issues/83)。
+设计依据与实测记录见 [issue #83](https://github.com/Daiwenxi798673133/claude-accounts-pool/issues/83)。已知代价见 [docs/limitations.md](docs/limitations.md#原生-claude-codeclaude-pool)。
 
 ### 更多细节
 

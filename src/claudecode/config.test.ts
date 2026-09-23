@@ -1,19 +1,27 @@
 import { expect, test } from "bun:test"
-import { CC_DEFAULT_SLOTS, CC_MAX_SLOTS, claimLockTarget, claimsPath, parseSlots, resolveBaseWorkerId } from "./config.ts"
+import { CC_RELAY_DEFAULT_PORT, CC_UPSTREAM_DEFAULT, parseRelayPort, relayLogPath, relayUrl, resolveBaseWorkerId, upstreamUrl } from "./config.ts"
 
-test("槽位数:缺省、封顶、非法值一律落回默认", () => {
-  expect(parseSlots(undefined)).toBe(CC_DEFAULT_SLOTS)
-  expect(parseSlots(3)).toBe(3)
-  expect(parseSlots("3")).toBe(3)
-  expect(parseSlots(99)).toBe(CC_MAX_SLOTS)
+test("relay 端口:缺省、合法值、非法值一律落回默认", () => {
+  expect(parseRelayPort(undefined)).toBe(CC_RELAY_DEFAULT_PORT)
+  expect(parseRelayPort(19000)).toBe(19000)
+  expect(parseRelayPort("19000")).toBe(19000)
   // 不是"报错不启动",是"落回一个能跑的值" —— 与 senpi 的 parseSlotCount 同一条规矩。
-  expect(parseSlots(0)).toBe(CC_DEFAULT_SLOTS)
-  expect(parseSlots(-1)).toBe(CC_DEFAULT_SLOTS)
-  expect(parseSlots("abc")).toBe(CC_DEFAULT_SLOTS)
-  expect(parseSlots(2.5)).toBe(CC_DEFAULT_SLOTS)
+  expect(parseRelayPort(80)).toBe(CC_RELAY_DEFAULT_PORT) // 特权端口,操作者身份绑不上
+  expect(parseRelayPort(70000)).toBe(CC_RELAY_DEFAULT_PORT)
+  expect(parseRelayPort("abc")).toBe(CC_RELAY_DEFAULT_PORT)
+  expect(parseRelayPort(19000.5)).toBe(CC_RELAY_DEFAULT_PORT)
 })
 
-test("基名优先级:环境变量 > 配置文件 > 由 senpi 标签推导", () => {
+// 与 master 撞端口,relay 会把 master 认成"别的程序"而拒绝启动。
+test("默认端口避开 master 的 8787", () => {
+  expect(CC_RELAY_DEFAULT_PORT).not.toBe(8787)
+})
+
+test("relay 只绑回环", () => {
+  expect(relayUrl(18787)).toBe("http://127.0.0.1:18787")
+})
+
+test("标签优先级:环境变量 > 配置文件 > 由 senpi 标签推导", () => {
   expect(resolveBaseWorkerId("vince-local.senpi", "vince-cc", { CAP_CC_WORKER: "from-env" })).toBe("from-env")
   expect(resolveBaseWorkerId("vince-local.senpi", "vince-cc", {})).toBe("vince-cc")
   expect(resolveBaseWorkerId("vince-local.senpi", undefined, {})).toBe("vince-local.senpi.cc")
@@ -21,26 +29,22 @@ test("基名优先级:环境变量 > 配置文件 > 由 senpi 标签推导", () 
 
 // 推导出来的默认值必须仍然是合法标签,否则 master 会 400 —— 而那会发生在一台"没配过 ccWorkerId
 // 但一切看起来正常"的机器上。
-test("推导出的默认基名加上槽位号后仍然合法", () => {
-  const derived = resolveBaseWorkerId("vince-local.senpi", undefined, {})
-  expect(`${derived}.8`).toMatch(/^[A-Za-z0-9._-]{1,64}$/)
+test("推导出的默认标签合法", () => {
+  expect(resolveBaseWorkerId("vince-local.senpi", undefined, {})).toMatch(/^[A-Za-z0-9._-]{1,64}$/)
 })
 
 test("空字符串当作没配", () => {
   expect(resolveBaseWorkerId("base", "", { CAP_CC_WORKER: "" })).toBe("base.cc")
 })
 
-// 与 senpi 的文件各不相干:那边的租约会被它的 keeper adopt 并续期,这边的是冻结的。共用一份
-// 就等于让另一条链去续期一条我们管不了的租约。
-test("声明簿与锁文件都不与 senpi 共用", () => {
-  const env = { CAP_LEASE_CACHE_DIR: "/box" }
-  expect(claimsPath(env)).toBe("/box/cc-claims.json")
-  expect(claimLockTarget(env)).toBe("/box/cc-claims.lock")
-  expect(claimsPath(env)).not.toContain("senpi")
-  expect(claimLockTarget(env)).not.toContain("senpi")
+test("上游默认是 Anthropic 本身,只有显式覆盖才改", () => {
+  expect(upstreamUrl({})).toBe(CC_UPSTREAM_DEFAULT)
+  expect(upstreamUrl({ CAP_CC_UPSTREAM: "" })).toBe(CC_UPSTREAM_DEFAULT)
+  expect(upstreamUrl({ CAP_CC_UPSTREAM: "http://127.0.0.1:9" })).toBe("http://127.0.0.1:9")
 })
 
-// 一把锁保护【声明簿】这一个资源,不是每个会话一把 —— 每会话一把就等于没锁。
-test("锁只有一把,与会话无关", () => {
-  expect(claimLockTarget({ CAP_LEASE_CACHE_DIR: "/box" })).toBe(claimLockTarget({ CAP_LEASE_CACHE_DIR: "/box" }))
+test("relay 日志不与 senpi 的日志共用一个文件", () => {
+  const path = relayLogPath({ CAP_LEASE_CACHE_DIR: "/box" })
+  expect(path).toBe("/box/cc-relay.log")
+  expect(path).not.toContain("senpi")
 })

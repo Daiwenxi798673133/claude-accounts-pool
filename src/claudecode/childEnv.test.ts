@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { buildChildEnv, CLAUDE_CODE_TOKEN_VAR, envBlockers, settingsBlockers } from "./childEnv.ts"
+import { buildChildEnv, CLAUDE_CODE_TOKEN_VAR, envBlockers, RELAY_URL_VAR, settingsBlockers, TOOL_SEARCH_VAR } from "./childEnv.ts"
 
 // A plain object, never process.env: a token written into the runner's own environment would leak
 // into every later test file in the same process.
@@ -38,9 +38,32 @@ test.each([
   expect(outcome.blockers[0].remedy).toContain(`unset ${varName}`)
 })
 
-test("ANTHROPIC_BASE_URL 也拒绝:它不是盖过我们,是把租来的订阅凭证发去别人的网关", () => {
-  const outcome = buildChildEnv({ env: base({ ANTHROPIC_BASE_URL: "http://gw.internal" }), access: "lease-token" })
+// 子进程的 ANTHROPIC_BASE_URL 是我们的(指向本机 relay)。操作者自己设的那个若被静默盖掉,他们以为
+// 流量去了自己的网关,实际去了池子 —— 这是要说出来的决定,不是要丢掉的配置。
+test("操作者环境里的 ANTHROPIC_BASE_URL 仍然拒绝,不会被静默盖掉", () => {
+  const outcome = buildChildEnv({ env: base({ ANTHROPIC_BASE_URL: "http://gw.internal" }), access: "lease-token", relayUrl: "http://127.0.0.1:18787" })
   expect(outcome.ok).toBe(false)
+})
+
+test("子进程的 base URL 指向本机 relay", () => {
+  const outcome = buildChildEnv({ env: base(), access: "lease-token", relayUrl: "http://127.0.0.1:18787" })
+  expect(outcome.ok).toBe(true)
+  if (!outcome.ok) return
+  expect(outcome.env[RELAY_URL_VAR]).toBe("http://127.0.0.1:18787")
+})
+
+test("空跑(不给 relay 地址)时不写 base URL", () => {
+  const outcome = buildChildEnv({ env: base(), access: "" })
+  expect(outcome.ok && outcome.env[RELAY_URL_VAR]).toBeUndefined()
+})
+
+// 自定义 base URL 会让 Claude Code 关掉乐观 tool search(它假设网关不认 tool_reference),每一轮都把
+// 全部 MCP 工具塞进上下文。relay 原样转给 api.anthropic.com,这个假设不成立,所以把默认值还回去。
+test("ENABLE_TOOL_SEARCH 没设时补成 true,设了就不动", () => {
+  const unset = buildChildEnv({ env: base(), access: "t", relayUrl: "http://127.0.0.1:1" })
+  expect(unset.ok && unset.env[TOOL_SEARCH_VAR]).toBe("true")
+  const chosen = buildChildEnv({ env: base({ [TOOL_SEARCH_VAR]: "false" }), access: "t", relayUrl: "http://127.0.0.1:1" })
+  expect(chosen.ok && chosen.env[TOOL_SEARCH_VAR]).toBe("false")
 })
 
 // `export ANTHROPIC_API_KEY=` 会留下一个空值的名字,Claude Code 不当它是凭证。为它拒绝启动
