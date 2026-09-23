@@ -104,6 +104,12 @@ bun ~/.claude-accounts-pool/claude-pool.ts -p "..."   # 参数原样透传,一�
 
 退出码:`78` = 这台机器配置得让租约用不上(先按提示修);`75` = 池子这会儿给不出号(稍后再试);其余都是 `claude` 自己的退出码。
 
+**撞限流会自动上报给 master**,于是别的机器不用各自再撞一次墙。实现是一个 `StopFailure` 钩子,经 `--settings` 挂在子进程上——同样不碰你的 settings 文件。两个实测得来的边界:
+
+- **`-p` 模式下不触发**(同一次对照里 `SessionStart` / `UserPromptSubmit` 触发了,`Stop` 与 `StopFailure` 没有;交互式会话四个全触发)。所以 `-p` 跑的那次撞限流不会上报,启动时会提醒一句。
+- **鉴权失败绝不当限流上报**。租约过期与额度打满是两回事,把前者报成后者会把一个额度健康的账号打进冷却。
+
+
 设计依据与实测记录见 [issue #83](https://github.com/Daiwenxi798673133/claude-accounts-pool/issues/83)。
 
 ### 更多细节

@@ -13,6 +13,7 @@
 import type { LeaseFailure, LeaseOutcome } from "../worker/leaseClient.ts"
 import type { LeaseRefusal } from "../cloud/protocol.ts"
 import { buildChildEnv, POOL_SESSION_SENTINEL, type Blocker } from "./childEnv.ts"
+import { printModeNotice, withHookSettings } from "./hookSettings.ts"
 
 // sysexits codes, not 1-for-everything: the operator's shell (and any wrapper script) can tell
 // "this machine is configured wrong, fixing it is on you" apart from "the pool had nothing right
@@ -80,6 +81,8 @@ export type SessionDeps = {
   // composition root, so it cannot pollute a piped stdout.
   notify: (line: string) => void
   masterUrl: string
+  // 限流上报钩子脚本的绝对路径,undefined 表示这次不挂(找不到脚本,或操作者自己传了 --settings)。
+  hookPath?: string
   now?: () => number
 }
 
@@ -124,7 +127,7 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
     return EXIT_NO_LEASE
   }
 
-  const child = buildChildEnv({ env: deps.env, access: lease.access, settings })
+  const child = buildChildEnv({ env: deps.env, access: lease.access, accountId: lease.accountId, settings })
   // Unreachable in practice — the same inputs passed the dry run above — but the type says it can
   // fail, and inventing an `as` to get past that would be the one place this lane could start an
   // unguarded session.
@@ -137,5 +140,14 @@ export async function runPooledSession(deps: SessionDeps, argv: readonly string[
     `账号池:已租到 ${lease.accountId.slice(0, 8)},本次会话凭证有效期 ${horizonText(lease.expiresAt, now())}。` +
       "会话中途不会换号,到期后需要重开。",
   )
-  return deps.spawn({ argv, env: child.env })
+
+  // 限流上报钩子。挂不上不是失败:少的是给【别的机器】看的遥测,这一次会话照常能跑。所以只说一句,
+  // 不拦启动 —— 反过来(为了一条遥测拒绝启动)才是本末倒置。
+  const hooked = withHookSettings(argv, deps.hookPath)
+  if (hooked.skipped !== undefined) deps.notify(`账号池:${hooked.skipped}`)
+  else {
+    const printNotice = printModeNotice(argv)
+    if (printNotice !== undefined) deps.notify(`账号池:${printNotice}`)
+  }
+  return deps.spawn({ argv: hooked.argv, env: child.env })
 }
