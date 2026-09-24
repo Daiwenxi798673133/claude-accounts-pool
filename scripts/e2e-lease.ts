@@ -130,8 +130,13 @@ const workerRegistry = createWorkerRegistry({
 const server = startLeaseServer({
   // recordLease / justAdopted 是 serveLease 与 handleLease 真的会调的两个动词。这个桩曾经漏了它们,
   // 于是每一发 lease 都以 TypeError 逃逸成 Bun 的 500,整个 harness 在 main 上就是红的。
+  // 第二次踩同一个坑:prelease 路径后来加了 recallAffinity / pickIncumbent(续期保号),桩又没跟上。
+  // 这里按 leaseServer 实际会调的动词列全,返回"不保号、不冷却",让 lease 落到 pickAccount。
   scheduler: {
     pickAccount: ({ accounts, exclude }) => accounts.find((a) => a.id !== exclude),
+    recallAffinity: () => undefined,
+    pickIncumbent: () => undefined,
+    isCoolingDown: () => false,
     recordLease: () => {},
     justAdopted: () => false,
     reportRateLimit: () => {},

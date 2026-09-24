@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { latestMaxedReset, PROVIDER_IDS, PROVIDERS, scoreWindows, toProviderId, type NormalizedWindow, type RetryErrorLike } from "./providers.ts"
+import { anthropicQuotaVerdict, latestMaxedReset, latestWindowReset, PROVIDER_IDS, PROVIDERS, scoreWindows, toProviderId, type NormalizedWindow, type RetryErrorLike } from "./providers.ts"
 import type { OpenaiUsage } from "./openai-usage.ts"
 import type { UsageResponse } from "./usage.ts"
 
@@ -249,4 +249,40 @@ test("V16:两个 provider 的 ops 都齐全,归一化产物都是 NormalizedWind
     expect(typeof win.utilization).toBe("number")
   }
   expect(all).toHaveLength(6)
+})
+
+// issue #95:按客户端自己的规则读 429 的限流头。
+test("anthropicQuotaVerdict:带额度标记的是 quota", () => {
+  expect(anthropicQuotaVerdict({ "anthropic-ratelimit-unified-representative-claim": "five_hour" })).toBe("quota")
+  expect(anthropicQuotaVerdict({ "anthropic-ratelimit-unified-overage-status": "rejected" })).toBe("quota")
+  expect(anthropicQuotaVerdict({ "anthropic-ratelimit-unified-status": "rejected" })).toBe("quota")
+  expect(anthropicQuotaVerdict({ "Anthropic-Ratelimit-Unified-5h-Status": "REJECTED" })).toBe("quota")
+})
+
+// 把 eaaa1a79 冷却到 10 月 1 日的那次上报,原样。
+test("anthropicQuotaVerdict:有限流头但没有额度标记的是 not-quota", () => {
+  expect(
+    anthropicQuotaVerdict({
+      "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+      "anthropic-ratelimit-unified-reset": "1790812800",
+    }),
+  ).toBe("not-quota")
+  expect(anthropicQuotaVerdict({ "anthropic-ratelimit-unified-status": "allowed" })).toBe("not-quota")
+})
+
+test("anthropicQuotaVerdict:一个限流头都没有是 unknown —— 大多数上报链路本来就拿不到头", () => {
+  expect(anthropicQuotaVerdict({})).toBe("unknown")
+  expect(anthropicQuotaVerdict({ "retry-after": "10" })).toBe("unknown")
+})
+
+test("latestWindowReset:所有窗口里最晚的未来重置点,用满与否都算", () => {
+  const now = Date.parse("2026-09-24T00:00:00Z")
+  const windows: NormalizedWindow[] = [
+    { label: "five_hour", utilization: 11, resets_at: "2026-09-24T05:00:00Z" },
+    { label: "seven_day", utilization: 91, resets_at: "2026-09-24T11:00:00Z" },
+    { label: "old", utilization: 3, resets_at: "2026-09-23T00:00:00Z" },
+    { label: "none", utilization: 0 },
+  ]
+  expect(latestWindowReset(windows, now)).toBe(Date.parse("2026-09-24T11:00:00Z"))
+  expect(latestWindowReset([{ label: "x", utilization: 1 }], now)).toBeUndefined()
 })

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import type { StoredAccount } from "../accounts.ts"
 import { MASTER_USAGE_POLL_INTERVAL_MS, MAX_ACCOUNT_HOLDERS } from "../constants.ts"
 import type { UsageResponse } from "../usage.ts"
-import { createScheduler, RATELIMIT_ADOPTION_GRACE_MS, type SchedulerDeps } from "./scheduler.ts"
+import { createScheduler, IMPLAUSIBLE_COOLDOWN_SLACK_MS, RATELIMIT_ADOPTION_GRACE_MS, type SchedulerDeps } from "./scheduler.ts"
 
 const COOLDOWN_KEY = "claude-accounts-usage.master.cooldown"
 
@@ -887,4 +887,59 @@ test("已过期的租约不占满员席位", () => {
   scheduler.recordLease({ workerId: "w3", accountId: "a", expiresAt: at - 1, pinned: false })
 
   expect(scheduler.pickAccount({ accounts, workerId: "w4" })?.id).toBe("a")
+})
+
+// issue #95:一个没有任何窗口解释得了的计时冷却。eaaa1a79 当时:5h 11%、7d 91%,7d 在 10 小时后重置,
+// 冷却却排到了 10 月 1 日(extra usage 的月度重置点)。
+test("计时冷却的截止时间比所有窗口的重置点都晚、且没有窗口用满:下一次轮询解除", () => {
+  const { kv, snapshot } = makeKv()
+  const now = Date.parse("2026-09-24T00:00:00Z")
+  const scheduler = createScheduler({ kv, now: () => now })
+  scheduler.reportRateLimit("a", Date.parse("2026-10-01T00:00:00Z"))
+  expect(scheduler.isCoolingDown("a")).toBe(true)
+  scheduler.setUsageCache([
+    { id: "a", usage: { five_hour: { utilization: 11, resets_at: "2026-09-24T05:00:00Z" }, seven_day: { utilization: 91, resets_at: "2026-09-24T11:00:00Z" } } },
+  ])
+  expect(scheduler.isCoolingDown("a")).toBe(false)
+  // 持久化的那份也清掉了 —— 重启不会把它读回来。
+  expect(snapshot()).toEqual({})
+})
+
+// 快照可能比真实撞墙晚一次轮询:截止时间落在窗口范围内的冷却,正是计时冷却要保护的情形。
+test("截止时间在窗口重置范围内的计时冷却保留,哪怕快照里还没用满", () => {
+  const { kv } = makeKv()
+  const now = Date.parse("2026-09-24T00:00:00Z")
+  const scheduler = createScheduler({ kv, now: () => now })
+  const fiveHourReset = Date.parse("2026-09-24T05:00:00Z")
+  scheduler.reportRateLimit("a", fiveHourReset + IMPLAUSIBLE_COOLDOWN_SLACK_MS - 1)
+  scheduler.setUsageCache([{ id: "a", usage: { five_hour: { utilization: 99, resets_at: "2026-09-24T05:00:00Z" } } }])
+  expect(scheduler.isCoolingDown("a")).toBe(true)
+})
+
+test("窗口一个重置点都没有时判断不了,计时冷却保留", () => {
+  const { kv } = makeKv()
+  const now = Date.parse("2026-09-24T00:00:00Z")
+  const scheduler = createScheduler({ kv, now: () => now })
+  scheduler.reportRateLimit("a", Date.parse("2026-10-01T00:00:00Z"))
+  scheduler.setUsageCache([{ id: "a", usage: { five_hour: { utilization: 0 } } }])
+  expect(scheduler.isCoolingDown("a")).toBe(true)
+})
+
+test("快照里没有这个号:不当作恢复的证据,计时冷却保留", () => {
+  const { kv } = makeKv()
+  const now = Date.parse("2026-09-24T00:00:00Z")
+  const scheduler = createScheduler({ kv, now: () => now })
+  scheduler.reportRateLimit("a", Date.parse("2026-10-01T00:00:00Z"))
+  scheduler.setUsageCache([{ id: "b", usage: usage(1, "2026-09-24T05:00:00Z") }])
+  expect(scheduler.isCoolingDown("a")).toBe(true)
+})
+
+// 重启后从持久化读回来的那份也要能被解除 —— 这正是 eaaa1a79 的处境。
+test("从持久化恢复的误报冷却,在第一次轮询时解除", () => {
+  const now = Date.parse("2026-09-24T00:00:00Z")
+  const { kv } = makeKv({ a: Date.parse("2026-10-01T00:00:00Z") })
+  const scheduler = createScheduler({ kv, now: () => now })
+  expect(scheduler.isCoolingDown("a")).toBe(true)
+  scheduler.setUsageCache([{ id: "a", usage: usage(11, "2026-09-24T05:00:00Z") }])
+  expect(scheduler.isCoolingDown("a")).toBe(false)
 })
