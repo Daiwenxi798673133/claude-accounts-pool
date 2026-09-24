@@ -77,16 +77,37 @@ const ORIGINAL_ZSHRC = 'export PATH="$HOME/.local/bin:$PATH"\nalias ll="ls -l"\n
 writeFileSync(ZSHRC, ORIGINAL_ZSHRC)
 
 // ── 假 master / 假 Anthropic ──
-const leases: { workerId: string }[] = []
+const leases: { workerId: string; preferredAccountIdPrefix?: string; pinned?: boolean }[] = []
+const POOL_ACCOUNTS = [
+  { id: "aaaaaaaa-e2e0-0000-0000-000000000000", access: "FAKE-A", label: "a@e2e.invalid" },
+  { id: "bbbbbbbb-e2e0-0000-0000-000000000000", access: "FAKE-B", label: "b@e2e.invalid" },
+]
 const master = Bun.serve({
   port: 0,
   hostname: "127.0.0.1",
   async fetch(req) {
     const url = new URL(req.url)
     if (url.pathname === CLOUD_ROUTES.health) return Response.json({ ok: true })
+    if (url.pathname === CLOUD_ROUTES.usage) {
+      return Response.json({
+        at: Date.now(),
+        stale: false,
+        accounts: POOL_ACCOUNTS.map((a) => ({
+          idPrefix: a.id.slice(0, 8),
+          label: a.label,
+          windows: [{ label: "five_hour", utilization: 7 }, { label: "seven_day", utilization: 40 }],
+          hasUsage: true,
+          coolingDown: false,
+          excluded: false,
+          needsReauth: false,
+        })),
+      })
+    }
     if (url.pathname === CLOUD_ROUTES.lease && req.method === "POST") {
-      leases.push((await req.json()) as { workerId: string })
-      return Response.json({ accountId: "aaaaaaaa-e2e0-0000-0000-000000000000", access: "FAKE-A", expiresAt: Date.now() + 3 * 3600_000 })
+      const body = (await req.json()) as (typeof leases)[number]
+      leases.push(body)
+      const pick = POOL_ACCOUNTS.find((a) => body.preferredAccountIdPrefix !== undefined && a.id.startsWith(body.preferredAccountIdPrefix)) ?? POOL_ACCOUNTS[0]
+      return Response.json({ accountId: pick.id, access: pick.access, expiresAt: Date.now() + 3 * 3600_000 })
     }
     return new Response(null, { status: 204 })
   },
@@ -175,6 +196,8 @@ try {
       check(`生成了可执行的 ${f}`, existsSync(path) && (Bun.file(path).size ?? 0) > 0)
     }
     check("租约用的是输入的 WorkerID", leases.at(-1)?.workerId === "e2e-box", leases.at(-1))
+    const skill = join(home, ".claude", "skills", "pool", "SKILL.md")
+    check("装了 /pool skill(交互式界面才认得这条命令),且不许模型自己调用", existsSync(skill) && readFileSync(skill, "utf8").includes("disable-model-invocation: true"))
   }
 
   console.log("T2 终端里手敲 claude:经 PATH 前面的转发脚本走池子")
@@ -220,6 +243,36 @@ try {
     check("settings 没有被再写一次(没有新备份)", backups(SETTINGS) === 1, backups(SETTINGS))
   }
 
+  console.log("T15 /pool 面板:经生成的 UserPromptSubmit 钩子,不经过模型")
+  {
+    const HOOK = join(BIN, "claude-pool-prompt-hook")
+    const settings = readJson(SETTINGS) as { hooks?: { UserPromptSubmit?: { hooks: { command: string }[] }[] } }
+    check("settings 里挂上了 /pool 钩子", JSON.stringify(settings.hooks?.UserPromptSubmit ?? []).includes(HOOK), settings.hooks)
+    const feed = async (prompt: string) => {
+      const proc = Bun.spawn([HOOK], { cwd: box, env: baseEnv(), stdin: Buffer.from(JSON.stringify({ session_id: "s", prompt })), stdout: "pipe", stderr: "pipe" })
+      const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
+      const reply = stdout.length > 0 ? (JSON.parse(stdout) as { decision?: string; reason?: string; suppressOriginalPrompt?: boolean }) : undefined
+      return { code, stdout, reply }
+    }
+    const plain = await feed("fix the failing test")
+    check("普通输入:原样放行,什么都不输出", plain.code === 0 && plain.stdout === "", plain)
+    const list = await feed("/pool")
+    check("/pool:拦下输入,不复述原输入", list.reply?.decision === "block" && list.reply.suppressOriginalPrompt === true, list)
+    check("/pool:列出两个号,当前号标出来", /1\s+aaaaaaaa.*← 当前/.test(list.reply?.reason ?? "") && (list.reply?.reason ?? "").includes("bbbbbbbb"), list.reply?.reason)
+    const leasesBefore = leases.length
+    const sw = await feed("/pool 2")
+    check("/pool 2:切到 bbbbbbbb", (sw.reply?.reason ?? "").includes("✓ 已切到 bbbbbbbb"), sw.reply?.reason)
+    check("点名经 relay 发给 master", leases.slice(leasesBefore).some((l) => l.preferredAccountIdPrefix === "bbbbbbbb" && l.pinned === false), leases.slice(leasesBefore))
+    check("relay 的共享号真的换了", (await relayHealth())?.accountId === "bbbbbbbb", await relayHealth())
+    const after = await claudeVia([LAUNCHER, fakeClaude])
+    check("之后起的 claude 进程拿到的是新号", after.report?.token === "FAKE-B", after.report?.token)
+    const pinned = await feed("/pool pin 1")
+    check("/pool pin 1:切回 aaaaaaaa 并钉住", (pinned.reply?.reason ?? "").includes("✓ 已切到 aaaaaaaa 并钉住"), pinned.reply?.reason)
+    check("钉住落盘", readFileSync(join(POOL, "cc-pin.json"), "utf8").includes("aaaaaaaa"))
+    const unpin = await feed("/pool unpin")
+    check("/pool unpin:取消钉住", (unpin.reply?.reason ?? "").includes("✓ 已取消钉住") && !readFileSync(join(POOL, "cc-pin.json"), "utf8").includes("aaaaaaaa"), unpin.reply?.reason)
+  }
+
   console.log("T7 revert:照单撤回,别人的文件回到原样")
   {
     const r = await takeover("revert")
@@ -227,9 +280,10 @@ try {
     check("settings 回到原内容", JSON.stringify(readJson(SETTINGS)) === JSON.stringify(ORIGINAL_SETTINGS), readJson(SETTINGS))
     check(".zshrc 与原文逐字节相同", readFileSync(ZSHRC, "utf8") === ORIGINAL_ZSHRC, readFileSync(ZSHRC, "utf8"))
     check("setup 建的池子配置删掉了", !existsSync(WORKER))
-    check("转发脚本删掉了", !existsSync(join(BIN, "claude")) && !existsSync(join(BIN, "claude-pool")))
+    check("转发脚本删掉了", !existsSync(join(BIN, "claude")) && !existsSync(join(BIN, "claude-pool")) && !existsSync(join(BIN, "claude-pool-prompt-hook")))
     check("启动器留着(撤回前启动的进程还指着它)", existsSync(LAUNCHER))
     check("清单没了", !existsSync(MANIFEST) && !existsSync(`${MANIFEST}.reverting`))
+    check("/pool skill 连目录一起删掉了", !existsSync(join(home, ".claude", "skills", "pool")))
     check("relay 停了", (await relayHealth()) === undefined)
   }
 
@@ -253,6 +307,35 @@ try {
     check("revert 成功", back.code === 0, back.stderr)
     check("池子配置还原成 setup 之前", JSON.stringify(readJson(WORKER)) === JSON.stringify(senpi), readJson(WORKER))
     rmSync(WORKER)
+  }
+
+  console.log("T16 用户自己已有 UserPromptSubmit 钩子:setup 追加、revert 只删自己那条")
+  {
+    const withHooks = { hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "/their/prompt-hook" }] }], Stop: [{ hooks: [{ type: "command", command: "/their/stop" }] }] } }
+    writeFileSync(SETTINGS, `${JSON.stringify(withHooks, null, 2)}\n`)
+    const r = await takeover("setup", "--master", MASTER, "--worker", "e2e-box")
+    check("setup 成功", r.code === 0, r.stderr)
+    const merged = readJson(SETTINGS) as { hooks: { UserPromptSubmit: unknown[]; Stop: unknown[] } }
+    check("别人的钩子还在,我们的追加在后面", merged.hooks.UserPromptSubmit.length === 2 && JSON.stringify(merged.hooks.UserPromptSubmit[0]).includes("/their/prompt-hook"), merged.hooks)
+    const back = await takeover("revert")
+    check("revert 成功", back.code === 0, back.stderr)
+    check("settings 回到原样(别人的两个钩子都在)", JSON.stringify(readJson(SETTINGS)) === JSON.stringify(withHooks), readJson(SETTINGS))
+    writeFileSync(SETTINGS, `${JSON.stringify(ORIGINAL_SETTINGS, null, 2)}\n`)
+  }
+
+  console.log("T17 用户自己已有一个 pool skill:不覆盖,revert 也不删")
+  {
+    const skill = join(home, ".claude", "skills", "pool", "SKILL.md")
+    mkdirSync(dirname(skill), { recursive: true })
+    const theirs = "---\nname: pool\ndescription: 我自己的 pool\n---\n我的内容\n"
+    writeFileSync(skill, theirs)
+    const r = await takeover("setup", "--master", MASTER, "--worker", "e2e-box")
+    check("setup 成功,并说明跳过了", r.code === 0 && r.stderr.includes("不覆盖"), { code: r.code, stderr: r.stderr })
+    check("用户的 skill 原样", readFileSync(skill, "utf8") === theirs)
+    const back = await takeover("revert")
+    check("revert 成功", back.code === 0, back.stderr)
+    check("revert 后用户的 skill 仍在", readFileSync(skill, "utf8") === theirs)
+    rmSync(dirname(skill), { recursive: true })
   }
 
   console.log("T10 settings 的 env 块里有盖过租约的变量:setup 拒绝,什么都不写")

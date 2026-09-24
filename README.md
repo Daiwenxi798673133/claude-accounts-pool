@@ -152,7 +152,7 @@ make revert     # 一键撤回:Claude Code 回到你自己的号
 
 也可以不提问:`make setup MASTER=100.64.0.36:8787 WORKER=vince-mbp`。WorkerID 就是看板上这台机器的名字。要在**主 clone** 里跑(不是 git worktree):启动器和 launchd 任务会写死仓库路径,worktree 合并后被删掉,接管就跟着失效了。
 
-`make setup` 做五件事。每一件都记进 `~/.claude-accounts-pool/cc-takeover.json`,改别人的文件之前先备份(`*.bak-<时间>`):
+`make setup` 做这几件事。每一件都记进 `~/.claude-accounts-pool/cc-takeover.json`,改别人的文件之前先备份(`*.bak-<时间>`):
 
 | 改了什么 | 为什么 |
 |---|---|
@@ -161,6 +161,18 @@ make revert     # 一键撤回:Claude Code 回到你自己的号
 | `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PROCESS_WRAPPER` | 官方[启动器契约](https://code.claude.com/docs/en/corporate-launcher):Claude Code 从自己二进制拉起的一切进程(后台服务、agent view、自我重启、Remote Control、队友 pane)都经过启动器 |
 | `~/.claude-accounts-pool/bin/claude` + shell rc 末尾一段 PATH | 终端里手敲的 `claude` 不在契约覆盖内,文档的建议做法就是在 PATH 前面放一个名为 `claude` 的脚本(官方 symlink 不动) |
 | `~/Library/LaunchAgents/com.claude-accounts-pool.relay.plist` | relay 常驻:不闲置退出,崩溃自动拉起 |
+| `settings.json` 的 `hooks.UserPromptSubmit` + `~/.claude/skills/pool/` | `/pool` 面板(见下) |
+
+**在 Claude Code 里输入 `/pool`** 就能看全池用量、切号、钉住,不经过模型、不花 token:
+
+```text
+/pool              列出全池账号:5h / 7d 用量、当前共享号、钉住、冷却中、需重登、几台在用
+/pool 3            把本机共享号切到 #3(也可以写 id 前缀),本机所有会话从下一个请求起一起换
+/pool pin 3        切过去并钉住,额度用满前不被轮换走
+/pool unpin        取消钉住
+```
+
+它是一个 `UserPromptSubmit` 钩子(外加一个同名 skill,让交互界面认得这条命令):拦下 `/pool`,把面板直接显示给你,上游收不到任何模型请求。所以当前号撞墙、模型用不了的时候,照样能切。Claude Code 没有给插件自绘交互界面的接口,所以它是文字面板加命令,而不是方向键菜单。
 
 装完**开一个新终端**再敲 `claude`。已经开着的会话读的是旧设置,重启后生效;后台服务要重启一次(没有在跑的后台会话时执行 `claude daemon stop --any`)。
 
