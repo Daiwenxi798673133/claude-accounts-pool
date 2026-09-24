@@ -221,9 +221,31 @@ function launchctl(args: string[]): { ok: boolean; output: string } {
 
 const uid = (): string => String(process.getuid?.() ?? "")
 
-async function ask(rl: ReturnType<typeof createInterface> | undefined, question: string, fallback?: string): Promise<string> {
-  if (rl === undefined) return fallback ?? ""
-  const answer = (await rl.question(fallback === undefined ? `${question}: ` : `${question} [${fallback}]: `)).trim()
+// 终端被关掉、SIGHUP 却没送到时(issue #105),readline 会 close,但挂着的 question 既不 resolve 也不
+// reject;Bun 随后把读到 EOF 的 tty 留在 kqueue 里,kevent 每次立即返回 —— 单核空转,永不退出。
+// 所以 close 一到就 abort 这次提问,与 Ctrl-C / Ctrl-D(Bun 以 AbortError reject)走同一条路。
+type Prompt = { rl: ReturnType<typeof createInterface>; closed: AbortSignal }
+
+function openPrompt(): Prompt {
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  const closed = new AbortController()
+  rl.once("close", () => closed.abort())
+  return { rl, closed: closed.signal }
+}
+
+// 拿不到回答了:终端没了,或者按了 Ctrl-C / Ctrl-D。
+class NoAnswer extends Error {}
+
+async function ask(prompt: Prompt | undefined, question: string, fallback?: string): Promise<string> {
+  if (prompt === undefined) return fallback ?? ""
+  if (prompt.closed.aborted) throw new NoAnswer()
+  let answer: string
+  try {
+    answer = (await prompt.rl.question(fallback === undefined ? `${question}: ` : `${question} [${fallback}]: `, { signal: prompt.closed })).trim()
+  } catch (error) {
+    if (prompt.closed.aborted || (error instanceof Error && error.name === "AbortError")) throw new NoAnswer()
+    throw error
+  }
   return answer.length > 0 ? answer : (fallback ?? "")
 }
 
@@ -238,12 +260,12 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   const previous = loadManifest(MANIFEST) ?? loadManifest(REVERTING)
 
   // ── 1. 输入 ──
-  const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : undefined
+  const prompt = interactive ? openPrompt() : undefined
   let masterUrl: string
   let workerId: string
   try {
     const defaultMaster = typeof current?.masterUrl === "string" ? current.masterUrl.replace(/^https?:\/\//, "") : undefined
-    const masterInput = flags.master ?? (await ask(rl, "master 地址 (ip:port)", defaultMaster))
+    const masterInput = flags.master ?? (await ask(prompt, "master 地址 (ip:port)", defaultMaster))
     const master = normalizeMasterUrl(masterInput)
     if (!master.ok) {
       warn(master.reason)
@@ -252,7 +274,7 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
     masterUrl = master.url
 
     const defaultWorker = typeof current?.ccWorkerId === "string" ? current.ccWorkerId : undefined
-    const workerInput = flags.worker ?? (await ask(rl, "WorkerID(看板上显示的这台机器的名字)", defaultWorker))
+    const workerInput = flags.worker ?? (await ask(prompt, "WorkerID(看板上显示的这台机器的名字)", defaultWorker))
     const worker = validateWorkerId(workerInput)
     if (!worker.ok) {
       warn(worker.reason)
@@ -269,11 +291,15 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
     } catch {}
     if (!reachable) {
       warn(`连不上 master:${masterUrl}/v1/health 没有应答 {"ok":true}。`)
-      const go = flags.yes === true || (await ask(rl, "仍然继续? (y/N)", "N")).toLowerCase() === "y"
+      const go = flags.yes === true || (await ask(prompt, "仍然继续? (y/N)", "N")).toLowerCase() === "y"
       if (!go) return EXIT_REFUSED
     }
+  } catch (error) {
+    if (!(error instanceof NoAnswer)) throw error
+    warn("没拿到回答(终端关了,或者按了 Ctrl-C / Ctrl-D),没有做任何改动。")
+    return EXIT_USAGE
   } finally {
-    rl?.close()
+    prompt?.rl.close()
   }
 
   // ── 3. 预检:任何一条不过都不写任何东西 ──

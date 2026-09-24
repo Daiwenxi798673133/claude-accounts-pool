@@ -448,6 +448,57 @@ try {
     const back = await takeover("revert")
     check("revert 成功", back.code === 0, back.stderr)
   }
+
+  console.log("T19 交互提问(真 pty,make setup 不带 MASTER / WORKER):照常答得上;终端被关、Ctrl-C 都立刻退出(issue #105)")
+  {
+    // trap '' HUP:SIGHUP 照常送到的话进程本来就会被杀掉;要测的是它没送到的那种情况。
+    const interactive = () => {
+      let screen = ""
+      const proc = Bun.spawn(["/bin/sh", "-c", `trap '' HUP; exec bun '${join(REPO, "scripts", "cc-takeover.ts")}' setup`], {
+        cwd: box,
+        env: baseEnv(),
+        terminal: { cols: 120, rows: 40, data: (_t, chunk) => void (screen += new TextDecoder().decode(chunk)) },
+      })
+      return { proc, screen: () => screen }
+    }
+    const waitFor = async (screen: () => string, text: string) => {
+      const deadline = Date.now() + 10_000
+      while (!screen().includes(text) && Date.now() < deadline) await Bun.sleep(50)
+      return screen().includes(text)
+    }
+    const exitWithin = async (proc: ReturnType<typeof interactive>["proc"], ms: number) => {
+      const code = await Promise.race([proc.exited, Bun.sleep(ms).then(() => undefined)])
+      if (code === undefined) proc.kill("SIGKILL") // 别把一个空转的进程留在测试机上
+      return code
+    }
+
+    const answered = interactive()
+    check("问 master 地址", await waitFor(answered.screen, "master 地址"), answered.screen())
+    answered.proc.terminal?.write(`${MASTER}\r`)
+    check("问 WorkerID", await waitFor(answered.screen, "WorkerID"), answered.screen())
+    answered.proc.terminal?.write("e2e-pty\r")
+    const answeredCode = await exitWithin(answered.proc, 60_000)
+    answered.proc.terminal?.close()
+    check("答完两问,setup 成功", answeredCode === 0 && answered.screen().includes("接管完成"), { code: answeredCode, screen: answered.screen() })
+    check("用的是输入的 WorkerID", existsSync(WORKER) && readJson(WORKER).ccWorkerId === "e2e-pty")
+    const back = await takeover("revert")
+    check("revert 成功", back.code === 0, back.stderr)
+
+    const hungUp = interactive()
+    check("终端被关前停在提问上", await waitFor(hungUp.screen, "master 地址"), hungUp.screen())
+    hungUp.proc.terminal?.close()
+    check("终端被关:几秒内退出,不空转", (await exitWithin(hungUp.proc, 5_000)) !== undefined)
+    check("终端被关:什么都没写", !existsSync(MANIFEST) && readFileSync(ZSHRC, "utf8") === ORIGINAL_ZSHRC)
+
+    const interrupted = interactive()
+    check("Ctrl-C 前停在提问上", await waitFor(interrupted.screen, "master 地址"), interrupted.screen())
+    interrupted.proc.terminal?.write("\x03")
+    const interruptedCode = await exitWithin(interrupted.proc, 5_000)
+    interrupted.proc.terminal?.close()
+    check("Ctrl-C:退出码 2", interruptedCode === 2, interruptedCode)
+    check("Ctrl-C:一行说明,不出栈", interrupted.screen().includes("没有做任何改动") && !interrupted.screen().includes("AbortError"), interrupted.screen())
+    check("Ctrl-C:什么都没写", !existsSync(MANIFEST) && readFileSync(ZSHRC, "utf8") === ORIGINAL_ZSHRC)
+  }
 } finally {
   const h = await relayHealth()
   if (h?.pid) process.kill(h.pid, "SIGTERM")
