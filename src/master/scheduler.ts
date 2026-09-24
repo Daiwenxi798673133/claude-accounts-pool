@@ -4,6 +4,7 @@ import { MASTER_USAGE_POLL_INTERVAL_MS, MAX_ACCOUNT_HOLDERS } from "../constants
 import { log } from "../logger.ts"
 import { latestMaxedReset, latestWindowReset, type NormalizedWindow, PROVIDERS, scoreWindows } from "../providers.ts"
 import type { UsageResponse } from "../usage.ts"
+import { writeKvRecord } from "../kvRecord.ts"
 
 // Which account should the next lease use? That is the whole job of this module: no network, no
 // token handling, no disk. Usage snapshots arrive from outside via setUsageCache.
@@ -273,7 +274,9 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     const at = now()
     const snapshot: Record<string, number> = {}
     for (const [id, until] of cooldown) if (until > at) snapshot[id] = until
-    deps.kv.set(COOLDOWN_KV_KEY, snapshot)
+    // writeKvRecord, not kv.set: api.kv shallow-MERGES, so a plain set never removes a cleared entry
+    // and it would come back on the next restart (issue #99).
+    writeKvRecord(deps.kv, COOLDOWN_KV_KEY, snapshot)
   }
 
   // Lapsed entries leave on the way out, so the stored object stays bounded without a sweep timer —
@@ -288,7 +291,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       }
       snapshot[workerId] = bound
     }
-    deps.kv.set(AFFINITY_KV_KEY, snapshot)
+    writeKvRecord(deps.kv, AFFINITY_KV_KEY, snapshot)
   }
 
   // Swept on read as well as on write: a master that serves nobody for a day would otherwise keep

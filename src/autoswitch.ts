@@ -8,6 +8,7 @@ import { latestTurn } from "./turn.ts"
 import { decideRedo, type PartLike } from "./continuation.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 import type { SwitchStrategy } from "./worker/switchStrategy.ts"
+import { writeKvRecord } from "./kvRecord.ts"
 
 const ENABLED = true
 
@@ -105,7 +106,9 @@ export function installAutoSwitch(api: TuiPluginApi, strategy?: SwitchStrategy):
     const now = Date.now()
     const snapshot: Record<string, number> = {}
     for (const [id, until] of cooldown) if (until > now) snapshot[id] = until
-    api.kv.set(COOLDOWN_KV_KEY, snapshot)
+    // writeKvRecord, not api.kv.set: the store shallow-MERGES, so a cleared cooldown would otherwise
+    // survive in kv.json and come back on the next OpenCode start (issue #99).
+    writeKvRecord(api.kv, COOLDOWN_KV_KEY, snapshot)
   }
 
   function scheduleRecovery(id: string, until: number): void {

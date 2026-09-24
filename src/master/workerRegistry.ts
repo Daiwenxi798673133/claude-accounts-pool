@@ -14,6 +14,7 @@
 // must answer false, and `{}[label] !== undefined` answers true for both.
 
 import { log } from "../logger.ts"
+import { writeKvRecord } from "../kvRecord.ts"
 
 // Same namespace as the scheduler's cooldown book, because it is the same store and the same
 // process: a grep for `claude-accounts-usage.master.` finds everything this master persists.
@@ -48,7 +49,9 @@ export function createWorkerRegistry(deps: WorkerRegistryDeps): WorkerRegistry {
   function persist(): void {
     const snapshot: Record<string, number> = {}
     for (const [workerId, registeredAt] of registered) snapshot[workerId] = registeredAt
-    deps.kv.set(WORKER_REGISTRY_KV_KEY, snapshot)
+    // writeKvRecord: api.kv shallow-merges (issue #99); today nothing is ever removed from this book,
+    // but a plain set would silently keep any label a future edit takes out.
+    writeKvRecord(deps.kv, WORKER_REGISTRY_KV_KEY, snapshot)
   }
 
   return {
