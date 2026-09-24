@@ -308,7 +308,7 @@ export const POOL_SKILL_MARKER = "<!-- claude-accounts-pool: make setup 生成,m
 export function renderPoolSkill(): string {
   return `---
 name: pool
-description: 账号池面板:看全池用量、切号、钉住(由 UserPromptSubmit 钩子接管,不经过模型)
+description: 账号池面板:看全池用量(由 UserPromptSubmit 钩子接管,不经过模型)
 disable-model-invocation: true
 ---
 ${POOL_SKILL_MARKER}

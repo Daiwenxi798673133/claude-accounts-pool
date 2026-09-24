@@ -11,7 +11,6 @@ import { hookResponse } from "./src/claudecode/panel.ts"
 import { runPanel } from "./src/claudecode/panelRun.ts"
 import { createPinStore } from "./src/claudecode/pin.ts"
 import { RELAY_ROUTES, RELAY_SERVICE, type RelayHealth } from "./src/claudecode/relay.ts"
-import { createRelayClient } from "./src/claudecode/relayClient.ts"
 import { CLOUD_ROUTES, type UsageSnapshotView } from "./src/cloud/protocol.ts"
 
 try {
@@ -42,17 +41,7 @@ try {
         return undefined
       }
     },
-    // 面板从不拉起 relay:接管装好时它由 launchd 常驻;不在就如实说,而不是在一次按键里偷偷起一个进程。
-    relay: createRelayClient({
-      fetchImpl: fetch,
-      baseUrl: base,
-      spawnRelay: () => {},
-      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      now: Date.now,
-      controlTimeoutMs: 20_000,
-    }),
-    pin: createPinStore(env),
-    pid: process.pid,
+    readPin: () => createPinStore(env).read(),
   })
   if (out !== undefined) process.stdout.write(out)
 } catch (error) {
