@@ -943,3 +943,36 @@ test("从持久化恢复的误报冷却,在第一次轮询时解除", () => {
   scheduler.setUsageCache([{ id: "a", usage: usage(11, "2026-09-24T05:00:00Z") }])
   expect(scheduler.isCoolingDown("a")).toBe(false)
 })
+
+// 照 opencode api.kv 行为造的假 kv:set 对象是浅合并,undefined 才删键(与 src/kvRecord.test.ts 同款)。
+function solidLikeKv(): SchedulerDeps["kv"] & { raw: () => Record<string, unknown> } {
+  const store: Record<string, unknown> = {}
+  return {
+    get: <V>(key: string, fallback?: V): V => (key in store ? (store[key] as V) : (fallback as V)),
+    set: (key: string, value: unknown): void => {
+      const existing = store[key]
+      if (typeof existing === "object" && existing !== null && typeof value === "object" && value !== null) {
+        for (const [k, v] of Object.entries(value)) {
+          if (v === undefined) delete (existing as Record<string, unknown>)[k]
+          else (existing as Record<string, unknown>)[k] = v
+        }
+      } else store[key] = value
+    },
+    raw: () => JSON.parse(JSON.stringify(store)) as Record<string, unknown>,
+  }
+}
+
+// issue #99:api.kv 是浅合并。解除的冷却必须真的从存储里消失,否则下次重启又被读回来。
+test("解除的冷却从浅合并的 kv 里真的删掉,重启不复活", () => {
+  const kv = solidLikeKv()
+  const now = Date.parse("2026-09-24T00:00:00Z")
+  const first = createScheduler({ kv, now: () => now })
+  first.reportRateLimit("a", Date.parse("2026-10-01T00:00:00Z"))
+  first.reportRateLimit("b", Date.parse("2026-09-24T04:00:00Z"))
+  first.setUsageCache([{ id: "a", usage: usage(11, "2026-09-24T05:00:00Z") }])
+  expect(first.isCoolingDown("a")).toBe(false)
+  expect(Object.keys((kv.raw()[COOLDOWN_KEY] ?? {}) as object)).toEqual(["b"])
+  const restarted = createScheduler({ kv, now: () => now })
+  expect(restarted.isCoolingDown("a")).toBe(false)
+  expect(restarted.isCoolingDown("b")).toBe(true)
+})
