@@ -162,8 +162,20 @@ make revert     # 一键撤回:Claude Code 回到你自己的号
 | `~/.claude-accounts-pool/bin/claude` + shell rc 末尾一段 PATH | 终端里手敲的 `claude` 不在契约覆盖内,文档的建议做法就是在 PATH 前面放一个名为 `claude` 的脚本(官方 symlink 不动) |
 | `~/Library/LaunchAgents/com.claude-accounts-pool.relay.plist` | relay 常驻:不闲置退出,崩溃自动拉起 |
 | `settings.json` 的 `hooks.UserPromptSubmit` + `~/.claude/skills/pool/` | `/pool` 用量面板(见下) |
+| `settings.json` 的 `statusLine` | 底部状态栏常驻当前号的 5h / 7d 进度条(已有你自己的状态栏就不动) |
 
-**在 Claude Code 里输入 `/pool`** 就能看全池用量:每个号的 5h / 7d、当前共享号、钉住、冷却中、需重登、几台在用。不经过模型、不花 token —— 它是一个 `UserPromptSubmit` 钩子(外加一个同名 skill,让交互界面认得这条命令),拦下 `/pool`、把面板直接显示给你,上游收不到任何模型请求。所以当前号撞墙、模型用不了的时候照样能看。切号与钉住用 `claude-pool --pool-account <前缀> [--pool-pin]`。
+**在 Claude Code 里输入 `/pool`** 就能看全池用量,长得和 OMO 的「账号池用量」面板一样:每个号一行标题(`●` 本机在用、`○` 本机未用、已钉住、冷却中、需重新登录、哪几台机器在用、不自动切),每个窗口一行彩色进度条(0% 灰、<60% 绿、<85% 黄、≥85% 红)加重置倒计时;多于 6 个号且终端够宽时分两列。
+
+| 命令 | 作用 |
+|---|---|
+| `/pool` | 看面板 |
+| `/pool 3` | 把本机的共享号切到面板上的第 3 个(本机所有会话一起换,下一个请求起生效);也可以写 id 前缀,如 `/pool ea15` |
+| `/pool 3 pin` | 切过去并钉住:额度用满前不被轮换走。对已钉住的号再来一次就是取消钉住(OMO 的 `p`) |
+| `/pool r` | 让 master 立刻采一轮用量(OMO 的 `r`;master 30 秒内只采一次) |
+
+不经过模型、不花 token —— 它是一个 `UserPromptSubmit` 钩子(外加一个同名 skill,让交互界面认得这条命令),拦下 `/pool`、把面板直接显示给你,上游收不到任何模型请求。所以当前号撞墙、模型用不了的时候照样能看、能切。OMO 那种 ↑↓ + enter 做不出来:Claude Code 不给插件自绘交互界面,`!` 命令也没有 TTY,所以用行首编号代替光标。
+
+手动切到别的号时,原来的钉住会一起取消(不然下一次续期会把本机切回去)。启动时点名、钉住仍可用 `claude-pool --pool-account <前缀> [--pool-pin]`。
 
 装完**开一个新终端**再敲 `claude`。已经开着的会话读的是旧设置,重启后生效;后台服务要重启一次(没有在跑的后台会话时执行 `claude daemon stop --any`)。
 

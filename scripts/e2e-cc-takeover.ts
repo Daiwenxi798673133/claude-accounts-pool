@@ -78,6 +78,7 @@ writeFileSync(ZSHRC, ORIGINAL_ZSHRC)
 
 // ── 假 master / 假 Anthropic ──
 const leases: { workerId: string; preferredAccountIdPrefix?: string; pinned?: boolean }[] = []
+let usageRefreshes = 0
 const POOL_ACCOUNTS = [
   { id: "aaaaaaaa-e2e0-0000-0000-000000000000", access: "FAKE-A", label: "a@e2e.invalid" },
   { id: "bbbbbbbb-e2e0-0000-0000-000000000000", access: "FAKE-B", label: "b@e2e.invalid" },
@@ -88,7 +89,8 @@ const master = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url)
     if (url.pathname === CLOUD_ROUTES.health) return Response.json({ ok: true })
-    if (url.pathname === CLOUD_ROUTES.usage) {
+    if (url.pathname === CLOUD_ROUTES.usageRefresh && req.method === "POST") usageRefreshes += 1
+    if (url.pathname === CLOUD_ROUTES.usage || (url.pathname === CLOUD_ROUTES.usageRefresh && req.method === "POST")) {
       return Response.json({
         at: Date.now(),
         stale: false,
@@ -243,28 +245,61 @@ try {
     check("settings 没有被再写一次(没有新备份)", backups(SETTINGS) === 1, backups(SETTINGS))
   }
 
-  console.log("T15 /pool 用量面板:经生成的 UserPromptSubmit 钩子,不经过模型")
+  console.log("T15 /pool 面板:经生成的 UserPromptSubmit 钩子,不经过模型 —— 看用量、切号、钉住、刷新")
   {
     const HOOK = join(BIN, "claude-pool-prompt-hook")
     const settings = readJson(SETTINGS) as { hooks?: { UserPromptSubmit?: { hooks: { command: string }[] }[] } }
     check("settings 里挂上了 /pool 钩子", JSON.stringify(settings.hooks?.UserPromptSubmit ?? []).includes(HOOK), settings.hooks)
+    type Reply = { decision?: string; reason?: string; hookSpecificOutput?: { hookEventName?: string; suppressOriginalPrompt?: boolean } }
     const feed = async (prompt: string) => {
       const proc = Bun.spawn([HOOK], { cwd: box, env: baseEnv(), stdin: Buffer.from(JSON.stringify({ session_id: "s", prompt })), stdout: "pipe", stderr: "pipe" })
       const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
-      const reply = stdout.length > 0 ? (JSON.parse(stdout) as { decision?: string; reason?: string; suppressOriginalPrompt?: boolean }) : undefined
-      return { code, stdout, reply }
+      const reply = stdout.length > 0 ? (JSON.parse(stdout) as Reply) : undefined
+      // 面板带 ANSI 颜色;断言看的是字。
+      return { code, stdout, reply, text: (reply?.reason ?? "").replace(/\x1b\[[0-9;]*m/g, "") }
     }
+    const pinFile = join(POOL, "cc-pin.json")
+    const pinned = () => (existsSync(pinFile) ? (readJson(pinFile).accountPrefix as string | null) : null)
+
     const plain = await feed("fix the failing test")
     check("普通输入:原样放行,什么都不输出", plain.code === 0 && plain.stdout === "", plain)
     const list = await feed("/pool")
-    check("/pool:拦下输入,不复述原输入", list.reply?.decision === "block" && list.reply.suppressOriginalPrompt === true, list)
-    check("/pool:列出两个号,当前号标出来", /1\s+aaaaaaaa.*← 当前/.test(list.reply?.reason ?? "") && (list.reply?.reason ?? "").includes("bbbbbbbb"), list.reply?.reason)
-    // issue #101:只有 /pool 一条命令,带参数也只看面板,不切号。
+    check(
+      "/pool:拦下输入,不复述原输入(suppressOriginalPrompt 在 hookSpecificOutput 里)",
+      list.reply?.decision === "block" && list.reply.hookSpecificOutput?.hookEventName === "UserPromptSubmit" && list.reply.hookSpecificOutput.suppressOriginalPrompt === true,
+      list.reply,
+    )
+    check("/pool:OMO 外观 —— 标题、两个号、当前号 ● In Use、进度条", /^账号池用量\s+2 个账号/.test(list.text) && /1 ● a@e2e\.invalid In Use/.test(list.text) && /2 ○ b@e2e\.invalid/.test(list.text) && list.text.includes("█"), list.text)
+    check("/pool:进度条带颜色", (list.reply?.reason ?? "").includes("\x1b[32m"), list.reply?.reason)
+    check("/pool:底部给出命令提示", list.text.includes("/pool 编号 切号"), list.text)
+
     const leasesBefore = leases.length
-    const withArg = await feed("/pool 2")
-    check("/pool 2:只显示面板,不切号", withArg.reply?.decision === "block" && (withArg.reply.reason ?? "").includes("共享 aaaaaaaa"), withArg.reply?.reason)
-    check("没有发出任何点名", leases.length === leasesBefore, leases.slice(leasesBefore))
-    check("面板上不列衍生命令", !/\/pool\s+\S/.test(list.reply?.reason ?? ""), list.reply?.reason)
+    const sw = await feed("/pool 2")
+    check("/pool 2:点名 #2 发到 master,不带钉住", leases.slice(leasesBefore).some((l) => l.preferredAccountIdPrefix === "bbbbbbbb" && l.pinned === false), leases.slice(leasesBefore))
+    check("/pool 2:说切过去了", sw.text.includes("✓ 已切到「b@e2e.invalid」"), sw.text)
+    check("relay 现在持有 #2", (await relayHealth())?.accountId === "bbbbbbbb")
+    const beforeTraffic = upstreamAuth.length
+    const after = await claudeVia([join(BIN, "claude"), "-p", "after switch"])
+    check("之后的请求用的是 #2 的凭证", after.code === 0 && upstreamAuth.slice(beforeTraffic).at(-1) === "Bearer FAKE-B", upstreamAuth.slice(beforeTraffic))
+
+    const pin = await feed("/pool 1 pin")
+    check("/pool 1 pin:点名带钉住,钉住落盘", leases.at(-1)?.preferredAccountIdPrefix === "aaaaaaaa" && leases.at(-1)?.pinned === true && pinned() === "aaaaaaaa", { lease: leases.at(-1), pin: pinned() })
+    check("/pool 1 pin:面板标出已钉住", pin.text.includes("✓ 已钉住「a@e2e.invalid」") && /1 ● a@e2e\.invalid 已钉住/.test(pin.text), pin.text)
+    const leasesBeforeUnpin = leases.length
+    const unpin = await feed("/pool 1 pin")
+    check("再 /pool 1 pin:取消钉住,不发点名", pinned() === null && leases.length === leasesBeforeUnpin && unpin.text.includes("✓ 已取消钉住"), { pin: pinned(), text: unpin.text })
+
+    const refresh = await feed("/pool r")
+    check("/pool r:让 master 采一轮", usageRefreshes === 1 && refresh.text.includes("master 刚采完一轮用量"), refresh.text)
+    const bad = await feed("/pool 9")
+    check("/pool 9:编号越界如实说", bad.text.includes("没有 #9"), bad.text)
+
+    const STATUS = join(BIN, "claude-pool-statusline")
+    const statusLine = (readJson(SETTINGS) as { statusLine?: { type?: string; command?: string; refreshInterval?: number } }).statusLine
+    check("settings 里装了状态栏,30 秒刷新", statusLine?.type === "command" && statusLine.command === STATUS && statusLine.refreshInterval === 30, statusLine)
+    const status = await run([STATUS])
+    const line = status.stdout.replace(/\x1b\[[0-9;]*m/g, "")
+    check("状态栏:一行,当前号与 5h / 7d 进度条", status.code === 0 && line.startsWith("账号池 ● a aaaaaaaa · 5h ") && line.includes("7%") && line.includes("40%") && line.trim().split("\n").length === 1, status)
   }
 
   console.log("T7 revert:照单撤回,别人的文件回到原样")
@@ -274,7 +309,7 @@ try {
     check("settings 回到原内容", JSON.stringify(readJson(SETTINGS)) === JSON.stringify(ORIGINAL_SETTINGS), readJson(SETTINGS))
     check(".zshrc 与原文逐字节相同", readFileSync(ZSHRC, "utf8") === ORIGINAL_ZSHRC, readFileSync(ZSHRC, "utf8"))
     check("setup 建的池子配置删掉了", !existsSync(WORKER))
-    check("转发脚本删掉了", !existsSync(join(BIN, "claude")) && !existsSync(join(BIN, "claude-pool")) && !existsSync(join(BIN, "claude-pool-prompt-hook")))
+    check("转发脚本删掉了", !existsSync(join(BIN, "claude")) && !existsSync(join(BIN, "claude-pool")) && !existsSync(join(BIN, "claude-pool-prompt-hook")) && !existsSync(join(BIN, "claude-pool-statusline")))
     check("启动器留着(撤回前启动的进程还指着它)", existsSync(LAUNCHER))
     check("清单没了", !existsSync(MANIFEST) && !existsSync(`${MANIFEST}.reverting`))
     check("/pool skill 连目录一起删掉了", !existsSync(join(home, ".claude", "skills", "pool")))
@@ -330,6 +365,20 @@ try {
     check("revert 成功", back.code === 0, back.stderr)
     check("revert 后用户的 skill 仍在", readFileSync(skill, "utf8") === theirs)
     rmSync(dirname(skill), { recursive: true })
+  }
+
+  console.log("T18 用户自己已有状态栏:不覆盖,revert 也不删")
+  {
+    const theirs = { ...ORIGINAL_SETTINGS, statusLine: { type: "command", command: "~/my-status.sh", padding: 1 } }
+    writeFileSync(SETTINGS, `${JSON.stringify(theirs, null, 2)}\n`)
+    const r = await takeover("setup", "--master", MASTER, "--worker", "e2e-box")
+    check("setup 成功,并说明跳过了状态栏", r.code === 0 && r.stderr.includes("statusLine") && r.stderr.includes("不覆盖"), { code: r.code, stderr: r.stderr })
+    check("用户的状态栏原样", JSON.stringify((readJson(SETTINGS) as { statusLine?: unknown }).statusLine) === JSON.stringify(theirs.statusLine))
+    const st = await takeover("status")
+    check("make status 说状态栏是用户自己的", st.stdout.includes("状态栏:是你自己的,没动"), st.stdout)
+    const back = await takeover("revert")
+    check("revert 成功,settings 回到原样", back.code === 0 && JSON.stringify(readJson(SETTINGS)) === JSON.stringify(theirs), readJson(SETTINGS))
+    writeFileSync(SETTINGS, `${JSON.stringify(ORIGINAL_SETTINGS, null, 2)}\n`)
   }
 
   console.log("T10 settings 的 env 块里有盖过租约的变量:setup 拒绝,什么都不写")
