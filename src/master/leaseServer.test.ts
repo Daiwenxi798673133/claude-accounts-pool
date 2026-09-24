@@ -635,6 +635,37 @@ test("lease returns 503 when scheduler has no available account", async () => {
   }
 })
 
+// issue #95:有限流头、却没有一个说是额度的上报,不采信。原样取自把 eaaa1a79 冷却到 10 月 1 日的那次。
+test("带限流头但没有额度标记的上报:204,但不冷却", async () => {
+  const harness = startHarness()
+  try {
+    harness.advance(RATELIMIT_ADOPTION_GRACE_MS)
+    const ack = await post(harness.base, CLOUD_ROUTES.ratelimit, {
+      workerId: WORKER_ID,
+      accountId: "acct-a",
+      headers: {
+        "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+        "anthropic-ratelimit-unified-reset": "1790812800",
+      },
+      resetsAt: 1_790_812_800_000,
+    } satisfies RateLimitReport)
+    expect(ack.status).toBe(204)
+    expect(harness.reports).toEqual([])
+  } finally {
+    harness.stop()
+  }
+})
+
+test("不带任何头的上报照旧采信 —— 大多数上报链路拿不到响应头", async () => {
+  const harness = startHarness()
+  try {
+    await post(harness.base, CLOUD_ROUTES.ratelimit, { workerId: WORKER_ID, accountId: "acct-a", headers: {} } satisfies RateLimitReport)
+    expect(harness.reports).toEqual([{ accountId: "acct-a", resetsAt: undefined }])
+  } finally {
+    harness.stop()
+  }
+})
+
 test("ratelimit report cools the account and next lease picks another", async () => {
   const harness = startHarness()
   try {

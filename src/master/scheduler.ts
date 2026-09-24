@@ -2,7 +2,7 @@ import { providerOf, type StoredAccount } from "../accounts.ts"
 import type { LeaseRefusal } from "../cloud/protocol.ts"
 import { MASTER_USAGE_POLL_INTERVAL_MS, MAX_ACCOUNT_HOLDERS } from "../constants.ts"
 import { log } from "../logger.ts"
-import { latestMaxedReset, type NormalizedWindow, PROVIDERS, scoreWindows } from "../providers.ts"
+import { latestMaxedReset, latestWindowReset, type NormalizedWindow, PROVIDERS, scoreWindows } from "../providers.ts"
 import type { UsageResponse } from "../usage.ts"
 
 // Which account should the next lease use? That is the whole job of this module: no network, no
@@ -121,6 +121,12 @@ const USAGE_CACHE_TTL_MS = 2 * MASTER_USAGE_POLL_INTERVAL_MS
 // afford to: the cost of an over-long window is at most ONE wasted retry on an account that really
 // was spent, while the cost of an under-short one is a healthy account pulled out of the pool.
 export const RATELIMIT_ADOPTION_GRACE_MS = 15_000
+
+// How far past the latest window reset a timed cooldown may reach before it is judged implausible
+// (issue #95). A real quota report's deadline IS a window's reset, give or take the rounding between
+// the 429's `unified-reset` and the usage endpoint's `resets_at`; ten minutes absorbs that and still
+// catches a deadline days away.
+export const IMPLAUSIBLE_COOLDOWN_SLACK_MS = 10 * 60_000
 
 export type SchedulerDeps = {
   kv: { get: <V>(key: string, fallback?: V) => V; set: (key: string, value: unknown) => void }
@@ -342,6 +348,21 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     }
     cooldownPending.delete(id)
     if (cooldown.delete(id)) persistCooldown()
+  }
+
+  // A TIMED cooldown that no window can explain (issue #95). Nothing is at the limit, and the deadline
+  // lies beyond the reset of EVERY window the account has — so no subscription window could be what
+  // it is waiting for. That is the shape of a misreport (a non-quota 429 carrying some unrelated reset,
+  // e.g. the monthly extra-usage one), and it would otherwise exclude a healthy account until then,
+  // across restarts. A deadline WITHIN the window horizon stays: the snapshot may simply lag a real
+  // quota hit by one poll, and that is exactly the case the timed cooldown exists to cover.
+  function clearImplausibleCooldown(id: string, windows: readonly NormalizedWindow[]): void {
+    const until = cooldown.get(id)
+    if (until === undefined || until <= now()) return
+    const horizon = latestWindowReset(windows, now())
+    if (horizon === undefined || until <= horizon + IMPLAUSIBLE_COOLDOWN_SLACK_MS) return
+    log.warn("master:cooldown-implausible", { accountId: id.slice(0, 8), until, horizon })
+    clearCooldown(id)
   }
 
   function isCoolingDown(id: string): boolean {
@@ -626,6 +647,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       const resetsAt = latestMaxedReset(windows, now())
       if (resetsAt !== undefined) markCooldown(id, resetsAt)
       else if (cooldownPending.has(id)) clearCooldown(id)
+      else clearImplausibleCooldown(id, windows)
     }
     // ONE line per sweep, not one per account. This is the calibration data for a capacity check that
     // does not exist yet — the numbers a safety margin would have to be chosen from — and a single

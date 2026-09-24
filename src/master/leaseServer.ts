@@ -17,6 +17,7 @@
 // rotate a real chain on a paid account, so there are no defaults anywhere in LeaseServerDeps.
 
 import type { StoredAccount } from "../accounts.ts"
+import { anthropicQuotaVerdict } from "../providers.ts"
 import type {
   AccountAddRequest,
   AccountAddResponse,
@@ -495,6 +496,21 @@ export function startLeaseServer(deps: LeaseServerDeps): { port: number; stop: (
     // shrink the pool. Observe-only here too — the report is still believed.
     if (!deps.workerRegistry.isRegistered(workerId)) {
       log.warn("master:ratelimit-unknown-worker", { workerId, accountId: report.accountId })
+    }
+    // A REPORT THAT CARRIES RATE-LIMIT HEADERS AND NONE OF THEM SAYS QUOTA IS NOT BELIEVED (issue #95).
+    // One such report — `overage-disabled-reason` + `unified-reset`, i.e. an entitlement 429 on an org
+    // with extra usage turned off — cooled a healthy account until the monthly extra-usage reset, a
+    // week out, and the timed cooldown survived every restart. Header-less reports (most senpi and
+    // hook paths cannot see the response) keep the old behaviour: they carry no evidence either way,
+    // and the usage poll resolves their deadline-less cooldown.
+    if (anthropicQuotaVerdict(report.headers) === "not-quota") {
+      log.warn("master:ratelimit-not-quota", {
+        workerId,
+        accountId: report.accountId,
+        resetsAt: report.resetsAt,
+        headerKeys: redactHeaders(report.headers),
+      })
+      return new Response(null, { status: 204 })
     }
     deps.scheduler.reportRateLimit(report.accountId, report.resetsAt, workerId)
     // Header KEYS only, via redactHeaders: the worker forwards the limit response's headers

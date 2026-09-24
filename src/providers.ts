@@ -196,6 +196,42 @@ export function scoreWindows(windows?: readonly NormalizedWindow[]): number {
   return Math.max(0, ...windows.map((win) => win.utilization))
 }
 
+// WHAT A 429'S RATE-LIMIT HEADERS SAY ABOUT QUOTA, as the client itself reads them (claude-code
+// services/api/errors.ts, 429 branch): `-representative-claim` (five_hour / seven_day / …) or
+// `-overage-status` present means a quota limit; a `unified…-status` of `rejected` is the same signal
+// isAnthropicUsageLimit already keys on. Rate-limit headers WITHOUT any of those are the client's own
+// "this is NOT a quota limit" case — capacity, or an entitlement such as 1M context needing extra usage
+// on an org that disabled it (issue #95: one such 429 cooled a healthy account until the monthly
+// extra-usage reset). NO rate-limit headers at all is "unknown": most reporting paths (senpi, hooks)
+// never see the response headers, and that absence says nothing either way.
+//
+// Deliberately NOT folded into isAnthropicUsageLimit, which accepts a bare 429 on purpose and is
+// pinned by its own tests; this verdict answers a narrower question for callers holding the headers.
+export type QuotaVerdict = "quota" | "not-quota" | "unknown"
+
+const UNIFIED_STATUS = /^anthropic-ratelimit-unified(?:-[a-z0-9_]+)?-status$/
+
+export function anthropicQuotaVerdict(headers: Record<string, string>): QuotaVerdict {
+  const lower = lowerKeys(headers)
+  const keys = Object.keys(lower)
+  if ((lower["anthropic-ratelimit-unified-representative-claim"] ?? "").length > 0) return "quota"
+  if ((lower["anthropic-ratelimit-unified-overage-status"] ?? "").length > 0) return "quota"
+  if (keys.some((key) => UNIFIED_STATUS.test(key) && String(lower[key]).toLowerCase() === "rejected")) return "quota"
+  return keys.some((key) => key.startsWith("anthropic-ratelimit-")) ? "not-quota" : "unknown"
+}
+
+// The latest FUTURE reset among ALL windows, maxed or not: the furthest point at which any
+// subscription window this account has could clear. A quota cooldown cannot legitimately outlast it.
+export function latestWindowReset(windows: readonly NormalizedWindow[], now: number): number | undefined {
+  let latest: number | undefined
+  for (const win of windows) {
+    if (win.resets_at === undefined) continue
+    const at = Date.parse(win.resets_at)
+    if (Number.isFinite(at) && at > now && (latest === undefined || at > latest)) latest = at
+  }
+  return latest
+}
+
 // The latest reset among the windows that are AT the limit — the cooldown deadline, generic over
 // both providers. Binding = utilization >= 100; not maxed ⇒ undefined (honest unknown, never a
 // fabricated countdown). Windows without a resets_at, with an unparseable one, or with one already

@@ -31,6 +31,7 @@ const NOT_FORWARDED = new Set([
 const CREDENTIAL_HEADERS = new Set(["authorization", "x-api-key"])
 
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib"
+import { anthropicQuotaVerdict } from "../providers.ts"
 
 export const CLIENT_REQUEST_ID_HEADER = "x-client-request-id"
 
@@ -65,12 +66,13 @@ export function downstreamHeaders(upstream: Headers): Headers {
 // 为什么必须这么窄:权限类 429 换到哪个号都一样。见 429 就换,relay 会把整个池子挨个切一遍,每一次
 // 还附带一条冤枉的限流上报。429 之外(529 overloaded、5xx)一律不算 —— 那是服务端的事,与账号额度
 // 无关,PR #86 的钩子 matcher 排除 overloaded 是同一个道理。
-const QUOTA_MARKERS = ["anthropic-ratelimit-unified-representative-claim", "anthropic-ratelimit-unified-overage-status"]
-
+// 判定本身在 src/providers.ts 的 anthropicQuotaVerdict —— master 核对上报用的是同一个函数(issue #95),
+// 两处各写一份迟早会漂成两套规则。
 export function isQuotaExhausted(status: number, headers: Headers): boolean {
   if (status !== 429) return false
-  if (QUOTA_MARKERS.some((name) => (headers.get(name) ?? "").length > 0)) return true
-  return (headers.get("anthropic-ratelimit-unified-status") ?? "").toLowerCase() === "rejected"
+  const record: Record<string, string> = {}
+  headers.forEach((value, key) => (record[key] = value))
+  return anthropicQuotaVerdict(record) === "quota"
 }
 
 // 配额重置点,epoch 毫秒。【只认 unified-reset】,不拿 retry-after 兜底:src/senpi/limitReport.ts 记过
