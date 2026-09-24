@@ -243,7 +243,7 @@ try {
     check("settings 没有被再写一次(没有新备份)", backups(SETTINGS) === 1, backups(SETTINGS))
   }
 
-  console.log("T15 /pool 面板:经生成的 UserPromptSubmit 钩子,不经过模型")
+  console.log("T15 /pool 用量面板:经生成的 UserPromptSubmit 钩子,不经过模型")
   {
     const HOOK = join(BIN, "claude-pool-prompt-hook")
     const settings = readJson(SETTINGS) as { hooks?: { UserPromptSubmit?: { hooks: { command: string }[] }[] } }
@@ -259,18 +259,12 @@ try {
     const list = await feed("/pool")
     check("/pool:拦下输入,不复述原输入", list.reply?.decision === "block" && list.reply.suppressOriginalPrompt === true, list)
     check("/pool:列出两个号,当前号标出来", /1\s+aaaaaaaa.*← 当前/.test(list.reply?.reason ?? "") && (list.reply?.reason ?? "").includes("bbbbbbbb"), list.reply?.reason)
+    // issue #101:只有 /pool 一条命令,带参数也只看面板,不切号。
     const leasesBefore = leases.length
-    const sw = await feed("/pool 2")
-    check("/pool 2:切到 bbbbbbbb", (sw.reply?.reason ?? "").includes("✓ 已切到 bbbbbbbb"), sw.reply?.reason)
-    check("点名经 relay 发给 master", leases.slice(leasesBefore).some((l) => l.preferredAccountIdPrefix === "bbbbbbbb" && l.pinned === false), leases.slice(leasesBefore))
-    check("relay 的共享号真的换了", (await relayHealth())?.accountId === "bbbbbbbb", await relayHealth())
-    const after = await claudeVia([LAUNCHER, fakeClaude])
-    check("之后起的 claude 进程拿到的是新号", after.report?.token === "FAKE-B", after.report?.token)
-    const pinned = await feed("/pool pin 1")
-    check("/pool pin 1:切回 aaaaaaaa 并钉住", (pinned.reply?.reason ?? "").includes("✓ 已切到 aaaaaaaa 并钉住"), pinned.reply?.reason)
-    check("钉住落盘", readFileSync(join(POOL, "cc-pin.json"), "utf8").includes("aaaaaaaa"))
-    const unpin = await feed("/pool unpin")
-    check("/pool unpin:取消钉住", (unpin.reply?.reason ?? "").includes("✓ 已取消钉住") && !readFileSync(join(POOL, "cc-pin.json"), "utf8").includes("aaaaaaaa"), unpin.reply?.reason)
+    const withArg = await feed("/pool 2")
+    check("/pool 2:只显示面板,不切号", withArg.reply?.decision === "block" && (withArg.reply.reason ?? "").includes("共享 aaaaaaaa"), withArg.reply?.reason)
+    check("没有发出任何点名", leases.length === leasesBefore, leases.slice(leasesBefore))
+    check("面板上不列衍生命令", !/\/pool\s+\S/.test(list.reply?.reason ?? ""), list.reply?.reason)
   }
 
   console.log("T7 revert:照单撤回,别人的文件回到原样")

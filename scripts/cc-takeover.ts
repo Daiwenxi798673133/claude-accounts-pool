@@ -446,7 +446,7 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   say("  · 开一个新终端(或 source 一下 shell rc),再敲 claude —— 它会走池子")
   say("  · 已经开着的 claude 会话读的是旧设置,重启后生效")
   say("  · 后台服务(claude agents / --bg)要重启一次才走池子:没有在跑的后台会话时执行 claude daemon stop --any")
-  say("  · 在 Claude Code 里输入 /pool 看全池用量、切号、钉住(不经过模型,不花 token)")
+  say("  · 在 Claude Code 里输入 /pool 看全池用量(不经过模型,不花 token)")
   say("  · 出问题:在本目录 make revert,Claude Code 立刻回到你自己的号")
   return smoke.status === 0 && baseOk && tokenOk ? 0 : EXIT_REFUSED
 }
