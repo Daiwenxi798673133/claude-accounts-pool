@@ -117,6 +117,54 @@ export function removeWrapper(settings: JsonObject, value: string, createdEnv: b
   return { config: next, changed: true }
 }
 
+// ── ~/.claude/settings.json: the /pool panel hook (issue #97) ───────────────────────────────
+
+export type HookAdd = Result<{ config: JsonObject; createdHooks: boolean; createdEvent: boolean; changed: boolean }>
+
+const isOurHookEntry = (entry: unknown, command: string): boolean =>
+  isJsonObject(entry) && Array.isArray(entry.hooks) && entry.hooks.some((h) => isJsonObject(h) && h.command === command)
+
+/** Appends ONE UserPromptSubmit entry running `command`. Everybody else's hooks stay exactly as they are. */
+export function addPromptHook(settings: JsonObject, command: string): HookAdd {
+  const hooks = settings.hooks
+  if (hooks !== undefined && !isJsonObject(hooks)) return { ok: false, reason: `"hooks" 存在但不是对象` }
+  const event = hooks?.UserPromptSubmit
+  if (event !== undefined && !Array.isArray(event)) return { ok: false, reason: `"hooks.UserPromptSubmit" 存在但不是数组` }
+  if (event?.some((entry) => isOurHookEntry(entry, command))) {
+    return { ok: true, config: settings, createdHooks: false, createdEvent: false, changed: false }
+  }
+  const ours = { hooks: [{ type: "command", command }] }
+  return {
+    ok: true,
+    config: { ...settings, hooks: { ...(hooks ?? {}), UserPromptSubmit: [...(event ?? []), ours] } },
+    createdHooks: hooks === undefined,
+    createdEvent: event === undefined,
+    changed: true,
+  }
+}
+
+/** Removes only OUR command; an entry left empty goes, and so do containers setup itself created. */
+export function removePromptHook(
+  settings: JsonObject,
+  command: string,
+  created: { createdHooks: boolean; createdEvent: boolean },
+): { config: JsonObject; changed: boolean } {
+  const hooks = settings.hooks
+  if (!isJsonObject(hooks) || !Array.isArray(hooks.UserPromptSubmit)) return { config: settings, changed: false }
+  const before = hooks.UserPromptSubmit
+  if (!before.some((entry) => isOurHookEntry(entry, command))) return { config: settings, changed: false }
+  const after = before.flatMap((entry) => {
+    if (!isOurHookEntry(entry, command)) return [entry]
+    const rest = (entry as { hooks: unknown[] }).hooks.filter((h) => !(isJsonObject(h) && h.command === command))
+    return rest.length === 0 ? [] : [{ ...(entry as JsonObject), hooks: rest }]
+  })
+  const nextHooks: JsonObject = { ...hooks, UserPromptSubmit: after }
+  if (created.createdEvent && after.length === 0) delete nextHooks.UserPromptSubmit
+  const next: JsonObject = { ...settings, hooks: nextHooks }
+  if (created.createdHooks && Object.keys(nextHooks).length === 0) delete next.hooks
+  return { config: next, changed: true }
+}
+
 // ── shell rc: PATH so a hand-typed `claude` reaches the launcher ─────────────────────────────
 
 // The docs' own recipe for terminal sessions: "put a script named claude in a directory earlier on
@@ -229,6 +277,47 @@ exec "$@"
 `
 }
 
+/**
+ * The /pool hook. UserPromptSubmit runs before EVERY prompt the user sends, so the sh shell decides
+ * with one grep whether this is /pool at all, and anything else leaves at once — no bun start-up on
+ * ordinary input. It never blocks a prompt on its own failure: missing manifest, bun or clone all
+ * mean "not ours to handle", exit 0, the prompt goes through untouched.
+ */
+export function renderPromptHook(p: LauncherPaths): string {
+  return `#!/bin/sh
+# /pool 面板钩子(UserPromptSubmit)—— make setup 生成,make revert 删除。每次提交提示都会跑:
+# 不是 /pool 就立刻放行,不起 bun。自己出任何问题都放行,绝不把用户的输入拦在这里。
+input=$(cat)
+printf '%s' "$input" | grep -Eq '"prompt" *: *"/pool( |\\\\|")' || exit 0
+[ -f ${sq(p.manifest)} ] && [ -x ${sq(p.bun)} ] && [ -f ${sq(`${p.repo}/claude-pool-panel.ts`)} ] || exit 0
+printf '%s' "$input" | ${sq(p.bun)} ${sq(`${p.repo}/claude-pool-panel.ts`)} || exit 0
+`
+}
+
+// Marks the /pool skill as ours: revert deletes the file only while it still carries this line, so a
+// skill the user rewrote under the same name survives.
+export const POOL_SKILL_MARKER = "<!-- claude-accounts-pool: make setup 生成,make revert 删除 -->"
+
+/**
+ * WHY A SKILL AT ALL (measured on 2.1.280): in the interactive TUI an unknown `/pool` is rejected as
+ * "Unknown command: /pool. Did you mean /loop?" BEFORE any UserPromptSubmit hook runs. With a skill of
+ * that name the command is recognised (and listed in the `/` menu), the hook fires first and blocks it,
+ * and the skill body never reaches the model. The body is written for the case where it does anyway —
+ * the hook broken or missing — so the model does nothing and says so.
+ */
+export function renderPoolSkill(): string {
+  return `---
+name: pool
+description: 账号池面板:看全池用量、切号、钉住(由 UserPromptSubmit 钩子接管,不经过模型)
+disable-model-invocation: true
+---
+${POOL_SKILL_MARKER}
+
+如果你读到了这段话,说明账号池的 /pool 面板钩子没有接管这条命令。不要执行任何操作、不要调用任何工具,
+只回复用户一句:「/pool 面板没有生效,请在账号池仓库目录执行 make status 检查,或重跑 make setup。」
+`
+}
+
 /** A script named `claude`, earlier on PATH than the real one. Never a replacement for the managed symlink. */
 export function renderClaudeShim(p: { launcher: string; realClaude: string }): string {
   return `#!/bin/sh
@@ -303,6 +392,10 @@ export type TakeoverManifest = {
   updatedAt: string
   repo: string
   settings?: { path: string; value: string; createdEnv: boolean }
+  // The /pool hook entry in the same settings file (issue #97).
+  promptHook?: { command: string; createdHooks: boolean; createdEvent: boolean }
+  // The /pool skill file, only when setup wrote it (an existing user skill of that name is left alone).
+  poolSkill?: { path: string }
   // created: setup 新建了这个文件(之前不存在)—— 撤回后只剩空内容就删掉,不留一个会遮住别的
   // 启动文件的空壳(bash 登录 shell 只读 .bash_profile / .bash_login / .profile 里第一个存在的)。
   shellRc?: { path: string; created?: boolean }

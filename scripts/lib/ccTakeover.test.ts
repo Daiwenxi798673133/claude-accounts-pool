@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import {
+  addPromptHook,
   addShellBlock,
   addWrapper,
   mergeWorker,
@@ -7,6 +8,7 @@ import {
   parseClaudeVersion,
   parseManifest,
   proxyEnv,
+  removePromptHook,
   removeShellBlock,
   removeWrapper,
   renderClaudeShim,
@@ -180,4 +182,43 @@ test("清单:认得出自己的形状,认不出的一律不当清单", () => {
   expect(parseManifest({ version: 1, repo: "/r", generated: [], installedAt: "", updatedAt: "" })).toBeDefined()
   expect(parseManifest({ version: 2, repo: "/r", generated: [] })).toBeUndefined()
   expect(parseManifest("x")).toBeUndefined()
+})
+
+// /pool 面板钩子(issue #97):别人的钩子一个不动,撤回只删自己那条。
+test("加 /pool 钩子:追加到 UserPromptSubmit 末尾,已有的钩子原样", () => {
+  const theirs = { hooks: [{ type: "command", command: "/their/hook" }] }
+  const plan = addPromptHook({ hooks: { UserPromptSubmit: [theirs], Stop: [] } }, "/ours")
+  expect(plan.ok).toBe(true)
+  if (!plan.ok) return
+  expect(plan.config).toEqual({ hooks: { UserPromptSubmit: [theirs, { hooks: [{ type: "command", command: "/ours" }] }], Stop: [] } })
+  expect(plan.createdHooks).toBe(false)
+  expect(plan.createdEvent).toBe(false)
+})
+
+test("加 /pool 钩子:幂等;形状不对就拒绝", () => {
+  const once = addPromptHook({}, "/ours")
+  expect(once.ok && once.createdHooks && once.createdEvent).toBe(true)
+  if (!once.ok) return
+  const twice = addPromptHook(once.config, "/ours")
+  expect(twice.ok && twice.changed).toBe(false)
+  expect(addPromptHook({ hooks: "x" }, "/ours").ok).toBe(false)
+  expect(addPromptHook({ hooks: { UserPromptSubmit: {} } }, "/ours").ok).toBe(false)
+})
+
+test("撤回 /pool 钩子:别人的钩子留下;我们建的容器空了就删", () => {
+  const theirs = { hooks: [{ type: "command", command: "/their/hook" }] }
+  const mixed = addPromptHook({ theme: "x", hooks: { UserPromptSubmit: [theirs] } }, "/ours")
+  if (!mixed.ok) throw new Error("plan")
+  expect(removePromptHook(mixed.config, "/ours", mixed).config).toEqual({ theme: "x", hooks: { UserPromptSubmit: [theirs] } })
+
+  const fresh = addPromptHook({ theme: "x" }, "/ours")
+  if (!fresh.ok) throw new Error("plan")
+  expect(removePromptHook(fresh.config, "/ours", fresh).config).toEqual({ theme: "x" })
+})
+
+test("撤回 /pool 钩子:同一个条目里别人的命令留下", () => {
+  const settings = { hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "/their" }, { type: "command", command: "/ours" }] }] } }
+  expect(removePromptHook(settings, "/ours", { createdHooks: false, createdEvent: false }).config).toEqual({
+    hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "/their" }] }] },
+  })
 })

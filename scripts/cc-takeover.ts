@@ -14,7 +14,7 @@
 //
 // 设计依据:issue #93;启动器契约见 code.claude.com/docs/en/corporate-launcher。
 import { spawnSync } from "node:child_process"
-import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs"
+import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { delimiter, dirname, join } from "node:path"
 import { createInterface } from "node:readline/promises"
@@ -25,6 +25,7 @@ import { CC_RELAY_DEFAULT_PORT, readPoolConfig, relayLogPath, relayUrl, takeover
 import { RELAY_ROUTES, RELAY_SERVICE, type RelayHealth } from "../src/claudecode/relay.ts"
 import { leaseCacheDir } from "../src/senpi/leaseCache.ts"
 import {
+  addPromptHook,
   addShellBlock,
   addWrapper,
   emptyManifest,
@@ -35,11 +36,15 @@ import {
   parseManifest,
   proxyEnv,
   RELAY_AGENT_LABEL,
+  removePromptHook,
   removeShellBlock,
   removeWrapper,
   renderClaudePoolCmd,
   renderClaudeShim,
   renderLauncher,
+  renderPoolSkill,
+  renderPromptHook,
+  POOL_SKILL_MARKER,
   renderPlist,
   revertWorker,
   shellBlock,
@@ -64,10 +69,13 @@ const BIN_DIR = join(POOL_DIR, "bin")
 const LAUNCHER = join(BIN_DIR, "claude-pool-launch")
 const SHIM = join(BIN_DIR, "claude")
 const POOL_CMD = join(BIN_DIR, "claude-pool")
+const PROMPT_HOOK = join(BIN_DIR, "claude-pool-prompt-hook")
 const MANIFEST = takeoverManifestPath(env)
 const REVERTING = `${MANIFEST}.reverting`
 const SETTINGS = join(env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : join(HOME, ".claude"), "settings.json")
 const WORKER_FILE = join(POOL_DIR, "senpi-worker.json")
+// /pool 要能被 TUI 认成一条命令,得有一个同名 skill(见 ccTakeover.renderPoolSkill)。
+const POOL_SKILL = join(dirname(SETTINGS), "skills", "pool", "SKILL.md")
 const AGENT_PLIST = join(HOME, "Library", "LaunchAgents", `${RELAY_AGENT_LABEL}.plist`)
 // 只在 macOS 上用 launchd;CAP_CC_TAKEOVER_NO_LAUNCHD=1 只给测试用(沙箱 HOME 里不能往真 launchd 装任务)。
 const USE_LAUNCHD = process.platform === "darwin" && env.CAP_CC_TAKEOVER_NO_LAUNCHD !== "1"
@@ -295,6 +303,9 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   for (const blocker of settingsBlockers(settings, relayUrl(priorPort))) refusals.push(blocker.remedy)
   const settingsPlan = addWrapper(settings, wrapperValue(LAUNCHER))
   if (!settingsPlan.ok) refusals.push(`${SETTINGS}:${settingsPlan.reason}`)
+  // /pool 面板钩子(issue #97)加在同一个文件里,与启动器那个键一起规划、一起写。
+  const hookPlan = addPromptHook(settingsPlan.ok ? settingsPlan.config : settings, PROMPT_HOOK)
+  if (!hookPlan.ok) refusals.push(`${SETTINGS}:${hookPlan.reason}`)
 
   const rcPath = shellRcPath()
   const rcExisting = readText(rcPath)
@@ -309,7 +320,7 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
     for (const reason of refusals) warn(`  · ${reason}`)
     return EXIT_REFUSED
   }
-  if (!settingsPlan.ok || realClaude === undefined) return EXIT_REFUSED // 上面已经报过;只为收窄类型
+  if (!settingsPlan.ok || !hookPlan.ok || realClaude === undefined) return EXIT_REFUSED // 上面已经报过;只为收窄类型
 
   // ── 4. 落盘:每一步之后更新清单,中途失败也能 revert ──
   const now = new Date()
@@ -335,12 +346,17 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   manifest.launcher = LAUNCHER
   await writeExecutable(SHIM, renderClaudeShim({ launcher: LAUNCHER, realClaude }))
   await writeExecutable(POOL_CMD, renderClaudePoolCmd({ bun: BUN, repo: REPO }))
-  manifest.generated = [...new Set([...manifest.generated, SHIM, POOL_CMD])]
+  await writeExecutable(PROMPT_HOOK, renderPromptHook({ bun: BUN, repo: REPO, manifest: MANIFEST }))
+  manifest.generated = [...new Set([...manifest.generated, SHIM, POOL_CMD, PROMPT_HOOK])]
   await saveManifest(manifest)
   say(`生成   ${LAUNCHER}`)
   say(`生成   ${SHIM} → ${realClaude}`)
 
-  if (settingsPlan.changed) {
+  if (hookPlan.changed) {
+    const backup = await rewrite(SETTINGS, jsonText(hookPlan.config), now)
+    const what = [settingsPlan.changed ? "env.CLAUDE_CODE_PROCESS_WRAPPER" : "", "hooks.UserPromptSubmit(/pool 面板)"].filter(Boolean).join("、")
+    say(`写入   ${SETTINGS} 的 ${what}${backup ? `(备份 ${backup})` : ""}`)
+  } else if (settingsPlan.changed) {
     const backup = await rewrite(SETTINGS, jsonText(settingsPlan.config), now)
     say(`写入   ${SETTINGS} 的 env.CLAUDE_CODE_PROCESS_WRAPPER${backup ? `(备份 ${backup})` : ""}`)
   }
@@ -349,7 +365,26 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
     value: wrapperValue(LAUNCHER),
     createdEnv: manifest.settings?.createdEnv ?? settingsPlan.createdEnv,
   }
+  manifest.promptHook = {
+    command: PROMPT_HOOK,
+    createdHooks: manifest.promptHook?.createdHooks ?? hookPlan.createdHooks,
+    createdEvent: manifest.promptHook?.createdEvent ?? hookPlan.createdEvent,
+  }
   await saveManifest(manifest)
+
+  // /pool skill:已有一个不是我们写的同名 skill 就不碰它 —— 那是用户自己的东西;面板在 -p 模式下照样
+  // 能用,只是交互式 TUI 会把 /pool 当成未知命令。
+  const existingSkill = readText(POOL_SKILL)
+  if (existingSkill !== undefined && !existingSkill.includes(POOL_SKILL_MARKER)) {
+    warn(`跳过   ${POOL_SKILL}:已经有一个你自己的 pool skill,不覆盖。交互式界面里 /pool 会走它,而不是账号池面板。`)
+  } else {
+    mkdirSync(dirname(POOL_SKILL), { recursive: true })
+    await atomicWrite(POOL_SKILL, renderPoolSkill())
+    chmodSync(POOL_SKILL, 0o644)
+    manifest.poolSkill = { path: POOL_SKILL }
+    await saveManifest(manifest)
+    say(`生成   ${POOL_SKILL}(让 /pool 成为可识别的命令)`)
+  }
 
   if (rcPlan.changed) {
     const backup = await rewrite(rcPath, rcPlan.text, now)
@@ -411,6 +446,7 @@ async function setup(flags: { master?: string; worker?: string; yes?: boolean })
   say("  · 开一个新终端(或 source 一下 shell rc),再敲 claude —— 它会走池子")
   say("  · 已经开着的 claude 会话读的是旧设置,重启后生效")
   say("  · 后台服务(claude agents / --bg)要重启一次才走池子:没有在跑的后台会话时执行 claude daemon stop --any")
+  say("  · 在 Claude Code 里输入 /pool 看全池用量、切号、钉住(不经过模型,不花 token)")
   say("  · 出问题:在本目录 make revert,Claude Code 立刻回到你自己的号")
   return smoke.status === 0 && baseOk && tokenOk ? 0 : EXIT_REFUSED
 }
@@ -431,9 +467,14 @@ async function revert(): Promise<number> {
   const settingsRead = readJsonObject(settingsPath)
   if (settingsRead.kind === "ok") {
     const removed = removeWrapper(settingsRead.value, manifest?.settings?.value ?? wrapperValue(LAUNCHER), manifest?.settings?.createdEnv ?? false)
-    if (removed.changed) {
-      const backup = await rewrite(settingsPath, jsonText(removed.config), now)
-      say(`还原   ${settingsPath}:删掉 env.CLAUDE_CODE_PROCESS_WRAPPER(备份 ${backup})`)
+    const unhooked = removePromptHook(removed.config, manifest?.promptHook?.command ?? PROMPT_HOOK, {
+      createdHooks: manifest?.promptHook?.createdHooks ?? false,
+      createdEvent: manifest?.promptHook?.createdEvent ?? false,
+    })
+    if (removed.changed || unhooked.changed) {
+      const backup = await rewrite(settingsPath, jsonText(unhooked.config), now)
+      const what = [removed.changed ? "env.CLAUDE_CODE_PROCESS_WRAPPER" : "", unhooked.changed ? "/pool 面板钩子" : ""].filter(Boolean).join("、")
+      say(`还原   ${settingsPath}:删掉 ${what}(备份 ${backup})`)
     }
   } else if (settingsRead.kind === "bad") {
     problems.push(`${settingsRead.reason};请手工删掉 env.CLAUDE_CODE_PROCESS_WRAPPER`)
@@ -469,11 +510,22 @@ async function revert(): Promise<number> {
   if (stopped !== undefined) say(`停掉   relay(pid ${stopped})`)
 
   // 生成的转发脚本。启动器本身留着:撤回之前启动的会话和后台服务还指着它,而它看不到清单就只做 exec。
-  for (const path of manifest?.generated ?? [SHIM, POOL_CMD]) {
+  for (const path of manifest?.generated ?? [SHIM, POOL_CMD, PROMPT_HOOK]) {
     if (existsSync(path)) {
       rmSync(path)
       say(`删除   ${path}`)
     }
+  }
+
+  // /pool skill:只删还带着我们标记的那份;目录空了一并删掉。
+  const skillPath = manifest?.poolSkill?.path ?? POOL_SKILL
+  const skillText = readText(skillPath)
+  if (skillText !== undefined && skillText.includes(POOL_SKILL_MARKER)) {
+    rmSync(skillPath)
+    try {
+      rmdirSync(dirname(skillPath))
+    } catch {}
+    say(`删除   ${skillPath}`)
   }
 
   // 池子配置:setup 建的就删,setup 改的就改回去 —— 前提是它还是 setup 写的样子。
@@ -519,6 +571,9 @@ async function status(): Promise<number> {
   const settingsRead = readJsonObject(SETTINGS)
   const wrapper = settingsRead.kind === "ok" && isJsonObject(settingsRead.value.env) ? settingsRead.value.env.CLAUDE_CODE_PROCESS_WRAPPER : undefined
   say(`settings:${wrapper === undefined ? "没有 CLAUDE_CODE_PROCESS_WRAPPER" : `CLAUDE_CODE_PROCESS_WRAPPER=${String(wrapper)}`}`)
+  const promptHooks = settingsRead.kind === "ok" && isJsonObject(settingsRead.value.hooks) ? settingsRead.value.hooks.UserPromptSubmit : undefined
+  const panel = Array.isArray(promptHooks) && JSON.stringify(promptHooks).includes(PROMPT_HOOK)
+  say(`/pool:${panel ? "已装(在 Claude Code 里输入 /pool)" : "没装"}`)
   const first = (env.PATH ?? "").split(delimiter).find((dir) => existsSync(join(dir, "claude")))
   say(`终端:当前 shell 里的 claude 来自 ${first ?? "(找不到)"}${first === BIN_DIR ? "(走池子)" : ""}`)
   return 0
