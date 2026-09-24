@@ -2,6 +2,7 @@ import { expect, test } from "bun:test"
 import {
   addPromptHook,
   addShellBlock,
+  addStatusLine,
   addWrapper,
   mergeWorker,
   normalizeMasterUrl,
@@ -10,10 +11,13 @@ import {
   proxyEnv,
   removePromptHook,
   removeShellBlock,
+  removeStatusLine,
   removeWrapper,
   renderClaudeShim,
   renderLauncher,
   renderPlist,
+  renderStatusLineCmd,
+  STATUS_REFRESH_SECONDS,
   revertWorker,
   senpiLabelFor,
   shellBlock,
@@ -221,4 +225,30 @@ test("撤回 /pool 钩子:同一个条目里别人的命令留下", () => {
   expect(removePromptHook(settings, "/ours", { createdHooks: false, createdEvent: false }).config).toEqual({
     hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "/their" }] }] },
   })
+})
+
+// issue #103:状态栏只有一个位置。空着才装;是我们的就不动;是别人的就不碰。
+test("状态栏:空着才加,是我们的不重复,别人的原样留着", () => {
+  const added = addStatusLine({ theme: "x" }, "/ours")
+  expect(added).toEqual({
+    kind: "add",
+    config: { theme: "x", statusLine: { type: "command", command: "/ours", refreshInterval: STATUS_REFRESH_SECONDS } },
+  })
+  expect(addStatusLine(added.kind === "add" ? added.config : {}, "/ours")).toEqual({ kind: "ours" })
+  const theirs = { type: "command", command: "~/my-status.sh" }
+  expect(addStatusLine({ statusLine: theirs }, "/ours")).toEqual({ kind: "foreign", existing: theirs })
+})
+
+test("状态栏撤回:只删还指着我们命令的那个", () => {
+  const added = addStatusLine({ theme: "x" }, "/ours")
+  expect(removeStatusLine(added.kind === "add" ? added.config : {}, "/ours")).toEqual({ config: { theme: "x" }, changed: true })
+  const theirs = { theme: "x", statusLine: { type: "command", command: "~/my-status.sh" } }
+  expect(removeStatusLine(theirs, "/ours")).toEqual({ config: theirs, changed: false })
+  expect(removeStatusLine({}, "/ours")).toEqual({ config: {}, changed: false })
+})
+
+test("状态栏外壳:接管不在、bun 或仓库不在都安静退出,bun 的报错丢掉", () => {
+  const text = renderStatusLineCmd({ bun: "/b/bun", repo: "/r", manifest: "/m.json" })
+  expect(text).toContain("[ -f '/m.json' ] && [ -x '/b/bun' ] && [ -f '/r/claude-pool-status.ts' ] || exit 0")
+  expect(text).toContain("exec '/b/bun' '/r/claude-pool-status.ts' 2>/dev/null")
 })

@@ -5,22 +5,28 @@
 // SCOPE: the launcher leases nothing itself — it asks the relay. The relay leases, renews and switches,
 // but never refreshes: the master owns every chain (INV-CLOUD-1), so no token endpoint may ever be
 // named anywhere in this directory.
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { closeSync, existsSync, mkdirSync, openSync } from "node:fs"
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { constants as osConstants, homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import type { UsageSnapshotView } from "../cloud/protocol.ts"
 import { log } from "../logger.ts"
+import { leaseCacheDir } from "../senpi/leaseCache.ts"
 import { createLeaseClient } from "../worker/leaseClient.ts"
+import { createUsageClient, usageFailureMessage } from "../worker/usageClient.ts"
 import type { PoolArgs } from "./args.ts"
 import { relayLogPath, relayUrl, upstreamUrl, type ClaudeCodePoolConfig } from "./config.ts"
 import { createPinStore } from "./pin.ts"
-import type { RelayDeps } from "./relay.ts"
+import type { PanelDeps } from "./panelRun.ts"
+import { RELAY_ROUTES, RELAY_SERVICE, type RelayDeps, type RelayHealth } from "./relay.ts"
 import { createRelayClient } from "./relayClient.ts"
 import type { SessionDeps } from "./session.ts"
 import { createSharedLease } from "./sharedLease.ts"
+import { statusSnapshot, type CachedUsage } from "./statusLine.ts"
+import { detectTerminalWidth } from "./terminalWidth.ts"
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -189,6 +195,125 @@ export function createRelayDeps(cfg: ClaudeCodePoolConfig, env: NodeJS.ProcessEn
       }
     },
     newRequestId: randomUUID,
+    now: Date.now,
+  }
+}
+
+// ── /pool panel and status line (issue #103) ─────────────────────────────────────────────────
+// Both are short-lived processes Claude Code runs WITHOUT a terminal: the hook holds the operator's
+// input while it waits, and the status line re-runs every few seconds. So every read here is short, and
+// neither may spawn a relay — a missing relay is REPORTED, never started from a keystroke.
+
+const HEALTH_TIMEOUT_MS = 1_500
+const USAGE_TIMEOUT_MS = 5_000
+// A forced sweep walks every account with USAGE_POLL_SPACING_MS (500 ms) between them, so a pool of
+// fifteen already needs ~15 s — the usage client's default would give up on a sweep that succeeds.
+const REFRESH_TIMEOUT_MS = 45_000
+// An attach queues behind whatever the relay's serial queue is doing (a quota switch can take a few
+// lease round-trips); a hook cannot wait the launcher's 90 s, so it waits long enough for the common case.
+const ATTACH_TIMEOUT_MS = 20_000
+
+export function relayHealthProbe(cfg: ClaudeCodePoolConfig): () => Promise<RelayHealth | undefined> {
+  return async () => {
+    try {
+      const res = await fetch(`${relayUrl(cfg.relayPort)}${RELAY_ROUTES.health}`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) })
+      const body = (await res.json()) as RelayHealth
+      return body.service === RELAY_SERVICE ? body : undefined
+    } catch {
+      return undefined
+    }
+  }
+}
+
+export function usageSnapshotProbe(cfg: ClaudeCodePoolConfig): () => Promise<UsageSnapshotView | undefined> {
+  const client = createUsageClient({ fetchImpl: fetch, masterUrl: cfg.masterUrl, timeoutMs: USAGE_TIMEOUT_MS })
+  return async () => {
+    const outcome = await client.fetchSnapshot()
+    return outcome.ok ? outcome.view : undefined
+  }
+}
+
+/** A short synchronous command for the terminal-width probe; any failure is simply "no answer". */
+export function spawnExec(cmd: string[]): string | undefined {
+  try {
+    const out = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf8", timeout: 1_000, stdio: ["ignore", "pipe", "ignore"] })
+    return out.status === 0 ? out.stdout : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function terminalWidthProbe(env: NodeJS.ProcessEnv): () => number | undefined {
+  return () => detectTerminalWidth({ pid: process.pid, platform: process.platform, env, exec: spawnExec })
+}
+
+export function createPanelDeps(prompt: string, cfg: ClaudeCodePoolConfig | undefined, env: NodeJS.ProcessEnv): PanelDeps {
+  // Unconfigured: runPanel answers "make setup" before touching any of these, so they only need to exist.
+  const pool = cfg ?? { masterUrl: "http://127.0.0.1:0", workerId: "-", relayPort: 0 }
+  const refresh = createUsageClient({ fetchImpl: fetch, masterUrl: pool.masterUrl, timeoutMs: REFRESH_TIMEOUT_MS })
+  return {
+    prompt,
+    config: cfg,
+    health: relayHealthProbe(pool),
+    usage: usageSnapshotProbe(pool),
+    refreshUsage: async () => {
+      const outcome = await refresh.refreshSnapshot()
+      return outcome.ok ? { ok: true, view: outcome.view } : { ok: false, message: usageFailureMessage(outcome.failure) }
+    },
+    relay: createRelayClient({
+      fetchImpl: fetch,
+      baseUrl: relayUrl(pool.relayPort),
+      spawnRelay: () => {},
+      sleep,
+      now: Date.now,
+      controlTimeoutMs: ATTACH_TIMEOUT_MS,
+    }),
+    pin: createPinStore(env),
+    pid: process.pid,
+    terminalWidth: terminalWidthProbe(env),
+    now: Date.now,
+  }
+}
+
+// The status line's shared snapshot (see statusLine.ts): one file per machine, rewritten whole through a
+// temp file so a status line reading mid-write sees the previous copy, never half of the next.
+const STATUS_CACHE_VERSION = 1
+
+function statusCachePath(env: NodeJS.ProcessEnv): string {
+  return join(leaseCacheDir(env), "cc-statusline-usage.json")
+}
+
+export function createStatusDeps(cfg: ClaudeCodePoolConfig, env: NodeJS.ProcessEnv) {
+  const path = statusCachePath(env)
+  const usage = usageSnapshotProbe(cfg)
+  return {
+    health: relayHealthProbe(cfg),
+    snapshot: () =>
+      statusSnapshot({
+        read: () => {
+          try {
+            const raw = JSON.parse(readFileSync(path, "utf8")) as { version?: unknown } & Partial<CachedUsage>
+            return raw.version === STATUS_CACHE_VERSION && typeof raw.fetchedAt === "number" && typeof raw.view === "object" && raw.view !== null
+              ? { fetchedAt: raw.fetchedAt, view: raw.view }
+              : undefined
+          } catch {
+            return undefined
+          }
+        },
+        write: (cached) => {
+          try {
+            mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+            const tmp = `${path}.${process.pid}.tmp`
+            writeFileSync(tmp, JSON.stringify({ version: STATUS_CACHE_VERSION, ...cached }), { mode: 0o600 })
+            renameSync(tmp, path)
+          } catch {
+            // A cache that cannot be written only costs the next status line a fetch of its own.
+          }
+        },
+        fetch: usage,
+        now: Date.now,
+      }),
+    pin: createPinStore(env),
     now: Date.now,
   }
 }

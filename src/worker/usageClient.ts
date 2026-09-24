@@ -56,6 +56,9 @@ export type UsageClientDeps = {
   // silently talk to the real network in tests.
   fetchImpl: typeof fetch
   masterUrl: string
+  // Per-request timeout. The default suits a /usage command handler; Claude Code's /pool hook holds the
+  // operator's input while it waits, so it asks for a short read and a long forced sweep separately.
+  timeoutMs?: number
 }
 
 function errorMessage(error: unknown): string {
@@ -156,7 +159,7 @@ export function createUsageClient(deps: UsageClientDeps): {
   async function requestSnapshot(path: string, init?: RequestInit): Promise<UsageFetchOutcome> {
     let res: Response
     try {
-      res = await deps.fetchImpl(`${base}${path}`, { ...init, signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS) })
+      res = await deps.fetchImpl(`${base}${path}`, { ...init, signal: AbortSignal.timeout(deps.timeoutMs ?? NETWORK_TIMEOUT_MS) })
     } catch (error) {
       log.warn("worker:usage-unreachable", { detail: errorMessage(error) })
       return { ok: false, failure: { kind: "unreachable", detail: errorMessage(error) } }

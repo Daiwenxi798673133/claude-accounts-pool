@@ -165,6 +165,36 @@ export function removePromptHook(
   return { config: next, changed: true }
 }
 
+// ── ~/.claude/settings.json: the status line (issue #103) ───────────────────────────────────
+
+// Claude Code also re-runs a status line after every message; this is only the floor while idle.
+export const STATUS_REFRESH_SECONDS = 30
+
+export type StatusLinePlan =
+  | { kind: "add"; config: JsonObject }
+  // Already ours — re-running setup leaves it exactly as it is, including any refreshInterval the
+  // operator tuned on it.
+  | { kind: "ours" }
+  // Somebody else's status line. There is only one slot and it is theirs: left alone, setup says so.
+  | { kind: "foreign"; existing: unknown }
+
+const isOurStatusLine = (value: unknown, command: string): boolean => isJsonObject(value) && value.command === command
+
+export function addStatusLine(settings: JsonObject, command: string): StatusLinePlan {
+  const existing = settings.statusLine
+  if (existing === undefined) {
+    return { kind: "add", config: { ...settings, statusLine: { type: "command", command, refreshInterval: STATUS_REFRESH_SECONDS } } }
+  }
+  return isOurStatusLine(existing, command) ? { kind: "ours" } : { kind: "foreign", existing }
+}
+
+/** Removes the status line only while it still runs OUR command. */
+export function removeStatusLine(settings: JsonObject, command: string): { config: JsonObject; changed: boolean } {
+  if (!isOurStatusLine(settings.statusLine, command)) return { config: settings, changed: false }
+  const { statusLine: _ours, ...rest } = settings
+  return { config: rest, changed: true }
+}
+
 // ── shell rc: PATH so a hand-typed `claude` reaches the launcher ─────────────────────────────
 
 // The docs' own recipe for terminal sessions: "put a script named claude in a directory earlier on
@@ -294,6 +324,20 @@ printf '%s' "$input" | ${sq(p.bun)} ${sq(`${p.repo}/claude-pool-panel.ts`)} || e
 `
 }
 
+/**
+ * The status line. Claude Code runs it every few seconds in every session, so it has the prompt hook's
+ * rule and a stricter one: never a line of error text parked at the bottom of the screen. Missing
+ * manifest, bun or clone print nothing at all, and bun's own stderr is dropped.
+ */
+export function renderStatusLineCmd(p: LauncherPaths): string {
+  return `#!/bin/sh
+# 账号池状态栏(statusLine)—— make setup 生成,make revert 删除。本机共享号的 5h / 7d 进度条。
+# 出任何问题都只是不显示,绝不让状态栏挂一行报错。
+[ -f ${sq(p.manifest)} ] && [ -x ${sq(p.bun)} ] && [ -f ${sq(`${p.repo}/claude-pool-status.ts`)} ] || exit 0
+exec ${sq(p.bun)} ${sq(`${p.repo}/claude-pool-status.ts`)} 2>/dev/null
+`
+}
+
 // Marks the /pool skill as ours: revert deletes the file only while it still carries this line, so a
 // skill the user rewrote under the same name survives.
 export const POOL_SKILL_MARKER = "<!-- claude-accounts-pool: make setup 生成,make revert 删除 -->"
@@ -308,7 +352,8 @@ export const POOL_SKILL_MARKER = "<!-- claude-accounts-pool: make setup 生成,m
 export function renderPoolSkill(): string {
   return `---
 name: pool
-description: 账号池面板:看全池用量(由 UserPromptSubmit 钩子接管,不经过模型)
+description: 账号池面板:看全池用量、切号、钉住(由 UserPromptSubmit 钩子接管,不经过模型)
+argument-hint: "[编号 [pin] | r]"
 disable-model-invocation: true
 ---
 ${POOL_SKILL_MARKER}
@@ -396,6 +441,8 @@ export type TakeoverManifest = {
   promptHook?: { command: string; createdHooks: boolean; createdEvent: boolean }
   // The /pool skill file, only when setup wrote it (an existing user skill of that name is left alone).
   poolSkill?: { path: string }
+  // The status line (issue #103), only when it is ours — an operator's own status line is left alone.
+  statusLine?: { command: string }
   // created: setup 新建了这个文件(之前不存在)—— 撤回后只剩空内容就删掉,不留一个会遮住别的
   // 启动文件的空壳(bash 登录 shell 只读 .bash_profile / .bash_login / .profile 里第一个存在的)。
   shellRc?: { path: string; created?: boolean }
